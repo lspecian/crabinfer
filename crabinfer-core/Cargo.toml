@@ -1,0 +1,49 @@
+[package]
+name = "crabinfer-core"
+version = "0.1.0"
+edition = "2021"
+description = "Safe, memory-aware LLM inference engine for iOS"
+license = "Apache-2.0"
+repository = "https://github.com/specianic/crabinfer"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "crabinfer_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# Candle - ML framework with Metal support (fork with iOS Metal shader fixes)
+candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
+candle-nn = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
+candle-transformers = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
+
+# Tokenizer — use fancy-regex (pure Rust) instead of onig (C library)
+# because Oniguruma's ___chkstk_darwin symbol doesn't link on iOS
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# UniFFI for Swift bridge
+uniffi = { version = "0.28", features = ["cli"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "2"
+
+# Memory mapping for model files
+memmap2 = "0.9"
+
+# System calls (sysctl for device detection)
+libc = "0.2"
+
+[features]
+default = ["metal"]
+metal = []  # Metal GPU acceleration (Apple Silicon / iOS)
+cpu-only = []  # CPU-only mode for testing

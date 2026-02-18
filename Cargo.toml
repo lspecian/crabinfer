@@ -1,0 +1,9 @@
+[workspace]
+members = ["crabinfer-core"]
+resolver = "2"
+
+[profile.release]
+lto = "fat"
+panic = "unwind"  # Must be unwind for UniFFI to catch panics at FFI boundary
+strip = true
+opt-level = 3

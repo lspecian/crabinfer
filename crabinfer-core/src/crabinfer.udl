@@ -1,0 +1,124 @@
+// CrabInfer UniFFI Interface Definition
+// This defines the public API that Swift will see
+
+namespace crabinfer {
+    // Get library version
+    string version();
+    
+    // Detect device capabilities
+    DeviceInfo detect_device();
+};
+
+// Device information detected at runtime
+dictionary DeviceInfo {
+    string device_model;
+    u64 total_memory_bytes;
+    u64 available_memory_bytes;
+    boolean has_metal_gpu;
+    boolean has_neural_engine;
+    string recommended_quant;
+    u32 max_model_size_b;
+};
+
+// Configuration for the inference engine
+dictionary EngineConfig {
+    string model_path;
+    u32 max_tokens;
+    f32 temperature;
+    f32 top_p;
+    u32 context_length;
+    boolean use_metal;
+    u64 memory_limit_bytes;
+};
+
+// A generated token with metadata
+dictionary TokenOutput {
+    string text;
+    u32 token_id;
+    f32 probability;
+    boolean is_end_of_sequence;
+};
+
+// Model metadata after loading
+dictionary ModelInfo {
+    string model_name;
+    string architecture;
+    u64 parameter_count;
+    string quantization;
+    u64 file_size_bytes;
+    u32 context_length;
+    u32 vocab_size;
+};
+
+// Generation statistics
+dictionary GenerationStats {
+    u32 tokens_generated;
+    f64 tokens_per_second;
+    f64 time_to_first_token_ms;
+    f64 total_time_ms;
+    u64 peak_memory_bytes;
+    string compute_backend;
+};
+
+// Memory pressure levels matching iOS memory warning levels
+enum MemoryPressure {
+    "Normal",
+    "Warning",
+    "Critical",
+    "Terminal",
+};
+
+// Errors that can occur during inference
+[Error]
+enum CrabInferError {
+    "ModelNotFound",
+    "ModelLoadFailed",
+    "OutOfMemory",
+    "MetalNotAvailable",
+    "TokenizationFailed",
+    "InferenceFailed",
+    "ContextOverflow",
+    "InvalidConfig",
+    "DeviceNotSupported",
+};
+
+// The main inference engine
+interface CrabInferEngine {
+    // Create a new engine with configuration
+    [Throws=CrabInferError]
+    constructor(EngineConfig config);
+    
+    // Load a model (can be called after construction to swap models)
+    [Throws=CrabInferError]
+    void load_model(string model_path);
+    
+    // Get info about the currently loaded model
+    [Throws=CrabInferError]
+    ModelInfo model_info();
+    
+    // Generate a complete response (blocking)
+    [Throws=CrabInferError]
+    string complete(string prompt, u32 max_tokens, f32 temperature);
+    
+    // Generate next token (for streaming - call repeatedly)
+    [Throws=CrabInferError]
+    TokenOutput? next_token(string prompt);
+    
+    // Reset the generation state (start fresh conversation)
+    void reset();
+    
+    // Get generation statistics from last completion
+    GenerationStats? last_stats();
+    
+    // Get current memory pressure level
+    MemoryPressure memory_pressure();
+    
+    // Manually trigger memory cleanup
+    void reduce_memory();
+    
+    // Unload model to free memory
+    void unload_model();
+    
+    // Check if a model is loaded
+    boolean is_model_loaded();
+};

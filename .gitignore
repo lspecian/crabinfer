@@ -1,0 +1,49 @@
+# Rust build artifacts
+/target/
+
+# Generated UniFFI bindings (rebuild with ./build.sh)
+/generated/
+crabinfer-swift/Sources/CrabInfer/Generated/
+
+# XCFramework output (rebuild with ./build.sh)
+/CrabInferCore.xcframework/
+
+# Downloaded GGUF models
+/models/
+*.gguf
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Xcode
+*.xcuserdata/
+**/xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcuserstate
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.*
