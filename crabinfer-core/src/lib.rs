@@ -88,8 +88,8 @@ pub enum CrabInferError {
     ModelNotFound,
     #[error("Failed to load model: {reason}")]
     ModelLoadFailed { reason: String },
-    #[error("Out of memory")]
-    OutOfMemory,
+    #[error("Out of memory: {reason}")]
+    OutOfMemory { reason: String },
     #[error("Metal GPU not available")]
     MetalNotAvailable,
     #[error("Tokenization failed")]

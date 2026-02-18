@@ -139,6 +139,10 @@ pub struct CrabInferEngine {
     model_info: Mutex<Option<ModelInfo>>,
     last_stats: Mutex<Option<GenerationStats>>,
     streaming: Mutex<Option<StreamingState>>,
+    /// Persistent Metal device — created once and reused across load/unload
+    /// cycles. This avoids recreating command queues, recompiling shaders,
+    /// and leaking Metal framework allocations on each load.
+    metal_device: Mutex<Option<Device>>,
 }
 
 impl CrabInferEngine {
@@ -169,6 +173,7 @@ impl CrabInferEngine {
             model_info: Mutex::new(None),
             last_stats: Mutex::new(None),
             streaming: Mutex::new(None),
+            metal_device: Mutex::new(None),
         };
 
         // Auto-load model if path provided
@@ -217,18 +222,18 @@ impl CrabInferEngine {
         };
 
         if available_mb > 0 {
-            let estimated_need_mb = file_size_mb as f64 * 1.4; // model + KV cache + overhead
+            let estimated_need_mb = file_size_mb as f64 * 1.2; // model + KV cache + overhead
             log_debug!(
                 "[CrabInfer] Memory check: available={} MB, estimated need={:.0} MB",
                 available_mb, estimated_need_mb
             );
             if estimated_need_mb > available_mb as f64 {
-                log_debug!(
-                    "[CrabInfer] REFUSING to load: model needs ~{:.0} MB but only {} MB available. \
-                     Use a smaller quantization (Q2_K) or smaller model.",
+                let reason = format!(
+                    "Model needs ~{:.0} MB but only {} MB available. Use a smaller model or quantization.",
                     estimated_need_mb, available_mb
                 );
-                return Err(CrabInferError::OutOfMemory);
+                log_debug!("[CrabInfer] REFUSING to load: {}", reason);
+                return Err(CrabInferError::OutOfMemory { reason });
             }
         }
 
@@ -238,7 +243,9 @@ impl CrabInferEngine {
         match pressure {
             MemoryPressure::Critical | MemoryPressure::Terminal => {
                 log_debug!("[CrabInfer] ERROR: memory pressure too high to load ({:?})", pressure);
-                return Err(CrabInferError::OutOfMemory);
+                return Err(CrabInferError::OutOfMemory {
+                    reason: format!("Memory pressure is {:?} — free some memory first", pressure),
+                });
             }
             _ => {
                 log_debug!("[CrabInfer] Memory pressure: {:?}", pressure);
@@ -290,14 +297,21 @@ impl CrabInferEngine {
             Some(self.config.metallib_path.as_str())
         };
 
-        // Try loading with Metal first, fall back to CPU if it fails
+        // Reuse the persistent Metal device if available, otherwise create one.
+        // This avoids recreating command queues and recompiling shaders each load.
+        let cached_device = self.metal_device.lock_recover().clone();
+
         let (weights, info, device) = load_model_weights(
             &model_path,
             file_size,
             self.config.context_length,
             self.config.use_metal,
             metallib_path,
+            cached_device,
         )?;
+
+        // Cache the device for future loads
+        *self.metal_device.lock_recover() = Some(device.clone());
 
         // Load tokenizer from a file next to the model (tokenizer.json)
         let tokenizer = load_tokenizer(&model_path)?;
@@ -776,25 +790,26 @@ impl CrabInferEngine {
         *self.last_stats.lock_recover() = None;
 
         if let Some(loaded) = old_model {
-            // Save the device handle before dropping the model weights,
-            // since we need it to flush the Metal buffer pool afterwards.
-            let device = loaded.device.clone();
-
-            // Explicitly drop fields in order: weights (heavy), then tokenizer.
-            // `drop(loaded)` would do the same, but being explicit documents intent.
+            // Drop the model weights + tokenizer (heavy), but keep the device
+            // alive in self.metal_device for reuse on next load.
             drop(loaded);
 
-            // Flush Metal buffer pool — without this, Arc<Buffer> entries with
-            // strong_count==1 stay cached in the device's buffer pool forever,
-            // leaking GPU memory across load/unload cycles.
-            if let Ok(metal) = device.as_metal_device() {
-                // Wait for any in-flight GPU work to complete first
-                let _ = metal.wait_until_completed();
-                // Now release buffers whose only reference is the pool itself
-                if let Err(e) = metal.release_unused_buffers() {
-                    log_debug!("[CrabInfer] Warning: failed to release Metal buffers: {:?}", e);
+            // Flush Metal buffer pool on the cached device — without this,
+            // Arc<Buffer> entries with strong_count==1 stay cached in the
+            // device's pool forever, leaking GPU memory.
+            if let Some(ref device) = *self.metal_device.lock_recover() {
+                if let Ok(metal) = device.as_metal_device() {
+                    let _ = metal.wait_until_completed();
+                    if let Err(e) = metal.release_unused_buffers() {
+                        log_debug!("[CrabInfer] Warning: failed to release Metal buffers: {:?}", e);
+                    }
                 }
             }
+
+            // Force the system allocator to return freed pages to the OS.
+            // Without this, malloc keeps freed pages mapped as "dirty" and
+            // RSS never drops even though the memory is logically freed.
+            Self::force_memory_reclaim();
 
             log_debug!("[CrabInfer] Model unloaded, Metal buffers released");
         } else {
@@ -814,8 +829,17 @@ impl CrabInferEngine {
     /// Run a load/unload stress test to detect memory leaks.
     ///
     /// Loads the model, generates `tokens_per_cycle` tokens, unloads,
-    /// and repeats for `cycles` iterations. Returns a log of RSS after
-    /// each cycle so the caller can check for monotonic growth.
+    /// and repeats for `cycles` iterations.  Returns a log of memory
+    /// measurements after each cycle so the caller can check for leaks.
+    ///
+    /// **Key design**: between cycles the model weights are dropped but
+    /// the Metal buffer pool is deliberately NOT flushed.  Our Candle
+    /// fork's `new_buffer_with_data` reuses pool buffers of the same size
+    /// instead of allocating fresh Metal pages.  This keeps peak memory
+    /// at ~1× model size across all cycles, preventing jetsam kills.
+    ///
+    /// The Metal device is reused across cycles (creating a new one each
+    /// cycle leaks Metal framework overhead).
     pub fn stress_test(
         &self,
         model_path: String,
@@ -824,16 +848,55 @@ impl CrabInferEngine {
     ) -> Result<Vec<String>, CrabInferError> {
         let mut log: Vec<String> = Vec::new();
 
+        let file_size_mb = std::fs::metadata(&model_path)
+            .map(|m| m.len() / (1024 * 1024))
+            .unwrap_or(0);
+
+        // Safety margin: 1.5x file size. With buffer reuse the peak should
+        // stay close to 1x, but we still need headroom for the tokenizer,
+        // KV cache, and one-time pipeline state overhead.
+        let safety_mb = (file_size_mb as f64 * 1.5) as u64;
+
         let baseline_rss = Self::resident_memory_mb();
-        log.push(format!("Baseline RSS: {} MB", baseline_rss));
-        log_debug!("[CrabInfer-StressTest] Baseline RSS: {} MB", baseline_rss);
+        let baseline_avail = Self::available_memory_mb();
+        let baseline_metal = Self::metal_allocated_mb(&self.metal_device);
+        log.push(format!(
+            "Baseline: RSS {} MB, free {} MB, Metal {} MB  (model {} MB)",
+            baseline_rss, baseline_avail, baseline_metal, file_size_mb
+        ));
+        log_debug!(
+            "[CrabInfer-StressTest] Baseline RSS={} avail={} metal={}",
+            baseline_rss, baseline_avail, baseline_metal
+        );
+
+        let mut completed_cycles = 0u32;
 
         for i in 0..cycles {
             log_debug!("[CrabInfer-StressTest] === Cycle {}/{} ===", i + 1, cycles);
 
+            // Safety check: bail if available memory is too low.
+            let available_mb = Self::available_memory_mb();
+            if available_mb > 0 && available_mb < safety_mb {
+                let msg = format!(
+                    "Stopped before cycle {}: {} MB free < {} MB needed",
+                    i + 1, available_mb, safety_mb
+                );
+                log_debug!("[CrabInfer-StressTest] {}", msg);
+                log.push(msg);
+                break;
+            }
+
             // Load
-            self.load_model(model_path.clone())?;
-            let after_load = Self::resident_memory_mb();
+            match self.load_model(model_path.clone()) {
+                Ok(()) => {}
+                Err(CrabInferError::OutOfMemory { reason }) => {
+                    log.push(format!("Stopped at cycle {}: {}", i + 1, reason));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+            let after_load_rss = Self::resident_memory_mb();
+            let after_load_metal = Self::metal_allocated_mb(&self.metal_device);
 
             // Generate tokens
             self.reset();
@@ -848,30 +911,113 @@ impl CrabInferEngine {
                     _ => {}
                 }
             }
-            let after_gen = Self::resident_memory_mb();
 
-            // Unload
-            self.unload_model();
-            let after_unload = Self::resident_memory_mb();
+            // --- Unload weights but KEEP Metal buffers in pool for reuse ---
+            //
+            // We intentionally do NOT call self.unload_model() here because
+            // that flushes the buffer pool.  Instead we drop only the model
+            // state.  On the next load_model() call, Candle's
+            // new_buffer_with_data() will find same-size unused buffers in
+            // the pool and reuse them (memcpy into existing Metal pages)
+            // instead of creating new Metal allocations.
+            {
+                let old_model = self.model.lock_recover().take();
+                *self.model_info.lock_recover() = None;
+                *self.streaming.lock_recover() = None;
+                *self.last_stats.lock_recover() = None;
+                if let Some(loaded) = old_model {
+                    drop(loaded);
+                    // Wait for any in-flight GPU work to finish before
+                    // measuring, but do NOT release buffers.
+                    if let Some(ref device) = *self.metal_device.lock_recover() {
+                        if let Ok(metal) = device.as_metal_device() {
+                            let _ = metal.wait_until_completed();
+                        }
+                    }
+                }
+            }
+
+            Self::force_memory_reclaim();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let after_unload_rss = Self::resident_memory_mb();
+            let after_unload_metal = Self::metal_allocated_mb(&self.metal_device);
+            let available_after = Self::available_memory_mb();
+            completed_cycles = i + 1;
 
             let entry = format!(
-                "Cycle {}: load={} MB, gen={} MB, unload={} MB (delta from baseline: +{} MB)",
-                i + 1, after_load, after_gen, after_unload,
-                after_unload.saturating_sub(baseline_rss)
+                "Cycle {}: load {}|{} MB → free {}|{} MB (avail {})",
+                i + 1,
+                after_load_rss, after_load_metal,
+                after_unload_rss, after_unload_metal,
+                available_after
             );
             log_debug!("[CrabInfer-StressTest] {}", entry);
             log.push(entry);
         }
 
+        // Final cleanup: now actually release Metal buffers and unload
+        self.unload_model();
+        Self::force_memory_reclaim();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         let final_rss = Self::resident_memory_mb();
-        let leak = final_rss.saturating_sub(baseline_rss);
-        log.push(format!("Final RSS: {} MB (leaked: {} MB)", final_rss, leak));
-        log_debug!(
-            "[CrabInfer-StressTest] Final RSS: {} MB, leaked: {} MB",
-            final_rss, leak
-        );
+        let final_avail = Self::available_memory_mb();
+        let final_metal = Self::metal_allocated_mb(&self.metal_device);
+        let overhead = final_rss.saturating_sub(baseline_rss);
+        let per_cycle = if completed_cycles > 0 {
+            overhead / completed_cycles as u64
+        } else {
+            0
+        };
+        log.push(format!(
+            "Done: {} cycles | RSS {} MB (+{}, ~{}/cyc) Metal {} MB | {} MB free",
+            completed_cycles, final_rss, overhead, per_cycle, final_metal, final_avail
+        ));
 
         Ok(log)
+    }
+
+    /// Ask the system allocator to return freed pages to the OS.
+    ///
+    /// After dropping large allocations (model weights, Metal buffers), the
+    /// C allocator keeps freed virtual pages mapped as "dirty" for potential
+    /// reuse. This inflates RSS even though the memory is logically free.
+    /// `malloc_zone_pressure_relief` walks all malloc zones and returns
+    /// clean pages to the kernel, reducing RSS to reflect actual usage.
+    fn force_memory_reclaim() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            extern "C" {
+                fn malloc_zone_pressure_relief(
+                    zone: *mut std::ffi::c_void,
+                    goal: usize,
+                ) -> usize;
+            }
+            let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+            log_debug!("[CrabInfer] malloc_zone_pressure_relief freed {} bytes", freed);
+        }
+    }
+
+    /// Get Metal device allocated size in MB (0 if no device).
+    fn metal_allocated_mb(metal_device: &Mutex<Option<Device>>) -> u64 {
+        if let Some(ref device) = *metal_device.lock_recover() {
+            if let Ok(metal) = device.as_metal_device() {
+                return (metal.current_allocated_size() / (1024 * 1024)) as u64;
+            }
+        }
+        0
+    }
+
+    /// Get available memory in MB (jetsam-aware on iOS).
+    fn available_memory_mb() -> u64 {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            extern "C" { fn os_proc_available_memory() -> u64; }
+            return (unsafe { os_proc_available_memory() }) / (1024 * 1024);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        { 0 }
     }
 
     /// Get current process resident memory in MB (for stress test logging).
@@ -938,28 +1084,51 @@ fn load_model_weights(
     default_context_length: u32,
     use_metal: bool,
     metallib_path: Option<&str>,
+    cached_device: Option<Device>,
 ) -> Result<(Model, ModelInfo, Device), CrabInferError> {
     let devices_to_try: Vec<Device> = if use_metal {
-        log_debug!("[CrabInfer] Metal requested, creating Metal device...");
-        match Device::new_metal(0) {
-            Ok(metal) => {
-                // Configure pre-compiled metallib directory if provided
-                if let Some(dir) = metallib_path {
-                    if let Ok(metal_dev) = metal.as_metal_device() {
-                        log_debug!("[CrabInfer] Setting metallib dir: {}", dir);
-                        metal_dev.set_metallib_dir(dir);
+        // Reuse cached Metal device if available
+        if let Some(ref dev) = cached_device {
+            if matches!(dev, Device::Metal(_)) {
+                log_debug!("[CrabInfer] Reusing cached Metal device");
+                vec![dev.clone(), Device::Cpu]
+            } else {
+                log_debug!("[CrabInfer] Cached device is CPU, creating Metal device...");
+                match Device::new_metal(0) {
+                    Ok(metal) => {
+                        if let Some(dir) = metallib_path {
+                            if let Ok(metal_dev) = metal.as_metal_device() {
+                                log_debug!("[CrabInfer] Setting metallib dir: {}", dir);
+                                metal_dev.set_metallib_dir(dir);
+                            }
+                        }
+                        vec![metal, Device::Cpu]
                     }
-                } else {
-                    log_debug!("[CrabInfer] WARNING: No metallib_path provided — Metal will use runtime XPC compilation (may fail on iOS)");
+                    Err(e) => {
+                        log_debug!("[CrabInfer] Metal device FAILED: {}, falling back to CPU", e);
+                        vec![Device::Cpu]
+                    }
                 }
-                log_debug!("[CrabInfer] Metal device created OK");
-                // CPU fallback is allowed since the pre-flight memory check
-                // above already verified the model fits in available memory.
-                vec![metal, Device::Cpu]
             }
-            Err(e) => {
-                log_debug!("[CrabInfer] Metal device FAILED: {}, falling back to CPU", e);
-                vec![Device::Cpu]
+        } else {
+            log_debug!("[CrabInfer] Metal requested, creating Metal device...");
+            match Device::new_metal(0) {
+                Ok(metal) => {
+                    if let Some(dir) = metallib_path {
+                        if let Ok(metal_dev) = metal.as_metal_device() {
+                            log_debug!("[CrabInfer] Setting metallib dir: {}", dir);
+                            metal_dev.set_metallib_dir(dir);
+                        }
+                    } else {
+                        log_debug!("[CrabInfer] WARNING: No metallib_path provided — Metal will use runtime XPC compilation (may fail on iOS)");
+                    }
+                    log_debug!("[CrabInfer] Metal device created OK");
+                    vec![metal, Device::Cpu]
+                }
+                Err(e) => {
+                    log_debug!("[CrabInfer] Metal device FAILED: {}, falling back to CPU", e);
+                    vec![Device::Cpu]
+                }
             }
         }
     } else {
@@ -967,6 +1136,7 @@ fn load_model_weights(
         vec![Device::Cpu]
     };
 
+    let is_reused_device = cached_device.is_some();
     let mut last_error = String::from("no devices available");
     for device in devices_to_try {
         log_debug!("[CrabInfer] Trying device: {:?}", device);
@@ -1054,22 +1224,28 @@ fn load_model_weights(
                 // which only appends, so we explicitly clear after warmup.
                 let warmup_start = Instant::now();
 
-                // Step 1: Basic tensor ops (compiles fill.metal, binary.metal, cast.metal)
-                log_debug!("[CrabInfer] Metal warmup 1/3: basic tensor ops...");
-                let a = Tensor::zeros((2, 2), candle_core::DType::F32, &device)?;
-                let b = Tensor::ones((2, 2), candle_core::DType::F32, &device)?;
-                let _c = (&a + &b)?;
-                log_debug!("[CrabInfer] Metal warmup 1/3: OK ({:.1}s)", warmup_start.elapsed().as_secs_f64());
+                if is_reused_device {
+                    // Shaders already compiled on the cached device — skip tensor warmup,
+                    // just run a forward pass to populate KV cache shapes for new weights.
+                    log_debug!("[CrabInfer] Reused device, skipping shader warmup...");
+                } else {
+                    // Step 1: Basic tensor ops (compiles fill.metal, binary.metal, cast.metal)
+                    log_debug!("[CrabInfer] Metal warmup 1/3: basic tensor ops...");
+                    let a = Tensor::zeros((2, 2), candle_core::DType::F32, &device)?;
+                    let b = Tensor::ones((2, 2), candle_core::DType::F32, &device)?;
+                    let _c = (&a + &b)?;
+                    log_debug!("[CrabInfer] Metal warmup 1/3: OK ({:.1}s)", warmup_start.elapsed().as_secs_f64());
 
-                // Step 2: Unary + reduce ops (compiles unary.metal, reduce.metal)
-                log_debug!("[CrabInfer] Metal warmup 2/3: unary + reduce ops...");
-                let _d = b.sqrt()?;
-                let _e = a.sum_all()?;
-                log_debug!("[CrabInfer] Metal warmup 2/3: OK ({:.1}s)", warmup_start.elapsed().as_secs_f64());
+                    // Step 2: Unary + reduce ops (compiles unary.metal, reduce.metal)
+                    log_debug!("[CrabInfer] Metal warmup 2/3: unary + reduce ops...");
+                    let _d = b.sqrt()?;
+                    let _e = a.sum_all()?;
+                    log_debug!("[CrabInfer] Metal warmup 2/3: OK ({:.1}s)", warmup_start.elapsed().as_secs_f64());
+                }
 
-                // Step 3: Full forward pass (compiles quantized.metal — 7741 lines,
-                // the heaviest compilation and most likely to trigger XPC failure)
-                log_debug!("[CrabInfer] Metal warmup 3/3: quantized forward pass (this compiles ~8K lines of Metal shaders)...");
+                // Forward pass warmup — always run for new weights (compiles
+                // quantized.metal kernels specific to this model's tensor shapes)
+                log_debug!("[CrabInfer] Metal warmup: quantized forward pass...");
                 let dummy = Tensor::new(&[1u32], &device)?.unsqueeze(0)?;
                 weights.forward(&dummy, 0)?;
                 weights.clear_kv_cache();

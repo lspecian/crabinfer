@@ -388,29 +388,44 @@ class InferenceViewModel: ObservableObject {
     func runStressTest(cycles: Int = 10, tokensPerCycle: Int = 10) async {
         guard isSelectedModelDownloaded else { return }
 
-        // Unload any current model first
-        if isModelLoaded { unloadCurrentModel() }
-
         isStressTesting = true
         stressTestLog = ["Starting stress test: \(cycles) cycles, \(tokensPerCycle) tokens each..."]
+
+        // Unload the current model weights but KEEP the engine (and its
+        // cached Metal device).  Creating a second engine would allocate a
+        // second MTLDevice whose retained pages coexist with the first,
+        // doubling Metal memory usage and causing a jetsam kill.
+        if isModelLoaded {
+            engine?.unloadModel()
+            isModelLoaded = false
+            activeModelId = nil
+            output = ""
+            lastGenerationStats = nil
+        }
 
         let dir = modelDir(for: selectedModelId)
         let modelPath = dir.appendingPathComponent("model.gguf").path
 
         do {
-            let config = EngineConfig(
-                modelPath: "",
-                maxTokens: UInt32(tokensPerCycle),
-                temperature: 0.7,
-                topP: 0.9,
-                contextLength: 4096,
-                useMetal: true,
-                memoryLimitBytes: 0,
-                metallibPath: findMetallibDir()
-            )
-            let eng = try await inferenceThread.perform {
-                try CrabInferEngine(config: config)
+            // Reuse existing engine if available; only create a new one if
+            // this is the first time (no model was ever loaded).
+            if engine == nil {
+                let config = EngineConfig(
+                    modelPath: "",
+                    maxTokens: UInt32(tokensPerCycle),
+                    temperature: 0.7,
+                    topP: 0.9,
+                    contextLength: 4096,
+                    useMetal: true,
+                    memoryLimitBytes: 0,
+                    metallibPath: findMetallibDir()
+                )
+                engine = try await inferenceThread.perform {
+                    try CrabInferEngine(config: config)
+                }
             }
+
+            guard let eng = engine else { return }
 
             let log = try await inferenceThread.perform {
                 try eng.stressTest(
@@ -425,6 +440,10 @@ class InferenceViewModel: ObservableObject {
             stressTestLog.append("ERROR: \(error.localizedDescription)")
         }
 
+        // Update UI state — model is unloaded after stress test
+        modelStatus = downloadedModelIds.isEmpty
+            ? "No model — pick one to download"
+            : "Model ready to load"
         isStressTesting = false
     }
 
