@@ -222,7 +222,21 @@ impl CrabInferEngine {
         };
 
         if available_mb > 0 {
-            let estimated_need_mb = file_size_mb as f64 * 1.2; // model + KV cache + overhead
+            // If the Metal device already has allocations >= model size, the
+            // buffer pool likely has reusable buffers from a previous load of
+            // the same model.  new_buffer_with_data will reuse them via memcpy
+            // instead of making new Metal allocations, so we only need overhead
+            // for the tokenizer, GGUF parsing, and temporary copies.
+            let metal_mb = Self::metal_allocated_mb(&self.metal_device);
+            let estimated_need_mb = if metal_mb >= file_size_mb {
+                log_debug!(
+                    "[CrabInfer] Warm reload: Metal already has {} MB (>= model {} MB), expecting buffer reuse",
+                    metal_mb, file_size_mb
+                );
+                150.0 // ~150 MB overhead for tokenizer + GGUF parsing + temps
+            } else {
+                file_size_mb as f64 * 1.2 // cold load: model + KV cache + overhead
+            };
             log_debug!(
                 "[CrabInfer] Memory check: available={} MB, estimated need={:.0} MB",
                 available_mb, estimated_need_mb
@@ -793,28 +807,28 @@ impl CrabInferEngine {
             // Drop the model weights + tokenizer (heavy), but keep the device
             // alive in self.metal_device for reuse on next load.
             drop(loaded);
+            log_debug!("[CrabInfer] Model weights dropped");
+        }
 
-            // Flush Metal buffer pool on the cached device — without this,
-            // Arc<Buffer> entries with strong_count==1 stay cached in the
-            // device's pool forever, leaking GPU memory.
-            if let Some(ref device) = *self.metal_device.lock_recover() {
-                if let Ok(metal) = device.as_metal_device() {
-                    let _ = metal.wait_until_completed();
-                    if let Err(e) = metal.release_unused_buffers() {
-                        log_debug!("[CrabInfer] Warning: failed to release Metal buffers: {:?}", e);
-                    }
+        // Always flush the Metal buffer pool, even if no model was loaded.
+        // The stress test's partial unload drops model tensors but deliberately
+        // keeps buffers in the pool for reuse.  When unload_model() is called
+        // afterwards (or when loading a different model), we must flush the
+        // pool to avoid a stale 1 GB+ Metal footprint that would cause a
+        // jetsam kill on the next load.
+        if let Some(ref device) = *self.metal_device.lock_recover() {
+            if let Ok(metal) = device.as_metal_device() {
+                let _ = metal.wait_until_completed();
+                if let Err(e) = metal.release_unused_buffers() {
+                    log_debug!("[CrabInfer] Warning: failed to release Metal buffers: {:?}", e);
                 }
             }
-
-            // Force the system allocator to return freed pages to the OS.
-            // Without this, malloc keeps freed pages mapped as "dirty" and
-            // RSS never drops even though the memory is logically freed.
-            Self::force_memory_reclaim();
-
-            log_debug!("[CrabInfer] Model unloaded, Metal buffers released");
-        } else {
-            log_debug!("[CrabInfer] unload_model called but no model was loaded");
         }
+
+        // Force the system allocator to return freed pages to the OS.
+        Self::force_memory_reclaim();
+
+        log_debug!("[CrabInfer] Model unloaded, Metal buffers released");
     }
 
     pub fn is_model_loaded(&self) -> bool {
@@ -848,14 +862,32 @@ impl CrabInferEngine {
     ) -> Result<Vec<String>, CrabInferError> {
         let mut log: Vec<String> = Vec::new();
 
+        // Flush any stale Metal buffers left over from a previous stress test
+        // or model load. Without this, a failed prior stress test (which skips
+        // final cleanup) can leave hundreds of MB of unreleased buffers that
+        // push the next cold load over the jetsam limit.
+        if let Some(ref device) = *self.metal_device.lock_recover() {
+            if let Ok(metal) = device.as_metal_device() {
+                let stale = metal.current_allocated_size() / (1024 * 1024);
+                if stale > 0 {
+                    log_debug!("[CrabInfer-StressTest] Flushing {} MB of stale Metal buffers", stale);
+                    let _ = metal.wait_until_completed();
+                    let _ = metal.release_unused_buffers();
+                }
+            }
+        }
+        Self::force_memory_reclaim();
+
         let file_size_mb = std::fs::metadata(&model_path)
             .map(|m| m.len() / (1024 * 1024))
             .unwrap_or(0);
 
-        // Safety margin: 1.5x file size. With buffer reuse the peak should
-        // stay close to 1x, but we still need headroom for the tokenizer,
-        // KV cache, and one-time pipeline state overhead.
-        let safety_mb = (file_size_mb as f64 * 1.5) as u64;
+        // Safety margins:
+        //   Cycle 1 (cold): 1.5x file size — new Metal allocations + overhead
+        //   Cycle 2+ (warm): 200 MB — buffers already exist in pool, only need
+        //     headroom for tokenizer, GGUF parsing, and temporary copies
+        let cold_safety_mb = (file_size_mb as f64 * 1.5) as u64;
+        let warm_safety_mb: u64 = 200;
 
         let baseline_rss = Self::resident_memory_mb();
         let baseline_avail = Self::available_memory_mb();
@@ -875,6 +907,9 @@ impl CrabInferEngine {
             log_debug!("[CrabInfer-StressTest] === Cycle {}/{} ===", i + 1, cycles);
 
             // Safety check: bail if available memory is too low.
+            // After cycle 1, buffers exist in pool and will be reused via
+            // memcpy — no new Metal allocations needed, so the margin is small.
+            let safety_mb = if i == 0 { cold_safety_mb } else { warm_safety_mb };
             let available_mb = Self::available_memory_mb();
             if available_mb > 0 && available_mb < safety_mb {
                 let msg = format!(
