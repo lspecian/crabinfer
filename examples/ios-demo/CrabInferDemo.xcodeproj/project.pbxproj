@@ -15,6 +15,10 @@
 		AA0001000000000000000006 /* CrabInferCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0002000000000000000006 /* CrabInferCore.xcframework */; };
 		AA0001000000000000000007 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0002000000000000000007 /* Metal.framework */; };
 		AA0001000000000000000008 /* InferenceThread.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0002000000000000000009 /* InferenceThread.swift */; };
+		AA000100000000000000000A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000200000000000000000A /* ChatView.swift */; };
+		AA000100000000000000000B /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000200000000000000000B /* MessageBubble.swift */; };
+		AA000100000000000000000C /* DeviceInfoBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000200000000000000000C /* DeviceInfoBar.swift */; };
+		AA000100000000000000000D /* ModelLoaderSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000200000000000000000D /* ModelLoaderSheet.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +31,10 @@
 		AA0002000000000000000007 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		AA0002000000000000000008 /* CrabInferDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CrabInferDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0002000000000000000009 /* InferenceThread.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceThread.swift; sourceTree = "<group>"; };
+		AA000200000000000000000A /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		AA000200000000000000000B /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
+		AA000200000000000000000C /* DeviceInfoBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceInfoBar.swift; sourceTree = "<group>"; };
+		AA000200000000000000000D /* ModelLoaderSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelLoaderSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -64,6 +72,10 @@
 				AA0002000000000000000002 /* ContentView.swift */,
 				AA0002000000000000000003 /* InferenceViewModel.swift */,
 				AA0002000000000000000009 /* InferenceThread.swift */,
+				AA000200000000000000000A /* ChatView.swift */,
+				AA000200000000000000000B /* MessageBubble.swift */,
+				AA000200000000000000000C /* DeviceInfoBar.swift */,
+				AA000200000000000000000D /* ModelLoaderSheet.swift */,
 				AA0002000000000000000005 /* Assets.xcassets */,
 			);
 			path = CrabInferDemo;
@@ -163,6 +175,10 @@
 				AA0001000000000000000003 /* InferenceViewModel.swift in Sources */,
 				AA0001000000000000000004 /* crabinfer_core.swift in Sources */,
 				AA0001000000000000000008 /* InferenceThread.swift in Sources */,
+				AA000100000000000000000A /* ChatView.swift in Sources */,
+				AA000100000000000000000B /* MessageBubble.swift in Sources */,
+				AA000100000000000000000C /* DeviceInfoBar.swift in Sources */,
+				AA000100000000000000000D /* ModelLoaderSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

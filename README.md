@@ -4,6 +4,13 @@
 
 CrabInfer is a three-layer AI inference stack for iOS, built in Rust on top of [Candle](https://github.com/huggingface/candle) (Hugging Face's ML framework), exposed to Swift via [UniFFI](https://mozilla.github.io/uniffi-rs/).
 
+## Demo
+
+<p align="center">
+  <img src="docs/screenshots/demo-readme.gif" alt="CrabInfer iOS Demo — on-device chat with Qwen3 0.6B on iPhone 15 Pro" width="300">
+</p>
+<p align="center"><em>On-device chat running Qwen3 0.6B (Q4_K_M) on iPhone 14 Pro Max via Metal GPU — ~18-22 tok/s</em></p>
+
 ## Why CrabInfer?
 
 Every iOS LLM app today crashes, locks up phones, or leaks memory — because iOS developers are wrapping C++ inference engines (llama.cpp) with no memory safety, no device-aware model selection, and no graceful degradation. CrabInfer solves this.

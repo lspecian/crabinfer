@@ -73,19 +73,19 @@ let modelCatalog: [ModelEntry] = [
         tokenizerURL: URL(string: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json")!
     ),
     ModelEntry(
-        id: "qwen3-0.6b-q8",
-        name: "Qwen3 0.6B (Q8_0)",
-        sizeMB: 596,
+        id: "qwen3-0.6b-q4",
+        name: "Qwen3 0.6B (Q4_K_M)",
+        sizeMB: 380,
         architecture: "qwen3",
-        modelURL: URL(string: "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf")!,
+        modelURL: URL(string: "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf")!,
         tokenizerURL: URL(string: "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json")!
     ),
     ModelEntry(
-        id: "qwen3-1.7b-q4",
-        name: "Qwen3 1.7B (Q4_K_M)",
-        sizeMB: 1056,
+        id: "qwen3-1.7b-q3",
+        name: "Qwen3 1.7B (Q3_K_S)",
+        sizeMB: 750,
         architecture: "qwen3",
-        modelURL: URL(string: "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf")!,
+        modelURL: URL(string: "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q3_K_S.gguf")!,
         tokenizerURL: URL(string: "https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/tokenizer.json")!
     ),
     ModelEntry(
@@ -98,46 +98,56 @@ let modelCatalog: [ModelEntry] = [
     ),
 ]
 
+// MARK: - Chat message model
+
+struct ChatMessage: Identifiable {
+    let id = UUID()
+    let role: Role
+    var content: String
+    var stats: GenerationStats?
+    var isError: Bool = false
+
+    enum Role {
+        case user
+        case assistant
+    }
+}
+
 // MARK: - ViewModel
 
 @MainActor
 class InferenceViewModel: ObservableObject {
     @Published var deviceInfo = "Detecting..."
+    @Published var deviceModel = ""
+    @Published var deviceRAMGB: UInt64 = 0
+    @Published var deviceHasMetal = false
     @Published var modelStatus = "No model loaded"
-    @Published var output = ""
     @Published var isGenerating = false
     @Published var isLoading = false
     @Published var isModelLoaded = false
     @Published var pressureLevel: MemoryPressure = .normal
     @Published var pressureLabel = "Normal"
-    @Published var lastGenerationStats: GenerationStats? = nil
-    @Published var generatingStatus = ""
+
+    // Chat state
+    @Published var messages: [ChatMessage] = []
 
     // Download state
     @Published var isDownloading = false
     @Published var downloadProgress: Double = 0
     @Published var downloadStatus = ""
 
-    // Stress test state
-    @Published var isStressTesting = false
-    @Published var stressTestLog: [String] = []
-
     // Model selection
     @Published var selectedModelId: String = modelCatalog[0].id
     @Published var downloadedModelIds: [String] = []
     @Published var activeModelId: String? = nil
+    @Published var activeModelName: String? = nil
 
     private var engine: CrabInferEngine?
 
     /// Persistent Metal-inference thread.
-    ///
-    /// All Candle/Metal work runs on this single OS thread for the lifetime of
-    /// the app. A plain DispatchQueue is not enough because:
-    ///   - GCD worker threads have no RunLoop -> Metal completion callbacks never fire
-    ///   - GCD recycles threads across async blocks -> Metal's device affinity breaks
-    ///   - Lazy shader compilation can deadlock a plain serial queue (mutex re-entry)
-    /// See InferenceThread.swift for the full explanation.
-    private let inferenceThread = InferenceThread()
+    /// Lazy so the semaphore wait in InferenceThread.init() doesn't block
+    /// SwiftUI's first render cycle (which causes the black screen on launch).
+    private lazy var inferenceThread = InferenceThread()
 
     private var docsDir: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -148,17 +158,31 @@ class InferenceViewModel: ObservableObject {
         docsDir.appendingPathComponent("models/\(id)")
     }
 
+    @Published var isReady = false
+
     init() {
-        let info = detectDevice()
-        let ramGB = info.totalMemoryBytes / (1024 * 1024 * 1024)
-        let freeGB = info.availableMemoryBytes / (1024 * 1024 * 1024)
-        deviceInfo = """
-        \(info.deviceModel)
-        RAM: \(ramGB) GB (\(freeGB) GB free)
-        Metal: \(info.hasMetalGpu ? "Yes" : "No")
-        Recommended: \(info.recommendedQuant) (up to \(info.maxModelSizeB)B)
-        """
         refreshDownloadedModels()
+        // Detect device on a background thread so the UI renders immediately.
+        // Task {} inherits @MainActor from the class, so we must use Task.detached
+        // to actually leave the main thread for the blocking FFI call.
+        Task.detached { [weak self] in
+            let info = detectDevice()
+            await MainActor.run {
+                guard let self else { return }
+                let ramGB = info.totalMemoryBytes / (1024 * 1024 * 1024)
+                let freeGB = info.availableMemoryBytes / (1024 * 1024 * 1024)
+                self.deviceModel = info.deviceModel
+                self.deviceRAMGB = ramGB
+                self.deviceHasMetal = info.hasMetalGpu
+                self.deviceInfo = """
+                \(info.deviceModel)
+                RAM: \(ramGB) GB (\(freeGB) GB free)
+                Metal: \(info.hasMetalGpu ? "Yes" : "No")
+                Recommended: \(info.recommendedQuant) (up to \(info.maxModelSizeB)B)
+                """
+                self.isReady = true
+            }
+        }
     }
 
     /// Scan the models directory to find which models have been downloaded.
@@ -192,6 +216,16 @@ class InferenceViewModel: ObservableObject {
     /// The catalog entry for the currently selected model.
     var selectedModel: ModelEntry {
         modelCatalog.first(where: { $0.id == selectedModelId }) ?? modelCatalog[0]
+    }
+
+    /// Short summary for the device info bar
+    var deviceBarSummary: String {
+        var parts = [deviceModel, "\(deviceRAMGB) GB"]
+        if deviceHasMetal { parts.append("Metal") }
+        if let name = activeModelName {
+            parts.append(name)
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - Download
@@ -291,7 +325,7 @@ class InferenceViewModel: ObservableObject {
         refreshDownloadedModels()
     }
 
-    // MARK: - Load / Unload / Switch
+    // MARK: - Load / Unload
 
     func loadModel(id: String) async {
         // Unload any previously loaded model first
@@ -338,7 +372,7 @@ class InferenceViewModel: ObservableObject {
 
                 let config = EngineConfig(
                     modelPath: "",
-                    maxTokens: 256,
+                    maxTokens: 512,
                     temperature: 0.7,
                     topP: 0.9,
                     contextLength: 4096,
@@ -356,6 +390,7 @@ class InferenceViewModel: ObservableObject {
             engine = eng
             isModelLoaded = true
             activeModelId = id
+            activeModelName = modelCatalog.first(where: { $0.id == id })?.name
             let mb = info.fileSizeBytes / (1024 * 1024)
             let backend = info.architecture
             modelStatus = """
@@ -376,75 +411,105 @@ class InferenceViewModel: ObservableObject {
         engine = nil
         isModelLoaded = false
         activeModelId = nil
-        output = ""
-        lastGenerationStats = nil
+        activeModelName = nil
+        messages = []
         modelStatus = downloadedModelIds.isEmpty
             ? "No model — pick one to download"
             : "Model ready to load"
     }
 
-    // MARK: - Stress Test
+    // MARK: - Chat templates
 
-    func runStressTest(cycles: Int = 10, tokensPerCycle: Int = 10) async {
-        guard isSelectedModelDownloaded else { return }
+    private let systemPrompt = "You are a helpful, concise assistant running on-device. Answer the user's question directly and briefly."
 
-        isStressTesting = true
-        stressTestLog = ["Starting stress test: \(cycles) cycles, \(tokensPerCycle) tokens each..."]
-
-        // Unload the current model weights but KEEP the engine (and its
-        // cached Metal device).  Creating a second engine would allocate a
-        // second MTLDevice whose retained pages coexist with the first,
-        // doubling Metal memory usage and causing a jetsam kill.
-        if isModelLoaded {
-            engine?.unloadModel()
-            isModelLoaded = false
-            activeModelId = nil
-            output = ""
-            lastGenerationStats = nil
+    /// Wrap raw user text in the correct instruct/chat template for the loaded model.
+    private func chatPrompt(_ userText: String) -> String {
+        guard let id = activeModelId,
+              let entry = modelCatalog.first(where: { $0.id == id }) else {
+            return "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
         }
 
-        let dir = modelDir(for: selectedModelId)
-        let modelPath = dir.appendingPathComponent("model.gguf").path
+        switch entry.architecture {
+        case "qwen3":
+            // /no_think disables Qwen3's chain-of-thought <think> blocks,
+            // which waste tokens and can trigger Rust UTF-8 boundary errors with emoji.
+            return "<|im_start|>system\n\(systemPrompt)\n/no_think<|im_end|>\n<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
+        case "qwen2":
+            return "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
+        case "gemma3", "gemma2", "gemma":
+            return "<start_of_turn>user\n\(systemPrompt)\n\n\(userText)<end_of_turn>\n<start_of_turn>model\n"
+        case "phi3":
+            return "<|system|>\n\(systemPrompt)<|end|>\n<|user|>\n\(userText)<|end|>\n<|assistant|>\n"
+        default:
+            return "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
+        }
+    }
 
-        do {
-            // Reuse existing engine if available; only create a new one if
-            // this is the first time (no model was ever loaded).
-            if engine == nil {
-                let config = EngineConfig(
-                    modelPath: "",
-                    maxTokens: UInt32(tokensPerCycle),
-                    temperature: 0.7,
-                    topP: 0.9,
-                    contextLength: 4096,
-                    useMetal: true,
-                    memoryLimitBytes: 0,
-                    metallibPath: findMetallibDir()
-                )
-                engine = try await inferenceThread.perform {
-                    try CrabInferEngine(config: config)
-                }
+    /// Stop sequences that indicate the model has finished its turn.
+    /// Includes both special token markers (which may or may not appear as literal
+    /// text depending on how the tokenizer decodes them) and plain-text fallbacks
+    /// for when models emit raw turn boundaries.
+    private var stopSequences: [String] {
+        // Architecture-specific special tokens
+        var sequences: [String] = []
+
+        if let id = activeModelId,
+           let entry = modelCatalog.first(where: { $0.id == id }) {
+            switch entry.architecture {
+            case "qwen3", "qwen2":
+                sequences += ["<|im_end|>", "<|im_start|>"]
+            case "gemma3", "gemma2", "gemma":
+                sequences += ["<end_of_turn>", "<start_of_turn>"]
+            case "phi3":
+                sequences += ["<|end|>", "<|user|>"]
+            default:
+                sequences += ["<|im_end|>", "<|im_start|>"]
             }
-
-            guard let eng = engine else { return }
-
-            let log = try await inferenceThread.perform {
-                try eng.stressTest(
-                    modelPath: modelPath,
-                    cycles: UInt32(cycles),
-                    tokensPerCycle: UInt32(tokensPerCycle)
-                )
-            }
-
-            stressTestLog = log
-        } catch {
-            stressTestLog.append("ERROR: \(error.localizedDescription)")
+        } else {
+            sequences += ["<|im_end|>", "<|im_start|>"]
         }
 
-        // Update UI state — model is unloaded after stress test
-        modelStatus = downloadedModelIds.isEmpty
-            ? "No model — pick one to download"
-            : "Model ready to load"
-        isStressTesting = false
+        // Plain-text fallbacks — catch models that decode turn markers as raw text.
+        // Use \n prefix to avoid false positives mid-sentence.
+        sequences += ["\nuser\n", "\nUser\n", "\nassistant\n", "\nAssistant\n",
+                      "\nsystem\n", "\nSystem\n",
+                      "\nuser:", "\nUser:", "\nassistant:", "\nAssistant:",
+                      "\nsystem:", "\nSystem:",
+                      "\n<user>", "\n<assistant>", "\n<system>"]
+
+        return sequences
+    }
+
+    /// Check if any stop sequence appears in the text.
+    /// Returns the text truncated before the stop sequence, or nil if none found.
+    private func truncateAtStopSequence(_ text: String) -> String? {
+        for stop in stopSequences {
+            if let range = text.range(of: stop) {
+                return String(text[text.startIndex..<range.lowerBound])
+            }
+        }
+        return nil
+    }
+
+    /// Strip `<think>...</think>` blocks from model output.
+    /// Qwen3 is a "thinking" model that emits chain-of-thought reasoning inside
+    /// these tags before producing the actual response. During streaming:
+    /// - If `<think>` is found but `</think>` hasn't appeared yet, return empty
+    ///   string (still thinking).
+    /// - If the full block is found, return only the content after `</think>`.
+    /// - If no `<think>` tag is present, return the text unchanged.
+    private func stripThinkBlocks(_ text: String) -> String {
+        guard let thinkStart = text.range(of: "<think>") else {
+            return text
+        }
+        guard let thinkEnd = text.range(of: "</think>") else {
+            // Still inside think block — show nothing yet
+            return String(text[text.startIndex..<thinkStart.lowerBound])
+        }
+        // Full think block found — return content after it
+        let before = String(text[text.startIndex..<thinkStart.lowerBound])
+        let after = String(text[thinkEnd.upperBound...])
+        return (before + after).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func findMetallibDir() -> String {
@@ -463,70 +528,78 @@ class InferenceViewModel: ObservableObject {
         return ""
     }
 
-    // MARK: - Chat templates
+    // MARK: - Chat generation
 
-    /// Wrap raw user text in the correct instruct/chat template for the loaded model.
-    private func chatPrompt(_ userText: String) -> String {
-        guard let id = activeModelId,
-              let entry = modelCatalog.first(where: { $0.id == id }) else {
-            // Fallback: ChatML (works with most models)
-            return "<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
+    func sendMessage(_ text: String) async {
+        guard engine != nil else {
+            messages.append(ChatMessage(role: .assistant, content: "Please load a model first.", isError: true))
+            return
         }
 
-        switch entry.architecture {
-        case "qwen3", "qwen2":
-            return "<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
-        case "gemma3", "gemma2", "gemma":
-            return "<start_of_turn>user\n\(userText)<end_of_turn>\n<start_of_turn>model\n"
-        case "phi3":
-            return "<|user|>\n\(userText)<|end|>\n<|assistant|>\n"
-        default:
-            return "<|im_start|>user\n\(userText)<|im_end|>\n<|im_start|>assistant\n"
-        }
-    }
+        // Add user message
+        messages.append(ChatMessage(role: .user, content: text))
 
-    // MARK: - Generate
+        // Add empty assistant message that we'll stream into
+        messages.append(ChatMessage(role: .assistant, content: ""))
+        let assistantIndex = messages.count - 1
 
-    func generate(prompt: String, maxTokens: UInt32) async {
-        guard let engine else { return }
         isGenerating = true
-        output = ""
-        lastGenerationStats = nil
-        generatingStatus = "Starting inference..."
+        engine!.reset()
 
-        engine.reset()
-
-        let eng = engine
-        let promptText = chatPrompt(prompt)
+        let eng = engine!
+        let promptText = chatPrompt(text)
 
         let stream = inferenceThread.stream { yieldToken in
-            for _ in 0..<maxTokens {
+            for _ in 0..<UInt32(512) {
                 do {
                     guard let tok = try eng.nextToken(prompt: promptText) else { break }
                     if tok.isEndOfSequence { break }
                     if !yieldToken(tok.text) { break }
                 } catch {
-                    _ = yieldToken("\n[Error: \(error.localizedDescription)]")
+                    NSLog("[CrabInfer-Swift] Token generation error: %@", "\(error)")
+                    _ = yieldToken("\n[Generation stopped due to an error]")
                     break
                 }
             }
         }
 
         var tokenCount: UInt32 = 0
-        for await text in stream {
-            output += text
+        var hitStop = false
+        var rawContent = ""
+        for await token in stream {
+            rawContent += token
             tokenCount += 1
-            if tokenCount == 1 {
-                generatingStatus = "Streaming tokens..."
+
+            // Check if a stop sequence appeared in the raw accumulated text
+            if let truncated = truncateAtStopSequence(rawContent) {
+                rawContent = truncated
+                hitStop = true
+                messages[assistantIndex].content = stripThinkBlocks(rawContent)
+                break
             }
+
+            // Throttle UI updates — updating @Published on every token at ~37 tok/s
+            // causes excessive SwiftUI re-renders and makes the UI feel sluggish.
+            // Update every 4 tokens (~9 updates/s) for smooth streaming without lag.
+            if tokenCount % 4 == 0 {
+                messages[assistantIndex].content = stripThinkBlocks(rawContent)
+            }
+
             if tokenCount % 8 == 0 { updatePressure() }
         }
 
-        generatingStatus = ""
+        // Final update with clean content — always fires after streaming ends
+        messages[assistantIndex].content = stripThinkBlocks(rawContent)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        engine.reset()
-        lastGenerationStats = engine.lastStats()
+        engine?.reset()
+        messages[assistantIndex].stats = engine?.lastStats()
         isGenerating = false
+    }
+
+    func stopGenerating() {
+        // Engine reset will cause nextToken to return nil on next call
+        engine?.reset()
     }
 
     private func updatePressure() {
