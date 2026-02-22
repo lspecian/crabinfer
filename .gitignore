@@ -8,8 +8,10 @@ crabinfer-swift/Sources/CrabInfer/Generated/
 # XCFramework output (rebuild with ./build.sh)
 /CrabInferCore.xcframework/
 
-# Downloaded GGUF models
+# Downloaded GGUF models (but keep the manifest + download script)
 /models/
+!/models/manifest.json
+!/models/download.sh
 *.gguf
 
 # macOS
@@ -48,5 +50,6 @@ build/
 .env
 .env.*
 
-ROADMAP.md
+docs/build/*
 
+.mcp.json

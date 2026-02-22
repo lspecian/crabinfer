@@ -4,9 +4,29 @@
 namespace crabinfer {
     // Get library version
     string version();
-    
+
     // Detect device capabilities
     DeviceInfo detect_device();
+
+    // Estimate peak memory usage for a GGUF model before loading (reads header only)
+    [Throws=CrabInferError]
+    u64 estimate_model_memory(string model_path, u32 context_length);
+
+    // Model catalog
+    sequence<CatalogEntry> model_catalog();
+    sequence<CatalogEntry> models_for_device(DeviceInfo device);
+    sequence<CatalogEntry> recommended_models(DeviceInfo device);
+    CatalogEntry? catalog_entry(string id);
+
+    // Credential management
+    void set_credential(string provider, string api_key);
+    string? get_credential(string provider);
+    void remove_credential(string provider);
+    boolean has_credential(string provider);
+    sequence<string> configured_providers();
+
+    [Throws=CrabInferError]
+    boolean validate_credential(string provider);
 };
 
 // Device information detected at runtime
@@ -18,6 +38,10 @@ dictionary DeviceInfo {
     boolean has_neural_engine;
     string recommended_quant;
     u32 max_model_size_b;
+    u64 max_model_file_size_bytes;
+    string chip_name;
+    string chip_variant;
+    u32 recommended_context_length;
 };
 
 // Configuration for the inference engine
@@ -29,6 +53,7 @@ dictionary EngineConfig {
     u32 context_length;
     boolean use_metal;
     u64 memory_limit_bytes;
+    string metallib_path;
 };
 
 // A generated token with metadata
@@ -48,6 +73,10 @@ dictionary ModelInfo {
     u64 file_size_bytes;
     u32 context_length;
     u32 vocab_size;
+    boolean is_moe;
+    u32 expert_count;
+    u32 expert_used_count;
+    u64 active_parameter_count;
 };
 
 // Generation statistics
@@ -60,12 +89,47 @@ dictionary GenerationStats {
     string compute_backend;
 };
 
+// ---------------------------------------------------------------------------
+// Model catalog types
+// ---------------------------------------------------------------------------
+
+// Model use-case category
+enum ModelCategory {
+    "General",
+    "Code",
+    "Reasoning",
+};
+
+// A model in the curated catalog
+dictionary CatalogEntry {
+    string id;
+    string name;
+    string hf_repo;
+    string gguf_file;
+    string tokenizer_repo;
+    u64 size_bytes;
+    f32 param_count_b;
+    f32 active_param_count_b;
+    string quant;
+    string architecture;
+    u32 min_ram_gb;
+    ModelCategory category;
+    boolean is_moe;
+    string sha256;
+    boolean requires_auth;
+};
+
 // Memory pressure levels matching iOS memory warning levels
 enum MemoryPressure {
     "Normal",
     "Warning",
     "Critical",
     "Terminal",
+};
+
+// Callback interface for memory pressure notifications
+callback interface MemoryPressureListener {
+    void on_pressure_change(MemoryPressure old_level, MemoryPressure new_level);
 };
 
 // Errors that can occur during inference
@@ -80,6 +144,15 @@ enum CrabInferError {
     "ContextOverflow",
     "InvalidConfig",
     "DeviceNotSupported",
+    "ModelTooLarge",
+    "NetworkError",
+    "ApiError",
+    "AuthenticationFailed",
+    "RateLimited",
+    "ProviderNotAvailable",
+    "DownloadFailed",
+    "IntegrityCheckFailed",
+    "StorageError",
 };
 
 // The main inference engine
@@ -121,4 +194,270 @@ interface CrabInferEngine {
     
     // Check if a model is loaded
     boolean is_model_loaded();
+
+    // Get current Metal GPU memory allocation in bytes
+    u64 metal_allocated_bytes();
+
+    // Register a listener for memory pressure changes
+    void set_memory_pressure_listener(MemoryPressureListener listener);
+};
+
+// ---------------------------------------------------------------------------
+// Download manager types
+// ---------------------------------------------------------------------------
+
+// Status of a model download
+enum DownloadStatus {
+    "NotDownloaded",
+    "Downloading",
+    "Downloaded",
+    "Failed",
+};
+
+// A successfully downloaded model with local paths
+dictionary DownloadedModel {
+    string id;
+    string model_path;
+    string tokenizer_path;
+    u64 size_bytes;
+    string downloaded_at;
+};
+
+// Callback interface for download progress
+callback interface DownloadProgressListener {
+    void on_progress(u64 bytes_downloaded, u64 bytes_total, string phase);
+};
+
+// Model download manager
+interface ModelDownloadManager {
+    [Throws=CrabInferError]
+    constructor();
+
+    [Name=with_directory, Throws=CrabInferError]
+    constructor(string directory);
+
+    [Throws=CrabInferError]
+    DownloadedModel download(CatalogEntry entry, DownloadProgressListener? listener);
+
+    boolean is_downloaded(string id);
+    string? model_path(string id);
+    string? tokenizer_path(string id);
+    sequence<DownloadedModel> list_downloaded();
+
+    [Throws=CrabInferError]
+    void delete(string id);
+
+    u64 total_disk_usage();
+    string storage_directory();
+};
+
+// ---------------------------------------------------------------------------
+// Provider types
+// ---------------------------------------------------------------------------
+
+// A chat message in a conversation
+dictionary ChatMessage {
+    string role;
+    string content;
+};
+
+// Unified completion request
+dictionary CompletionRequest {
+    string model;
+    sequence<ChatMessage> messages;
+    u32 max_tokens;
+    f32 temperature;
+    f32 top_p;
+    string system_prompt;
+    string api_key_override;
+};
+
+// Unified completion response
+dictionary CompletionResponse {
+    string content;
+    string model;
+    string provider_name;
+    string stop_reason;
+    u32 input_tokens;
+    u32 output_tokens;
+    string routing_info;
+};
+
+// Describes a model available from a provider
+dictionary ModelDescriptor {
+    string id;
+    string name;
+    string provider;
+    boolean is_local;
+    u32 context_length;
+};
+
+// Provider configuration for cloud and self-hosted providers
+dictionary ProviderConfig {
+    string provider_type;
+    string api_key;
+    string base_url;
+    string default_model;
+    u32 timeout_seconds;
+    string tier_override;
+};
+
+// Unified provider interface for local and cloud LLM inference
+interface CrabInferProvider {
+    [Throws=CrabInferError]
+    constructor(ProviderConfig config);
+
+    [Name=new_local, Throws=CrabInferError]
+    constructor(EngineConfig engine_config);
+
+    string name();
+
+    [Throws=CrabInferError]
+    CompletionResponse complete(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    void stream_start(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    TokenOutput? stream_next();
+
+    [Throws=CrabInferError]
+    sequence<ModelDescriptor> available_models();
+
+    boolean is_available();
+};
+
+// ---------------------------------------------------------------------------
+// Smart Router types
+// ---------------------------------------------------------------------------
+
+// Which infrastructure tier a provider belongs to
+enum ProviderTier {
+    "Local",
+    "SelfHosted",
+    "Cloud",
+};
+
+// Routing policy controlling provider selection
+enum RoutingPolicy {
+    "LocalFirst",
+    "CloudFirst",
+    "LocalOnly",
+    "Auto",
+    "SelfHostedFirst",
+};
+
+// Why a specific provider was chosen
+enum RoutingReason {
+    "LocalAvailable",
+    "MemoryPressureFallback",
+    "NoLocalModel",
+    "CloudPreferred",
+    "NetworkUnavailable",
+    "PrivacyMode",
+    "FallbackAfterError",
+    "SelfHostedAvailable",
+    "SelfHostedPreferred",
+    "DataSovereignty",
+};
+
+// Details about a routing decision
+dictionary RoutingDecision {
+    string provider_name;
+    RoutingReason reason;
+    u32 providers_tried;
+    boolean is_local;
+    ProviderTier provider_tier;
+    MemoryPressure memory_pressure;
+    boolean network_available;
+    u32 latency_ms;
+};
+
+// Router configuration
+dictionary RouterConfig {
+    RoutingPolicy policy;
+    boolean privacy_mode;
+    boolean ollama_is_local;
+    boolean data_sovereignty;
+};
+
+// Smart router that automatically selects between local and cloud providers
+interface CrabInferRouter {
+    [Throws=CrabInferError]
+    constructor(
+        RouterConfig config,
+        EngineConfig? local_config,
+        sequence<ProviderConfig> cloud_configs
+    );
+
+    string name();
+
+    [Throws=CrabInferError]
+    CompletionResponse complete(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    void stream_start(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    TokenOutput? stream_next();
+
+    [Throws=CrabInferError]
+    sequence<ModelDescriptor> available_models();
+
+    boolean is_available();
+
+    void set_network_available(boolean available);
+
+    RoutingDecision? last_routing_decision();
+};
+
+// ---------------------------------------------------------------------------
+// vLLM types
+// ---------------------------------------------------------------------------
+
+// Server-side metrics scraped from vLLM's Prometheus /metrics endpoint
+dictionary VllmServerMetrics {
+    f32 gpu_cache_usage;
+    u32 requests_running;
+    u32 requests_waiting;
+    u32 requests_swapped;
+};
+
+// Extra sampling/generation parameters specific to vLLM
+dictionary VllmCompletionOptions {
+    f32 repetition_penalty;
+    f32 min_p;
+    string guided_json;
+    string guided_regex;
+};
+
+// vLLM provider with standard Provider methods + vLLM-specific features
+interface CrabInferVllm {
+    [Throws=CrabInferError]
+    constructor(ProviderConfig config);
+
+    string name();
+
+    [Throws=CrabInferError]
+    CompletionResponse complete(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    CompletionResponse complete_with_options(CompletionRequest request, VllmCompletionOptions options);
+
+    [Throws=CrabInferError]
+    void stream_start(CompletionRequest request);
+
+    [Throws=CrabInferError]
+    TokenOutput? stream_next();
+
+    [Throws=CrabInferError]
+    sequence<ModelDescriptor> available_models();
+
+    boolean is_available();
+
+    [Throws=CrabInferError]
+    boolean health();
+
+    [Throws=CrabInferError]
+    VllmServerMetrics server_metrics();
 };

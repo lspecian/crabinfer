@@ -199,19 +199,31 @@ fn run_benchmark(args: &CliArgs) {
 
     // Print memory estimate from the memory pressure manager
     if let Ok(info) = peek_model_info(&args.model) {
-        let param_b = info.parameter_count as f32 / 1e9;
-        let estimated = MemoryPressureManager::estimate_model_memory(
-            param_b,
+        let total_b = info.parameter_count as f32 / 1e9;
+        let active_b = info.active_parameter_count as f32 / 1e9;
+        let estimated = MemoryPressureManager::estimate_model_memory_moe(
+            total_b,
+            active_b,
             &info.quantization,
             args.context_length,
         );
-        eprintln!(
-            "Memory estimate: {:.2} GB (for {:.1}B params, {}, ctx {})",
-            estimated as f64 / (1024.0 * 1024.0 * 1024.0),
-            param_b,
-            info.quantization,
-            args.context_length,
-        );
+        if info.is_moe {
+            eprintln!(
+                "Memory estimate: {:.2} GB (MoE: {:.1}B total / {:.1}B active, {}, ctx {})",
+                estimated as f64 / (1024.0 * 1024.0 * 1024.0),
+                total_b, active_b,
+                info.quantization,
+                args.context_length,
+            );
+        } else {
+            eprintln!(
+                "Memory estimate: {:.2} GB (for {:.1}B params, {}, ctx {})",
+                estimated as f64 / (1024.0 * 1024.0 * 1024.0),
+                total_b,
+                info.quantization,
+                args.context_length,
+            );
+        }
         eprintln!();
     }
 
@@ -385,6 +397,31 @@ fn peek_model_info(model_path: &str) -> Result<crabinfer_core::ModelInfo, String
         .map(|(k, _)| k)
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Detect MoE from GGUF metadata
+    let expert_count = md.get(&format!("{architecture}.expert_count"))
+        .and_then(|v| match v {
+            gguf_file::Value::U32(n) => Some(*n),
+            gguf_file::Value::U64(n) => Some(*n as u32),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let expert_used_count = md.get(&format!("{architecture}.expert_used_count"))
+        .and_then(|v| match v {
+            gguf_file::Value::U32(n) => Some(*n),
+            gguf_file::Value::U64(n) => Some(*n as u32),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let is_moe = expert_count > 0 && expert_used_count > 0;
+    let active_parameter_count = if is_moe && expert_count > expert_used_count {
+        let shared_fraction = 0.20;
+        let expert_fraction = (1.0 - shared_fraction)
+            * (expert_used_count as f64 / expert_count as f64);
+        ((shared_fraction + expert_fraction) * parameter_count as f64) as u64
+    } else {
+        parameter_count
+    };
+
     Ok(crabinfer_core::ModelInfo {
         model_name,
         architecture,
@@ -393,6 +430,10 @@ fn peek_model_info(model_path: &str) -> Result<crabinfer_core::ModelInfo, String
         file_size_bytes: file_size,
         context_length,
         vocab_size,
+        is_moe,
+        expert_count,
+        expert_used_count,
+        active_parameter_count,
     })
 }
 

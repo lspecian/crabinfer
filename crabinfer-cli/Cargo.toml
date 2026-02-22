@@ -1,0 +1,30 @@
+[package]
+name = "crabinfer-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CrabInfer CLI — local LLM inference on Apple Silicon"
+license = "Apache-2.0"
+
+[[bin]]
+name = "crabinfer"
+path = "src/main.rs"
+
+[dependencies]
+crabinfer-core = { path = "../crabinfer-core", features = ["providers"] }
+crabinfer-server = { path = "../crabinfer-server" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime (for serve subcommand)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Interactive chat REPL
+rustyline = "14"
+
+# Hidden password input for API keys
+rpassword = "7"

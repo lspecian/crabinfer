@@ -15,10 +15,11 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-# Candle - ML framework with Metal support (fork with iOS Metal shader fixes)
-candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
-candle-nn = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
-candle-transformers = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", features = ["metal"] }
+# Candle - ML framework (fork with iOS Metal shader fixes)
+# Metal features are gated behind the "metal" Cargo feature so Linux builds work.
+candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
+candle-nn = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
+candle-transformers = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
 
 # Tokenizer — use fancy-regex (pure Rust) instead of onig (C library)
 # because Oniguruma's ___chkstk_darwin symbol doesn't link on iOS
@@ -43,7 +44,18 @@ memmap2 = "0.9"
 # System calls (sysctl for device detection)
 libc = "0.2"
 
+# Serialization (for provider types and cloud API JSON)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client for cloud providers (blocking mode, pure-Rust TLS)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+
+# SHA-256 verification for downloaded models
+sha2 = { version = "0.10", optional = true }
+
 [features]
 default = ["metal"]
-metal = []  # Metal GPU acceleration (Apple Silicon / iOS)
-cpu-only = []  # CPU-only mode for testing
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]  # Metal GPU acceleration (Apple Silicon / iOS)
+cpu-only = []  # CPU-only mode — build without Metal (Linux, CI)
+providers = ["dep:reqwest", "dep:sha2"]  # Cloud LLM providers + model downloads

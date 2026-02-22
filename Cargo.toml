@@ -1,5 +1,5 @@
 [workspace]
-members = ["crabinfer-core"]
+members = ["crabinfer-core", "crabinfer-server", "crabinfer-cli"]
 resolver = "2"
 
 [profile.release]

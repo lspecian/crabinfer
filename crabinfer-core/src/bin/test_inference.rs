@@ -42,6 +42,10 @@ fn main() -> Result<(), CrabInferError> {
     println!("  Name:         {}", info.model_name);
     println!("  Architecture: {}", info.architecture);
     println!("  Parameters:   {}", info.parameter_count);
+    if info.is_moe {
+        println!("  MoE:          {} experts, {} active per token", info.expert_count, info.expert_used_count);
+        println!("  Active params: {}", info.active_parameter_count);
+    }
     println!("  Quantization: {}", info.quantization);
     println!("  File size:    {} MB", info.file_size_bytes / (1024 * 1024));
     println!("  Context len:  {}", info.context_length);
