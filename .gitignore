@@ -53,3 +53,4 @@ build/
 docs/build/*
 
 .mcp.json
+node_modules

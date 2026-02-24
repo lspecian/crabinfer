@@ -8,7 +8,7 @@
 ///   cargo run --release --example mac-cli -- --model path/to/model.gguf --prompt "hello" --stream
 
 use crabinfer_core::engine::CrabInferEngine;
-use crabinfer_core::memory::MemoryPressureManager;
+use crabinfer_core::memory_pressure::MemoryPressureManager;
 use crabinfer_core::EngineConfig;
 
 fn main() {

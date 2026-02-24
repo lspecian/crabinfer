@@ -4,7 +4,7 @@
 //! Routing decisions are based on memory pressure, model availability, network
 //! status, provider tier, latency, and a configurable routing policy.
 
-use crate::memory::quick_check_pressure;
+use crate::memory_pressure::quick_check_pressure;
 use crate::provider::{
     CompletionRequest, CompletionResponse, ModelDescriptor, Provider,
 };

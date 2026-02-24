@@ -2,9 +2,12 @@
 name = "crabinfer-core"
 version = "0.1.0"
 edition = "2021"
-description = "Safe, memory-aware LLM inference engine for iOS"
+description = "Safe, memory-aware LLM inference engine for Apple Silicon — local GGUF inference with Metal GPU, smart routing, and cloud fallback"
 license = "Apache-2.0"
-repository = "https://github.com/specianic/crabinfer"
+repository = "https://github.com/lspecian/crabinfer"
+keywords = ["llm", "inference", "metal", "gguf", "apple-silicon"]
+categories = ["science", "api-bindings"]
+readme = "../README.md"
 
 [lib]
 crate-type = ["lib", "staticlib"]

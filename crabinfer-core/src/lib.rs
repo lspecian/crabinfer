@@ -9,10 +9,20 @@ pub mod catalog;
 pub mod chat_template;
 pub mod device;
 pub mod engine;
-pub mod memory;
+pub mod memory_pressure;
+pub mod prompt;
+pub mod conversation;
+pub mod facts;
+pub mod chunker;
+pub mod embedding;
+pub mod vectorstore;
+pub mod knowledge;
 pub mod provider;
 pub mod providers;
 pub mod router;
+pub mod tools;
+pub mod agent;
+pub mod mcp;
 
 #[cfg(feature = "providers")]
 pub mod credentials;
@@ -117,41 +127,41 @@ pub enum MemoryPressure {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum CrabInferError {
-    #[error("Model file not found")]
+    #[error("Model file not found. Ensure the GGUF file exists at the specified path and is readable.")]
     ModelNotFound,
-    #[error("Failed to load model: {reason}")]
+    #[error("Failed to load model: {reason}. Check that the file is a valid GGUF and the architecture is supported (Llama, Phi3, Qwen2/3, Gemma).")]
     ModelLoadFailed { reason: String },
-    #[error("Out of memory: {reason}")]
+    #[error("Out of memory: {reason}. Try a smaller model, reduce context_length, or call unload_model() first.")]
     OutOfMemory { reason: String },
-    #[error("Metal GPU not available")]
+    #[error("Metal GPU not available. Set use_metal=false to use CPU inference, or ensure you are running on Apple Silicon.")]
     MetalNotAvailable,
-    #[error("Tokenization failed")]
+    #[error("Tokenization failed. Ensure the model's GGUF file contains a valid tokenizer or provide a tokenizer.json alongside it.")]
     TokenizationFailed,
-    #[error("Inference failed")]
+    #[error("Inference failed. Ensure a model is loaded (is_model_loaded()), no concurrent generation is running, and the prompt fits within context_length.")]
     InferenceFailed,
-    #[error("Context window overflow")]
+    #[error("Context window overflow. The prompt exceeds the configured context_length. Reduce the prompt length, lower max_tokens, or increase context_length (requires more RAM).")]
     ContextOverflow,
-    #[error("Invalid configuration")]
+    #[error("Invalid configuration. Check that temperature is 0.0-2.0, top_p is 0.0-1.0, context_length > 0, and model_path is non-empty.")]
     InvalidConfig,
-    #[error("Device not supported")]
+    #[error("Device not supported. CrabInfer requires Apple Silicon (Metal GPU) or a 64-bit CPU. Check detect_device() for capabilities.")]
     DeviceNotSupported,
-    #[error("Model too large: {file_size_mb} MB exceeds device limit of {max_allowed_mb} MB")]
+    #[error("Model too large: {file_size_mb} MB exceeds device limit of {max_allowed_mb} MB. Use a smaller quantization (e.g. Q4_K_M instead of Q8_0) or a model with fewer parameters.")]
     ModelTooLarge { file_size_mb: u64, max_allowed_mb: u64 },
-    #[error("Network error: {reason}")]
+    #[error("Network error: {reason}. Check connectivity, verify the provider URL, or switch to a local model with LocalFirst/LocalOnly routing.")]
     NetworkError { reason: String },
-    #[error("API error from {provider}: {message} (status {status_code})")]
+    #[error("API error from {provider} (status {status_code}): {message}. For 401/403: check your API key. For 429: rate limited, wait before retrying. For 5xx: provider may be down.")]
     ApiError { provider: String, status_code: u32, message: String },
-    #[error("Authentication failed for {provider}")]
+    #[error("Authentication failed for {provider}. Set a valid API key via set_credential(\"{provider}\", key) or check that your key has not expired.")]
     AuthenticationFailed { provider: String },
-    #[error("Rate limited by {provider}, retry after {retry_after_seconds}s")]
+    #[error("Rate limited by {provider}, retry after {retry_after_seconds}s. Consider using a local model or reducing request frequency.")]
     RateLimited { provider: String, retry_after_seconds: u32 },
-    #[error("Provider {provider} is not available")]
+    #[error("Provider {provider} is not available. Verify the server is running and accessible, or use the Router with fallback providers.")]
     ProviderNotAvailable { provider: String },
-    #[error("Download failed: {reason}")]
+    #[error("Download failed: {reason}. Check internet connectivity and disk space. The download will resume from where it left off on retry.")]
     DownloadFailed { reason: String },
-    #[error("Integrity check failed: {reason}")]
+    #[error("Integrity check failed: {reason}. The file may be corrupted or incomplete. Delete it and re-download.")]
     IntegrityCheckFailed { reason: String },
-    #[error("Storage error: {reason}")]
+    #[error("Storage error: {reason}. Ensure the directory exists, is writable, and has sufficient disk space.")]
     StorageError { reason: String },
 }
 
@@ -179,7 +189,7 @@ pub fn estimate_model_memory(model_path: String, context_length: u32) -> Result<
     let (info, emb_overhead) = engine::peek_model_metadata(&model_path, context_length)?;
     let total_b = info.parameter_count as f32 / 1e9;
     let active_b = info.active_parameter_count as f32 / 1e9;
-    Ok(memory::MemoryPressureManager::estimate_model_memory_corrected(
+    Ok(memory_pressure::MemoryPressureManager::estimate_model_memory_corrected(
         total_b, active_b, &info.quantization, context_length, emb_overhead,
     ))
 }
@@ -365,7 +375,7 @@ impl CrabInferEngine {
 use provider::{
     CompletionRequest, CompletionResponse, ModelDescriptor, Provider, ProviderConfig,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Unified provider interface for local and cloud LLM inference.
 ///
@@ -730,5 +740,260 @@ impl CrabInferVllm {
     /// Scrape key Prometheus metrics from the vLLM server (GET /metrics).
     pub fn server_metrics(&self) -> Result<VllmServerMetrics, CrabInferError> {
         self.inner.server_metrics()
+    }
+}
+
+// === CrabInferVllmMlx — vLLM-MLX-specific provider exported to Swift ===
+
+// === Agent Runtime types exported to Swift ===
+
+/// Agent configuration for Swift.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AgentConfigRecord {
+    /// Maximum number of tool-calling rounds per turn.
+    pub max_tool_rounds: u32,
+    /// Maximum tokens for each LLM call.
+    pub max_tokens: u32,
+    /// Temperature for generation.
+    pub temperature: f32,
+    /// Top-p sampling.
+    pub top_p: f32,
+    /// Number of RAG results to retrieve per query.
+    pub rag_top_k: u32,
+}
+
+/// Record of a tool execution during an agent turn.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AgentToolExecution {
+    pub tool_name: String,
+    /// JSON string of the tool arguments.
+    pub arguments_json: String,
+    pub output: String,
+    pub is_error: bool,
+}
+
+/// Response from a single agent turn.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AgentResponseRecord {
+    /// The final text response.
+    pub text: String,
+    /// Tool executions that happened during this turn.
+    pub tool_executions: Vec<AgentToolExecution>,
+    /// Number of LLM rounds used.
+    pub rounds: u32,
+}
+
+/// A remembered fact (key-value pair).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FactRecord {
+    pub key: String,
+    pub value: String,
+}
+
+// === CrabInferAgent exported to Swift ===
+
+/// AI Agent with tool calling, memory, and knowledge.
+///
+/// The agent combines an LLM provider (local, cloud, or router) with a tool
+/// registry, conversation memory, persistent facts, and optional knowledge base
+/// to provide an autonomous assistant that can reason and act.
+///
+/// Swift API:
+/// ```swift
+/// let agent = try CrabInferAgent(
+///     providerConfig: ProviderConfig(providerType: "openai", ...),
+///     config: AgentConfigRecord(maxToolRounds: 10, ...)
+/// )
+/// let response = try agent.run(userInput: "What files are in my home directory?")
+/// // response.toolExecutions shows file_list was called
+/// // response.text has the answer
+/// ```
+#[derive(uniffi::Object)]
+pub struct CrabInferAgent {
+    inner: Mutex<agent::Agent>,
+}
+
+#[uniffi::export]
+impl CrabInferAgent {
+    /// Create an agent with a cloud provider.
+    #[uniffi::constructor]
+    pub fn new(
+        provider_config: ProviderConfig,
+        config: AgentConfigRecord,
+    ) -> Result<Self, CrabInferError> {
+        #[cfg(feature = "providers")]
+        let provider: Box<dyn Provider> = match provider_config.provider_type.as_str() {
+            "openai" => Box::new(providers::openai::OpenAIProvider::new(provider_config)?),
+            "anthropic" => Box::new(providers::anthropic::AnthropicProvider::new(provider_config)?),
+            "google" => Box::new(providers::google::GoogleProvider::new(provider_config)?),
+            "ollama" => Box::new(providers::ollama::OllamaProvider::new(provider_config)?),
+            "vllm" => Box::new(providers::vllm::VllmProvider::new(provider_config)?),
+            _ => return Err(CrabInferError::InvalidConfig),
+        };
+
+        #[cfg(not(feature = "providers"))]
+        {
+            let _ = provider_config;
+            let _ = config;
+            return Err(CrabInferError::InvalidConfig);
+        }
+
+        #[cfg(feature = "providers")]
+        {
+            let agent_config = agent::AgentConfig {
+                max_tool_rounds: config.max_tool_rounds,
+                max_tokens: config.max_tokens,
+                temperature: config.temperature,
+                top_p: config.top_p,
+                rag_top_k: config.rag_top_k as usize,
+            };
+
+            let agent = agent::Agent::new(Arc::from(provider))
+                .with_config(agent_config);
+
+            Ok(Self {
+                inner: Mutex::new(agent),
+            })
+        }
+    }
+
+    /// Create an agent with a local inference provider.
+    #[uniffi::constructor(name = "new_local")]
+    pub fn new_local(
+        engine_config: EngineConfig,
+        config: AgentConfigRecord,
+    ) -> Result<Self, CrabInferError> {
+        let provider: Box<dyn Provider> =
+            Box::new(providers::local::LocalProvider::new(engine_config)?);
+
+        let agent_config = agent::AgentConfig {
+            max_tool_rounds: config.max_tool_rounds,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            rag_top_k: config.rag_top_k as usize,
+        };
+
+        let agent = agent::Agent::new(Arc::from(provider))
+            .with_config(agent_config);
+
+        Ok(Self {
+            inner: Mutex::new(agent),
+        })
+    }
+
+    /// Run the agent with user input and return the response.
+    ///
+    /// This executes the full agent loop: LLM → parse tool calls → execute →
+    /// feed results back → repeat until text-only response.
+    pub fn run(&self, user_input: String) -> Result<AgentResponseRecord, CrabInferError> {
+        let mut agent = self.inner.lock().unwrap();
+        let response = agent.run(&user_input)?;
+        Ok(AgentResponseRecord {
+            text: response.text,
+            tool_executions: response
+                .tool_calls
+                .into_iter()
+                .map(|tc| AgentToolExecution {
+                    tool_name: tc.tool_name,
+                    arguments_json: serde_json::to_string(&tc.arguments)
+                        .unwrap_or_default(),
+                    output: tc.output,
+                    is_error: tc.is_error,
+                })
+                .collect(),
+            rounds: response.rounds,
+        })
+    }
+
+    /// Get the names of all available tools.
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut agent = self.inner.lock().unwrap();
+        agent.tools_mut().tool_names()
+    }
+
+    /// Get the number of available tools.
+    pub fn tool_count(&self) -> u32 {
+        let mut agent = self.inner.lock().unwrap();
+        agent.tools_mut().len() as u32
+    }
+
+    /// Add a persistent fact (key-value pair).
+    pub fn add_fact(&self, key: String, value: String) {
+        let mut agent = self.inner.lock().unwrap();
+        agent.facts_mut().add_fact(&key, &value);
+    }
+
+    /// Remove a persistent fact. Returns true if it existed.
+    pub fn remove_fact(&self, key: String) -> bool {
+        let mut agent = self.inner.lock().unwrap();
+        agent.facts_mut().remove_fact(&key)
+    }
+
+    /// Get all stored facts.
+    pub fn get_facts(&self) -> Vec<FactRecord> {
+        let agent = self.inner.lock().unwrap();
+        agent.facts_mut_ref()
+            .all_facts()
+            .iter()
+            .map(|f| FactRecord {
+                key: f.key.clone(),
+                value: f.value.clone(),
+            })
+            .collect()
+    }
+
+    /// Get the number of stored facts.
+    pub fn fact_count(&self) -> u32 {
+        let agent = self.inner.lock().unwrap();
+        agent.facts_mut_ref().count() as u32
+    }
+
+    /// Clear conversation history.
+    pub fn clear_conversation(&self) {
+        let mut agent = self.inner.lock().unwrap();
+        agent.clear_conversation();
+    }
+
+    /// Get the number of messages in the conversation.
+    pub fn message_count(&self) -> u32 {
+        let agent = self.inner.lock().unwrap();
+        agent.conversation().message_count() as u32
+    }
+
+    /// Save persistent state (conversation + facts).
+    pub fn save(&self) -> Result<(), CrabInferError> {
+        let agent = self.inner.lock().unwrap();
+        agent.save()
+    }
+
+    /// Set the system prompt identity.
+    pub fn set_identity(&self, identity: String) {
+        let mut agent = self.inner.lock().unwrap();
+        let prompt = prompt::SystemPrompt::new().identity(&identity);
+        agent.set_system_prompt(prompt);
+    }
+
+    /// Set the conversation persistence path.
+    pub fn set_conversation_path(&self, path: String) {
+        let mut agent = self.inner.lock().unwrap();
+        agent.set_conversation_path(&path);
+    }
+
+    /// Set the facts persistence path.
+    pub fn set_facts_path(&self, path: String) {
+        let mut agent = self.inner.lock().unwrap();
+        agent.set_facts_path(&path);
+    }
+
+    /// Connect to an MCP stdio server and register its tools.
+    /// Returns the number of tools registered.
+    pub fn connect_mcp_stdio(&self, command: String, args: Vec<String>) -> Result<u32, CrabInferError> {
+        let mut agent = self.inner.lock().unwrap();
+        let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let client = mcp::McpStdioClient::connect(&command, &str_args)?;
+        let client = Arc::new(client);
+        let count = mcp::register_mcp_tools(agent.tools_mut(), client)?;
+        Ok(count as u32)
     }
 }

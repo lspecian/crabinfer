@@ -1,0 +1,16 @@
+{
+  "name": "@crabinfer/node-linux-arm64-gnu",
+  "version": "0.1.0",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "main": "crabinfer.linux-arm64-gnu.node",
+  "files": ["crabinfer.linux-arm64-gnu.node"],
+  "description": "CrabInfer Node.js binding - Linux arm64 (GNU)",
+  "license": "Apache-2.0",
+  "engines": { "node": ">= 18" },
+  "libc": ["glibc"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lspecian/crabinfer"
+  }
+}

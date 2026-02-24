@@ -1,0 +1,14 @@
+{
+  "name": "crabinfer-node-minimal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal CrabInfer Node.js inference example",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@crabinfer/node": "^0.1.0"
+  }
+}

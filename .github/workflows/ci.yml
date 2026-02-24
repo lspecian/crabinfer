@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS-ARM64
+            os: macos-14
+            features: "metal,providers"
+            node_features: "metal,providers"
+            build_node: true
+          - platform: Linux-x64
+            os: ubuntu-latest
+            features: "cpu-only,providers"
+            node_features: "cpu-only,providers"
+            build_node: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build workspace
+        run: cargo build --workspace --features ${{ matrix.features }}
+
+      - name: Run tests
+        run: cargo test --workspace --features ${{ matrix.features }}
+
+      - name: Build crabinfer-node binding
+        if: matrix.build_node
+        run: cargo build -p crabinfer-node --features ${{ matrix.node_features }}
+
+  electron-demo:
+    name: Check Electron Demo App
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/electron-demo
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Typecheck
+        run: npm run typecheck

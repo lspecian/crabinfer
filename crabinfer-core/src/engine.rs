@@ -18,7 +18,7 @@ macro_rules! log_debug {
 
 use crate::{
     CrabInferError, EngineConfig, GenerationStats, MemoryPressure,
-    ModelInfo, TokenOutput, memory::MemoryPressureManager,
+    ModelInfo, TokenOutput, memory_pressure::MemoryPressureManager,
 };
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -28,6 +28,7 @@ use candle_transformers::models::quantized_llama::ModelWeights as LlamaModelWeig
 use candle_transformers::models::quantized_phi3::ModelWeights as Phi3ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2ModelWeights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3ModelWeights;
+use candle_transformers::models::quantized_qwen3_moe::GGUFQWenMoE as Qwen3MoeModelWeights;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -43,6 +44,7 @@ enum Model {
     Phi3(Phi3ModelWeights),
     Qwen2(Qwen2ModelWeights),
     Qwen3(Qwen3ModelWeights),
+    Qwen3Moe(Qwen3MoeModelWeights),
     Llama(LlamaModelWeights),
     Gemma3(Gemma3ModelWeights),
 }
@@ -53,6 +55,7 @@ impl Model {
             Model::Phi3(m) => m.forward(x, index_pos),
             Model::Qwen2(m) => m.forward(x, index_pos),
             Model::Qwen3(m) => m.forward(x, index_pos),
+            Model::Qwen3Moe(m) => m.forward(x, index_pos),
             Model::Llama(m) => m.forward(x, index_pos),
             Model::Gemma3(m) => m.forward(x, index_pos),
         }
@@ -66,6 +69,7 @@ impl Model {
     fn clear_kv_cache(&mut self) {
         match self {
             Model::Qwen3(m) => m.clear_kv_cache(),
+            Model::Qwen3Moe(m) => m.clear_kv_cache(),
             // Other architectures auto-reset on index_pos==0
             _ => {}
         }
@@ -78,7 +82,10 @@ impl Model {
     /// triggers a Metal NaN bug when `seq_len == num_kv_heads` (typically 8).
     /// Sequential prefill avoids this entirely since each call has seq_len=1.
     fn needs_sequential_prefill(&self, device: &Device) -> bool {
-        matches!((self, device), (Model::Qwen3(_), Device::Metal(_)))
+        matches!(
+            (self, device),
+            (Model::Qwen3(_) | Model::Qwen3Moe(_), Device::Metal(_))
+        )
     }
 }
 
@@ -861,8 +868,20 @@ impl CrabInferEngine {
             .decode(&state.generated_tokens, true)
             .map_err(|_| CrabInferError::InferenceFailed)?;
 
-        let text = if full_text.len() >= prev_text.len() {
-            full_text[prev_text.len()..].to_string()
+        let byte_offset = prev_text.len();
+        let text = if full_text.len() >= byte_offset
+            && full_text.is_char_boundary(byte_offset)
+        {
+            full_text[byte_offset..].to_string()
+        } else if full_text.len() >= byte_offset {
+            // byte_offset falls inside a multi-byte character; find the next
+            // valid char boundary so we don't panic on emoji / CJK / etc.
+            let safe = full_text
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| i >= byte_offset)
+                .unwrap_or(full_text.len());
+            full_text[safe..].to_string()
         } else {
             // Fallback: decode single token (edge case where BPE merges change output)
             loaded.tokenizer.decode(&[token_id], true).unwrap_or_default()
@@ -1200,6 +1219,11 @@ fn load_model_weights(
                         Qwen2ModelWeights::from_gguf(content, &mut file, &device)
                             .map(Model::Qwen2)?
                     }
+                    "qwen3moe" => {
+                        log_debug!("[CrabInfer] Using Qwen3 MoE loader");
+                        Qwen3MoeModelWeights::from_gguf(content, &mut file, &device, candle_core::DType::F32)
+                            .map(Model::Qwen3Moe)?
+                    }
                     "gemma3" | "gemma2" | "gemma" => Gemma3ModelWeights::from_gguf(content, &mut file, &device)
                         .map(Model::Gemma3)?,
                     "llama" => LlamaModelWeights::from_gguf(content, &mut file, &device)
@@ -1281,6 +1305,8 @@ fn load_model_weights(
                     .map(Model::Qwen3),
                 "qwen3" => Qwen2ModelWeights::from_gguf(content, &mut file, &device)
                     .map(Model::Qwen2),
+                "qwen3moe" => Qwen3MoeModelWeights::from_gguf(content, &mut file, &device, candle_core::DType::F32)
+                    .map(Model::Qwen3Moe),
                 "gemma3" | "gemma2" | "gemma" => Gemma3ModelWeights::from_gguf(content, &mut file, &device)
                     .map(Model::Gemma3),
                 "llama" => LlamaModelWeights::from_gguf(content, &mut file, &device)

@@ -1,5 +1,5 @@
 use crabinfer_core::engine::{self, CrabInferEngine};
-use crabinfer_core::memory::MemoryPressureManager;
+use crabinfer_core::memory_pressure::MemoryPressureManager;
 use crabinfer_core::{EngineConfig, GenerationStats};
 
 pub fn run(model: &str, prompt: &str, max_tokens: u32, temperature: f32, context_length: u32) {

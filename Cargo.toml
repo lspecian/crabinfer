@@ -1,5 +1,5 @@
 [workspace]
-members = ["crabinfer-core", "crabinfer-server", "crabinfer-cli"]
+members = ["crabinfer-core", "crabinfer-server", "crabinfer-cli", "crabinfer-node"]
 resolver = "2"
 
 [profile.release]
@@ -7,3 +7,10 @@ lto = "fat"
 panic = "unwind"  # Must be unwind for UniFFI to catch panics at FFI boundary
 strip = true
 opt-level = 3
+
+# Patch candle to use local fork with Llama RoPE + GQA fixes
+[patch."https://github.com/lspecian/candle"]
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-transformers = { path = "../candle/candle-transformers" }
+candle-metal-kernels = { path = "../candle/candle-metal-kernels" }

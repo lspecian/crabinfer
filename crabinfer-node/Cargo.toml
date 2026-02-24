@@ -1,0 +1,31 @@
+[package]
+name = "crabinfer-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js binding for CrabInfer — safe, memory-aware LLM inference"
+license = "Apache-2.0"
+repository = "https://github.com/lspecian/crabinfer"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# napi-rs bindings
+napi = { version = "2", default-features = false, features = ["async", "napi9", "tokio_rt"] }
+napi-derive = "2"
+
+# CrabInfer core
+crabinfer-core = { path = "../crabinfer-core", default-features = false }
+
+# Serialization for converting types
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[features]
+default = ["metal", "providers"]
+metal = ["crabinfer-core/metal"]
+cpu-only = ["crabinfer-core/cpu-only"]
+providers = ["crabinfer-core/providers"]

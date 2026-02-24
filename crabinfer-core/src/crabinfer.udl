@@ -461,3 +461,77 @@ interface CrabInferVllm {
     [Throws=CrabInferError]
     VllmServerMetrics server_metrics();
 };
+
+// ---------------------------------------------------------------------------
+// Agent Runtime types
+// ---------------------------------------------------------------------------
+
+// Agent configuration
+dictionary AgentConfigRecord {
+    u32 max_tool_rounds;
+    u32 max_tokens;
+    f32 temperature;
+    f32 top_p;
+    u32 rag_top_k;
+};
+
+// Record of a tool execution during an agent turn
+dictionary AgentToolExecution {
+    string tool_name;
+    string arguments_json;
+    string output;
+    boolean is_error;
+};
+
+// Response from a single agent turn
+dictionary AgentResponseRecord {
+    string text;
+    sequence<AgentToolExecution> tool_executions;
+    u32 rounds;
+};
+
+// A remembered fact (key-value pair)
+dictionary FactRecord {
+    string key;
+    string value;
+};
+
+// AI Agent with tool calling, memory, and knowledge
+interface CrabInferAgent {
+    [Throws=CrabInferError]
+    constructor(ProviderConfig provider_config, AgentConfigRecord config);
+
+    [Name=new_local, Throws=CrabInferError]
+    constructor(EngineConfig engine_config, AgentConfigRecord config);
+
+    // Run the agent with user input
+    [Throws=CrabInferError]
+    AgentResponseRecord run(string user_input);
+
+    // Tool information
+    sequence<string> tool_names();
+    u32 tool_count();
+
+    // Fact/memory management
+    void add_fact(string key, string value);
+    boolean remove_fact(string key);
+    sequence<FactRecord> get_facts();
+    u32 fact_count();
+
+    // Conversation management
+    void clear_conversation();
+    u32 message_count();
+
+    // Persistence
+    [Throws=CrabInferError]
+    void save();
+
+    // Configuration
+    void set_identity(string identity);
+    void set_conversation_path(string path);
+    void set_facts_path(string path);
+
+    // MCP integration
+    [Throws=CrabInferError]
+    u32 connect_mcp_stdio(string command, sequence<string> args);
+};

@@ -4,7 +4,7 @@
 //! HuggingFace, filterable by device capability, category, and size.
 //! The catalog is compiled into the binary — no network access needed.
 
-use crate::memory::MemoryPressureManager;
+use crate::memory_pressure::MemoryPressureManager;
 use crate::DeviceInfo;
 
 // ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ fn catalog_data() -> Vec<CatalogEntry> {
             name: "Llama 3.1 70B Instruct Q4_K_M".into(),
             hf_repo: "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF".into(),
             gguf_file: "Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf".into(),
-            tokenizer_repo: "meta-llama/Llama-3.1-70B-Instruct".into(),
+            tokenizer_repo: "unsloth/Meta-Llama-3.1-70B-Instruct".into(),
             size_bytes: 40_500_000_000,
             param_count_b: 70.0,
             active_param_count_b: 70.0,

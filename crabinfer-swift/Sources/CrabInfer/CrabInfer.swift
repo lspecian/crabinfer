@@ -967,4 +967,203 @@ extension CrabInfer {
             }
         }
     }
+
+    // MARK: - Agent
+
+    /// Configuration for the AI agent.
+    public struct AgentConfig {
+        /// Maximum number of tool-calling rounds per turn (prevents infinite loops).
+        public var maxToolRounds: UInt32
+        /// Maximum tokens for each LLM call.
+        public var maxTokens: UInt32
+        /// Temperature for generation.
+        public var temperature: Float
+        /// Top-p sampling.
+        public var topP: Float
+        /// Number of RAG results to retrieve per query.
+        public var ragTopK: UInt32
+
+        public init(
+            maxToolRounds: UInt32 = 10,
+            maxTokens: UInt32 = 2048,
+            temperature: Float = 0.7,
+            topP: Float = 0.9,
+            ragTopK: UInt32 = 3
+        ) {
+            self.maxToolRounds = maxToolRounds
+            self.maxTokens = maxTokens
+            self.temperature = temperature
+            self.topP = topP
+            self.ragTopK = ragTopK
+        }
+
+        fileprivate var record: AgentConfigRecord {
+            AgentConfigRecord(
+                maxToolRounds: maxToolRounds,
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                ragTopK: ragTopK
+            )
+        }
+    }
+
+    /// A tool execution record from an agent turn.
+    public struct ToolExecution {
+        /// Tool name that was called.
+        public let toolName: String
+        /// JSON string of tool arguments.
+        public let argumentsJson: String
+        /// Tool output.
+        public let output: String
+        /// Whether the tool returned an error.
+        public let isError: Bool
+
+        init(from record: AgentToolExecution) {
+            self.toolName = record.toolName
+            self.argumentsJson = record.argumentsJson
+            self.output = record.output
+            self.isError = record.isError
+        }
+    }
+
+    /// Response from a single agent turn.
+    public struct AgentResult {
+        /// The final text response from the agent.
+        public let text: String
+        /// Tool executions that happened during this turn.
+        public let toolExecutions: [ToolExecution]
+        /// Number of LLM rounds used.
+        public let rounds: UInt32
+
+        init(from record: AgentResponseRecord) {
+            self.text = record.text
+            self.toolExecutions = record.toolExecutions.map { ToolExecution(from: $0) }
+            self.rounds = record.rounds
+        }
+    }
+
+    /// A remembered fact (key-value pair).
+    public struct Fact: Identifiable {
+        public var id: String { key }
+        public let key: String
+        public let value: String
+
+        init(from record: FactRecord) {
+            self.key = record.key
+            self.value = record.value
+        }
+    }
+
+    /// AI Agent with tool calling, memory, and knowledge.
+    ///
+    /// The agent combines an LLM provider (local or cloud) with built-in tools
+    /// (file read/write, shell exec, web fetch), conversation memory, persistent
+    /// facts, and optional MCP server connections.
+    ///
+    /// Usage:
+    /// ```swift
+    /// let agent = try CrabInfer.Agent(
+    ///     provider: .cloudConfig(provider: "openai", apiKey: "sk-...", model: "gpt-4o"),
+    ///     config: .init(maxToolRounds: 10, maxTokens: 2048)
+    /// )
+    /// let result = try await agent.run("What files are in my home directory?")
+    /// print(result.text)
+    /// for exec in result.toolExecutions {
+    ///     print("  [\(exec.isError ? "ERR" : "OK")] \(exec.toolName)")
+    /// }
+    /// ```
+    public final class Agent: @unchecked Sendable {
+        private let inner: CrabInferAgent
+
+        /// Create an agent with a cloud provider.
+        ///
+        /// - Parameters:
+        ///   - provider: Cloud provider configuration (from `CrabInfer.cloudConfig()`)
+        ///   - config: Agent configuration (tool rounds, token limits, etc.)
+        public init(provider: ProviderConfig, config: AgentConfig = .init()) throws {
+            self.inner = try CrabInferAgent(providerConfig: provider, config: config.record)
+        }
+
+        /// Create an agent with a local inference engine.
+        ///
+        /// - Parameters:
+        ///   - engineConfig: Local engine configuration
+        ///   - config: Agent configuration
+        public init(engineConfig: EngineConfig, config: AgentConfig = .init()) throws {
+            self.inner = try CrabInferAgent.newLocal(engineConfig: engineConfig, config: config.record)
+        }
+
+        /// Run the agent with user input (async, dispatched to background thread).
+        ///
+        /// This executes the full agent loop: LLM → parse tool calls → execute →
+        /// feed results back → repeat until text-only response.
+        public func run(_ userInput: String) async throws -> AgentResult {
+            let inner = self.inner
+            let response = try await Task.detached(priority: .userInitiated) {
+                try inner.run(userInput: userInput)
+            }.value
+            return AgentResult(from: response)
+        }
+
+        /// Get the names of all available tools.
+        public var toolNames: [String] { inner.toolNames() }
+
+        /// Get the number of available tools.
+        public var toolCount: Int { Int(inner.toolCount()) }
+
+        /// Add a persistent fact (key-value pair).
+        public func addFact(key: String, value: String) {
+            inner.addFact(key: key, value: value)
+        }
+
+        /// Remove a persistent fact. Returns true if it existed.
+        @discardableResult
+        public func removeFact(key: String) -> Bool {
+            inner.removeFact(key: key)
+        }
+
+        /// Get all stored facts.
+        public var facts: [Fact] {
+            inner.getFacts().map { Fact(from: $0) }
+        }
+
+        /// Get the number of stored facts.
+        public var factCount: Int { Int(inner.factCount()) }
+
+        /// Clear conversation history.
+        public func clearConversation() {
+            inner.clearConversation()
+        }
+
+        /// Get the number of messages in the conversation.
+        public var messageCount: Int { Int(inner.messageCount()) }
+
+        /// Save persistent state (conversation + facts) to disk.
+        public func save() throws {
+            try inner.save()
+        }
+
+        /// Set the agent's identity/personality.
+        public func setIdentity(_ identity: String) {
+            inner.setIdentity(identity: identity)
+        }
+
+        /// Set the file path for conversation persistence.
+        public func setConversationPath(_ path: String) {
+            inner.setConversationPath(path: path)
+        }
+
+        /// Set the file path for facts persistence.
+        public func setFactsPath(_ path: String) {
+            inner.setFactsPath(path: path)
+        }
+
+        /// Connect to an MCP stdio server and register its tools.
+        /// Returns the number of tools registered.
+        @discardableResult
+        public func connectMcpStdio(command: String, args: [String] = []) throws -> Int {
+            Int(try inner.connectMcpStdio(command: command, args: args))
+        }
+    }
 }

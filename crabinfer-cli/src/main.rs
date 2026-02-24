@@ -1,7 +1,9 @@
+mod cmd_assistant;
 mod cmd_auth;
 mod cmd_bench;
 mod cmd_chat;
 mod cmd_info;
+mod cmd_mcp;
 mod cmd_models;
 mod cmd_run;
 mod cmd_serve;
@@ -113,6 +115,39 @@ enum Commands {
         action: ModelsAction,
     },
 
+    /// Interactive AI assistant with tool calling
+    Assistant {
+        /// Cloud provider: openai, anthropic, google, ollama, vllm
+        #[arg(long, default_value = "openai")]
+        provider: String,
+
+        /// Model to use (e.g., gpt-4o, claude-sonnet-4-20250514)
+        #[arg(long, default_value = "gpt-4o")]
+        model: String,
+
+        /// Maximum tokens per response
+        #[arg(long, default_value = "2048")]
+        max_tokens: u32,
+
+        /// Sampling temperature
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+
+        /// Data directory for state persistence
+        #[arg(long)]
+        data_dir: Option<String>,
+
+        /// Knowledge files to index for RAG
+        #[arg(long)]
+        knowledge: Vec<String>,
+    },
+
+    /// Manage MCP (Model Context Protocol) servers
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+
     /// Start OpenAI/Anthropic-compatible API server
     Serve {
         /// Path to GGUF model file
@@ -192,6 +227,52 @@ enum ModelsAction {
     Storage,
 }
 
+#[derive(Subcommand)]
+enum McpAction {
+    /// List configured MCP servers
+    List,
+    /// Add an MCP server
+    Add {
+        /// Unique server name
+        #[arg(long)]
+        name: String,
+        /// Transport: stdio or http
+        #[arg(long)]
+        transport: String,
+        /// For stdio: command to run. For http: URL
+        #[arg(long)]
+        command: String,
+        /// Command-line arguments (stdio only)
+        #[arg(long)]
+        args: Vec<String>,
+        /// Description
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Remove an MCP server
+    Remove {
+        /// Server name to remove
+        name: String,
+    },
+    /// Enable a disabled server
+    Enable {
+        /// Server name
+        name: String,
+    },
+    /// Disable a server
+    Disable {
+        /// Server name
+        name: String,
+    },
+    /// Test connection to an MCP server
+    Test {
+        /// Server name
+        name: String,
+    },
+    /// Run CrabInfer as an MCP server (stdio)
+    Serve,
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -241,6 +322,36 @@ fn main() {
             ModelsAction::Downloaded => cmd_models::downloaded(),
             ModelsAction::Remove { id } => cmd_models::remove(&id),
             ModelsAction::Storage => cmd_models::storage(),
+        },
+        Commands::Assistant {
+            provider,
+            model,
+            max_tokens,
+            temperature,
+            data_dir,
+            knowledge,
+        } => cmd_assistant::run(
+            &provider,
+            &model,
+            max_tokens,
+            temperature,
+            data_dir.as_deref(),
+            &knowledge,
+        ),
+        Commands::Mcp { action } => match action {
+            McpAction::List => cmd_mcp::list(),
+            McpAction::Add {
+                name,
+                transport,
+                command,
+                args,
+                description,
+            } => cmd_mcp::add(&name, &transport, &command, &args, &description),
+            McpAction::Remove { name } => cmd_mcp::remove(&name),
+            McpAction::Enable { name } => cmd_mcp::toggle(&name, true),
+            McpAction::Disable { name } => cmd_mcp::toggle(&name, false),
+            McpAction::Test { name } => cmd_mcp::test_server(&name),
+            McpAction::Serve => cmd_mcp::serve(),
         },
         Commands::Serve {
             model,

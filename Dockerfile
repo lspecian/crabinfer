@@ -45,7 +45,7 @@ RUN cargo build --release -p crabinfer-server \
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/crabinfer-server /usr/local/bin/crabinfer-server
@@ -54,6 +54,13 @@ COPY --from=builder /build/target/release/crabinfer-server /usr/local/bin/crabin
 RUN mkdir -p /models
 
 EXPOSE 8080
+
+LABEL org.opencontainers.image.source="https://github.com/lspecian/crabinfer"
+LABEL org.opencontainers.image.description="CrabInfer Server — OpenAI-compatible local LLM inference"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["crabinfer-server"]
 CMD ["--model", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080"]

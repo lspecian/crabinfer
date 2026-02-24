@@ -2,7 +2,7 @@
 /// Determines optimal model configuration based on hardware
 
 use crate::DeviceInfo;
-use crate::memory::MemoryPressureManager;
+use crate::memory_pressure::MemoryPressureManager;
 
 /// Detect the current device's capabilities
 pub fn detect_device() -> DeviceInfo {
