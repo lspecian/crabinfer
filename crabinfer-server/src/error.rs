@@ -31,6 +31,13 @@ impl ServerError {
             message: msg.into(),
         }
     }
+
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ServerError {

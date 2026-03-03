@@ -1,4 +1,5 @@
 use crabinfer_core::engine::CrabInferEngine;
+use crabinfer_core::serving::engine_loop::EngineHandle;
 use crabinfer_core::ModelInfo;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,9 +7,12 @@ use tokio::sync::Mutex;
 
 /// Shared application state
 pub struct AppState {
-    pub engine: Arc<CrabInferEngine>,
-    /// Serializes inference requests (engine supports one streaming session at a time)
+    /// Legacy single-request engine (used when `serving_engine` is None).
+    pub engine: Option<Arc<CrabInferEngine>>,
+    /// Serializes legacy inference requests.
     pub inference_lock: Mutex<()>,
+    /// New PagedAttention serving engine (when enabled, routes prefer this).
+    pub serving_engine: Option<EngineHandle>,
     /// Cached model info (set after engine loads)
     pub model_info: ModelInfo,
     /// Model identifier for API responses

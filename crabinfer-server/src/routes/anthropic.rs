@@ -5,6 +5,7 @@ use crate::types::anthropic::*;
 use crate::types::common::ChatMessage;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use axum::Json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,8 +22,6 @@ pub async fn messages(
         return Ok(messages_stream(state, req).await?.into_response());
     }
 
-    let _lock = state.inference_lock.lock().await;
-
     // Prepend system message if provided
     let mut messages = Vec::new();
     if let Some(ref system) = req.system {
@@ -33,11 +32,24 @@ pub async fn messages(
     }
     messages.extend(req.messages.iter().cloned());
 
+    // ── Serving engine path (continuous batching) ──
+    if let Some(ref engine) = state.serving_engine {
+        return serving_messages(&state, engine, &messages, &req).await;
+    }
+
+    // ── Legacy engine path ──
+    let engine = state
+        .engine
+        .as_ref()
+        .ok_or_else(|| ServerError::internal("no engine available"))?;
+
+    let _lock = state.inference_lock.lock().await;
+
     let architecture = &state.model_info.architecture;
     let prompt = apply_chat_template(architecture, &messages);
     let temperature = req.temperature.unwrap_or(0.7);
 
-    let engine = Arc::clone(&state.engine);
+    let engine = Arc::clone(engine);
     let max_tokens = req.max_tokens;
     let result = tokio::task::spawn_blocking(move || {
         engine.reset();
@@ -84,6 +96,81 @@ pub async fn messages(
     Ok(Json(response).into_response())
 }
 
+/// Non-streaming messages via the serving engine.
+async fn serving_messages(
+    state: &AppState,
+    engine: &crabinfer_core::serving::engine_loop::EngineHandle,
+    messages: &[ChatMessage],
+    req: &MessagesRequest,
+) -> Result<axum::response::Response, ServerError> {
+    use crabinfer_core::serving::sequence::SamplingParams;
+
+    let architecture = &state.model_info.architecture;
+    let prompt = apply_chat_template(architecture, messages);
+
+    let prompt_tokens = engine
+        .encode(&prompt)
+        .map_err(|e| ServerError::internal(format!("tokenization failed: {e}")))?;
+    let input_tokens = prompt_tokens.len() as u32;
+
+    let max_tokens = req.max_tokens as usize;
+    let temperature = req.temperature.unwrap_or(0.7);
+    let top_p = req.top_p.unwrap_or(0.9);
+
+    let params = SamplingParams {
+        temperature,
+        top_p,
+        max_tokens,
+        ..SamplingParams::default()
+    };
+
+    let mut rx = engine
+        .submit(prompt_tokens, params)
+        .map_err(|e| ServerError::internal(format!("engine error: {e}")))?;
+
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let mut stop_reason = "end_turn".to_string();
+
+    while let Some(tok) = rx.recv().await {
+        generated_ids.push(tok.token_id);
+        if let Some(reason) = tok.finish_reason {
+            stop_reason = finish_reason_to_anthropic(reason).to_string();
+            break;
+        }
+    }
+
+    let completion_text = engine.decode(&generated_ids).unwrap_or_default();
+    let output_tokens = generated_ids.len() as u32;
+
+    state.metrics.inc_success();
+    state
+        .metrics
+        .add_tokens(input_tokens as u64, output_tokens as u64);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let response = MessagesResponse {
+        id: format!("msg_{}", now),
+        type_field: "message".to_string(),
+        role: "assistant".to_string(),
+        content: vec![ContentBlock {
+            type_field: "text".to_string(),
+            text: completion_text,
+        }],
+        model: state.model_id.clone(),
+        stop_reason,
+        usage: AnthropicUsage {
+            input_tokens,
+            output_tokens,
+        },
+    };
+
+    Ok(Json(response).into_response())
+}
+
 /// Streaming variant of messages
 async fn messages_stream(
     state: Arc<AppState>,
@@ -92,9 +179,6 @@ async fn messages_stream(
     Sse<axum::response::sse::KeepAliveStream<ReceiverStream<Result<Event, std::convert::Infallible>>>>,
     ServerError,
 > {
-    let architecture = state.model_info.architecture.clone();
-    let model_id = state.model_id.clone();
-
     // Prepend system message if provided
     let mut messages = Vec::new();
     if let Some(ref system) = req.system {
@@ -104,6 +188,20 @@ async fn messages_stream(
         });
     }
     messages.extend(req.messages.iter().cloned());
+
+    // ── Serving engine path ──
+    if let Some(ref engine) = state.serving_engine {
+        return serving_messages_stream(state.clone(), engine.clone(), messages, req).await;
+    }
+
+    // ── Legacy engine path ──
+    let engine = state
+        .engine
+        .as_ref()
+        .ok_or_else(|| ServerError::internal("no engine available"))?;
+
+    let architecture = state.model_info.architecture.clone();
+    let model_id = state.model_id.clone();
 
     let prompt = apply_chat_template(&architecture, &messages);
     let max_tokens = req.max_tokens;
@@ -116,13 +214,11 @@ async fn messages_stream(
     let msg_id = format!("msg_{}", now);
 
     let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let engine = Arc::clone(engine);
 
     tokio::spawn(async move {
         let _lock = state.inference_lock.lock().await;
 
-        let engine = Arc::clone(&state.engine);
-
-        // Reset engine
         let engine_reset = Arc::clone(&engine);
         let _ = tokio::task::spawn_blocking(move || engine_reset.reset()).await;
 
@@ -144,9 +240,7 @@ async fn messages_stream(
         };
         if let Ok(json) = serde_json::to_string(&start_event) {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("message_start")
-                    .data(json)))
+                .send(Ok(Event::default().event("message_start").data(json)))
                 .await;
         }
 
@@ -161,9 +255,7 @@ async fn messages_stream(
         };
         if let Ok(json) = serde_json::to_string(&block_start) {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("content_block_start")
-                    .data(json)))
+                .send(Ok(Event::default().event("content_block_start").data(json)))
                 .await;
         }
 
@@ -178,10 +270,8 @@ async fn messages_stream(
             let engine_tok = Arc::clone(&engine);
             let prompt_for_tok = prompt_clone.clone();
 
-            let token_result = tokio::task::spawn_blocking(move || {
-                engine_tok.next_token(prompt_for_tok)
-            })
-            .await;
+            let token_result =
+                tokio::task::spawn_blocking(move || engine_tok.next_token(prompt_for_tok)).await;
 
             match token_result {
                 Ok(Ok(Some(tok))) => {
@@ -206,7 +296,7 @@ async fn messages_stream(
                             .await
                             .is_err()
                         {
-                            break; // Client disconnected
+                            break;
                         }
                     }
                 }
@@ -222,9 +312,7 @@ async fn messages_stream(
         };
         if let Ok(json) = serde_json::to_string(&block_stop) {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("content_block_stop")
-                    .data(json)))
+                .send(Ok(Event::default().event("content_block_stop").data(json)))
                 .await;
         }
 
@@ -241,9 +329,7 @@ async fn messages_stream(
         };
         if let Ok(json) = serde_json::to_string(&msg_delta) {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("message_delta")
-                    .data(json)))
+                .send(Ok(Event::default().event("message_delta").data(json)))
                 .await;
         }
 
@@ -253,9 +339,7 @@ async fn messages_stream(
         };
         if let Ok(json) = serde_json::to_string(&msg_stop) {
             let _ = tx
-                .send(Ok(Event::default()
-                    .event("message_stop")
-                    .data(json)))
+                .send(Ok(Event::default().event("message_stop").data(json)))
                 .await;
         }
     });
@@ -263,9 +347,183 @@ async fn messages_stream(
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
 }
 
+/// Streaming messages via the serving engine.
+async fn serving_messages_stream(
+    state: Arc<AppState>,
+    engine: crabinfer_core::serving::engine_loop::EngineHandle,
+    messages: Vec<ChatMessage>,
+    req: MessagesRequest,
+) -> Result<
+    Sse<axum::response::sse::KeepAliveStream<ReceiverStream<Result<Event, std::convert::Infallible>>>>,
+    ServerError,
+> {
+    use crabinfer_core::serving::sequence::SamplingParams;
+
+    let architecture = state.model_info.architecture.clone();
+    let model_id = state.model_id.clone();
+    let prompt = apply_chat_template(&architecture, &messages);
+
+    let prompt_tokens = engine
+        .encode(&prompt)
+        .map_err(|e| ServerError::internal(format!("tokenization failed: {e}")))?;
+    let input_tokens = prompt_tokens.len() as u32;
+
+    let max_tokens = req.max_tokens as usize;
+    let temperature = req.temperature.unwrap_or(0.7);
+    let top_p = req.top_p.unwrap_or(0.9);
+
+    let params = SamplingParams {
+        temperature,
+        top_p,
+        max_tokens,
+        ..SamplingParams::default()
+    };
+
+    let mut rx = engine
+        .submit(prompt_tokens, params)
+        .map_err(|e| ServerError::internal(format!("engine error: {e}")))?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let msg_id = format!("msg_{}", now);
+
+    let (tx, sse_rx) = tokio::sync::mpsc::channel(32);
+
+    tokio::spawn(async move {
+        // 1. message_start
+        let start_event = MessageStartEvent {
+            type_field: "message_start".to_string(),
+            message: MessageStartBody {
+                id: msg_id.clone(),
+                type_field: "message".to_string(),
+                role: "assistant".to_string(),
+                content: vec![],
+                model: model_id.clone(),
+                stop_reason: None,
+                usage: AnthropicUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            },
+        };
+        if let Ok(json) = serde_json::to_string(&start_event) {
+            let _ = tx
+                .send(Ok(Event::default().event("message_start").data(json)))
+                .await;
+        }
+
+        // 2. content_block_start
+        let block_start = ContentBlockStartEvent {
+            type_field: "content_block_start".to_string(),
+            index: 0,
+            content_block: ContentBlock {
+                type_field: "text".to_string(),
+                text: String::new(),
+            },
+        };
+        if let Ok(json) = serde_json::to_string(&block_start) {
+            let _ = tx
+                .send(Ok(Event::default().event("content_block_start").data(json)))
+                .await;
+        }
+
+        // 3. content_block_delta (stream tokens from serving engine)
+        let mut output_tokens = 0u32;
+        let mut stop_reason = "end_turn".to_string();
+
+        while let Some(tok) = rx.recv().await {
+            let text = engine.decode(&[tok.token_id]).unwrap_or_default();
+            output_tokens += 1;
+
+            let is_done = tok.finish_reason.is_some();
+            if let Some(reason) = tok.finish_reason {
+                stop_reason = finish_reason_to_anthropic(reason).to_string();
+            }
+
+            if !text.is_empty() {
+                let delta_event = ContentBlockDeltaEvent {
+                    type_field: "content_block_delta".to_string(),
+                    index: 0,
+                    delta: TextDelta {
+                        type_field: "text_delta".to_string(),
+                        text,
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&delta_event) {
+                    if tx
+                        .send(Ok(Event::default()
+                            .event("content_block_delta")
+                            .data(json)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if is_done {
+                break;
+            }
+        }
+
+        // 4. content_block_stop
+        let block_stop = ContentBlockStopEvent {
+            type_field: "content_block_stop".to_string(),
+            index: 0,
+        };
+        if let Ok(json) = serde_json::to_string(&block_stop) {
+            let _ = tx
+                .send(Ok(Event::default().event("content_block_stop").data(json)))
+                .await;
+        }
+
+        // 5. message_delta
+        let msg_delta = MessageDeltaEvent {
+            type_field: "message_delta".to_string(),
+            delta: MessageDelta { stop_reason },
+            usage: AnthropicUsage {
+                input_tokens,
+                output_tokens,
+            },
+        };
+        if let Ok(json) = serde_json::to_string(&msg_delta) {
+            let _ = tx
+                .send(Ok(Event::default().event("message_delta").data(json)))
+                .await;
+        }
+
+        // 6. message_stop
+        let msg_stop = MessageStopEvent {
+            type_field: "message_stop".to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg_stop) {
+            let _ = tx
+                .send(Ok(Event::default().event("message_stop").data(json)))
+                .await;
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()))
+}
+
+/// Map FinishReason to Anthropic stop_reason string.
+fn finish_reason_to_anthropic(
+    reason: crabinfer_core::serving::sequence::FinishReason,
+) -> &'static str {
+    use crabinfer_core::serving::sequence::FinishReason;
+    match reason {
+        FinishReason::EndOfSequence => "end_turn",
+        FinishReason::MaxTokens => "max_tokens",
+        FinishReason::Stop => "end_turn",
+        FinishReason::Cancelled => "end_turn",
+        FinishReason::Preempted => "end_turn",
+    }
+}
+
 fn estimate_tokens_anthropic(messages: &[ChatMessage]) -> u32 {
     let total_chars: usize = messages.iter().map(|m| m.content.len() + m.role.len()).sum();
     (total_chars / 4).max(1) as u32
 }
-
-use axum::response::IntoResponse;

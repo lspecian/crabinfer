@@ -23,6 +23,7 @@ pub mod router;
 pub mod tools;
 pub mod agent;
 pub mod mcp;
+pub mod serving;
 
 #[cfg(feature = "providers")]
 pub mod credentials;

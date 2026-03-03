@@ -3,10 +3,14 @@ pub mod health;
 pub mod openai;
 
 use crate::state::AppState;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+
+/// Maximum request body size: 1MB (prevents trivial DoS from huge payloads).
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -18,6 +22,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Anthropic-compatible
         .route("/v1/messages", post(anthropic::messages))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

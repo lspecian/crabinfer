@@ -16,6 +16,12 @@ path = "src/main.rs"
 [dependencies]
 crabinfer-core = { path = "../crabinfer-core", features = ["providers"] }
 
+# Candle (for GGUF loading in serving engine path)
+candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
+
+# Tokenizer (for serving engine path)
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
 # Web framework
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal"] }
@@ -34,3 +40,6 @@ tracing-subscriber = "0.3"
 
 # Streaming
 tokio-stream = "0.1"
+
+# System memory detection
+libc = "0.2"

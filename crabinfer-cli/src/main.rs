@@ -173,6 +173,18 @@ enum Commands {
         /// Advertise via Bonjour/mDNS for LAN discovery (macOS only)
         #[arg(long)]
         advertise: bool,
+
+        /// Use the PagedAttention serving engine with continuous batching
+        #[arg(long)]
+        serving: bool,
+
+        /// Path to a draft model GGUF for speculative decoding (requires --serving)
+        #[arg(long)]
+        draft_model: Option<String>,
+
+        /// Number of draft tokens per speculative step (default: 4)
+        #[arg(long, default_value = "4")]
+        num_draft_tokens: u32,
     },
 }
 
@@ -360,6 +372,19 @@ fn main() {
             context_length,
             cpu,
             advertise,
-        } => cmd_serve::run(&model, &host, port, context_length, cpu, advertise),
+            serving,
+            draft_model,
+            num_draft_tokens,
+        } => cmd_serve::run(
+            &model,
+            &host,
+            port,
+            context_length,
+            cpu,
+            advertise,
+            serving,
+            draft_model,
+            num_draft_tokens,
+        ),
     }
 }

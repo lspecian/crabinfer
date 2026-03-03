@@ -27,6 +27,18 @@ struct Cli {
     /// Advertise via Bonjour/mDNS for LAN discovery (macOS only)
     #[arg(long)]
     advertise: bool,
+
+    /// Use the PagedAttention serving engine with continuous batching
+    #[arg(long)]
+    serving: bool,
+
+    /// Path to a draft model GGUF for speculative decoding (requires --serving)
+    #[arg(long)]
+    draft_model: Option<String>,
+
+    /// Number of draft tokens per speculative step (default: 4)
+    #[arg(long, default_value = "4")]
+    num_draft_tokens: u32,
 }
 
 #[tokio::main]
@@ -42,6 +54,9 @@ async fn main() {
         context_length: cli.context_length,
         cpu: cli.cpu,
         advertise: cli.advertise,
+        serving: cli.serving,
+        draft_model_path: cli.draft_model,
+        num_draft_tokens: cli.num_draft_tokens,
     };
 
     if let Err(e) = run_server(config).await {

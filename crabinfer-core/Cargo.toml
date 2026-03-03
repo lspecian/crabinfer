@@ -23,6 +23,8 @@ path = "src/bin/uniffi-bindgen.rs"
 candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
 candle-nn = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
 candle-transformers = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }
+candle-metal-kernels = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix", optional = true }
+objc2-metal = { version = "0.3.1", optional = true }
 
 # Tokenizer — use fancy-regex (pure Rust) instead of onig (C library)
 # because Oniguruma's ___chkstk_darwin symbol doesn't link on iOS
@@ -59,6 +61,6 @@ sha2 = { version = "0.10", optional = true }
 
 [features]
 default = ["metal"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]  # Metal GPU acceleration (Apple Silicon / iOS)
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]  # Metal GPU acceleration (Apple Silicon / iOS)
 cpu-only = []  # CPU-only mode — build without Metal (Linux, CI)
 providers = ["dep:reqwest", "dep:sha2"]  # Cloud LLM providers + model downloads

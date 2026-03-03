@@ -593,10 +593,12 @@ name = "crabinfer-core"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
  "libc",
  "memmap2",
+ "objc2-metal",
  "reqwest",
  "serde",
  "serde_json",
@@ -626,10 +628,13 @@ name = "crabinfer-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "candle-core",
  "clap",
  "crabinfer-core",
+ "libc",
  "serde",
  "serde_json",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "tower-http",
