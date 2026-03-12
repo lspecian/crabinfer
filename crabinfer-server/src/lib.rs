@@ -257,7 +257,24 @@ fn load_serving_engine(
     use crabinfer_core::serving::models::load_model_from_gguf;
     use crabinfer_core::serving::quantization::QuantizationMethod;
 
-    let model_path = std::path::Path::new(&config.model_path);
+    // ── Resolve HF repo ID to local cache if needed ──
+    let (resolved_model_path, hf_repo_id) =
+        if crabinfer_core::serving::hub_download::is_hf_repo_id(&config.model_path) {
+            tracing::info!("Detected HuggingFace repo ID: {}", config.model_path);
+            let repo_id = config.model_path.clone();
+            let rt = tokio::runtime::Handle::current();
+            let local_dir = rt
+                .block_on(async {
+                    crabinfer_core::serving::hub_download::ensure_model_cached(&repo_id).await
+                })
+                .map_err(|e| format!("Failed to download model from HuggingFace Hub: {e}"))?;
+            tracing::info!("Model cached at: {}", local_dir.display());
+            (local_dir, Some(config.model_path.clone()))
+        } else {
+            (std::path::PathBuf::from(&config.model_path), None)
+        };
+
+    let model_path = resolved_model_path.as_path();
     let is_safetensors = crabinfer_core::serving::safetensors_loader::is_safetensors_dir(model_path);
 
     // ── Select device ──
@@ -292,11 +309,15 @@ fn load_serving_engine(
         .map_err(|e| format!("Failed to load safetensors model: {e}"))?;
 
         let model_config = model.config();
-        let model_name = model_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        // Use the HF repo ID as model name if we downloaded from Hub,
+        // otherwise fall back to the directory name.
+        let model_name = hf_repo_id.clone().unwrap_or_else(|| {
+            model_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
         let model_info = ModelInfo {
             model_name: model_name.clone(),
             architecture: "llama".to_string(),
@@ -340,7 +361,8 @@ fn load_serving_engine(
             .map_err(|e| format!("Failed to read GGUF content: {e}"))?;
 
         let model_info = extract_model_info(&ct, model_path)?;
-        let model_id = model_info.model_name.clone();
+        // Use the HF repo ID if we downloaded from Hub, otherwise use GGUF metadata name
+        let model_id = hf_repo_id.clone().unwrap_or_else(|| model_info.model_name.clone());
 
         let gguf_eos = ct
             .metadata
@@ -759,5 +781,22 @@ async fn shutdown_signal(state: Arc<AppState>) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         tracing::info!("Serving engine shut down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crabinfer_core::serving::hub_download::is_hf_repo_id;
+
+    /// Verify is_hf_repo_id returns true for HF repo IDs, triggering the download branch.
+    #[test]
+    fn test_hf_repo_id_triggers_download_branch() {
+        // Verify is_hf_repo_id returns true for repo IDs
+        assert!(is_hf_repo_id("meta-llama/Llama-3.1-8B-Instruct-GPTQ"));
+        assert!(is_hf_repo_id("TheBloke/Mistral-7B-GPTQ"));
+        // Verify is_hf_repo_id returns false for local paths
+        assert!(!is_hf_repo_id("/models/llama"));
+        assert!(!is_hf_repo_id("./models/llama"));
+        assert!(!is_hf_repo_id("model.gguf"));
     }
 }
