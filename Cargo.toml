@@ -13,4 +13,3 @@ opt-level = 3
 candle-core = { path = "../candle/candle-core" }
 candle-nn = { path = "../candle/candle-nn" }
 candle-transformers = { path = "../candle/candle-transformers" }
-candle-metal-kernels = { path = "../candle/candle-metal-kernels" }

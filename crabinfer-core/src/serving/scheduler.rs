@@ -4,8 +4,8 @@
 //! - No separate prefill/decode phases — a single token budget per step
 //! - Running sequences get 1 token each (decode)
 //! - New sequences consume remaining budget (prefill, possibly chunked)
-//! - No SWAPPED state (Apple Silicon unified memory — no CPU/GPU swap)
-//! - Preemption frees all blocks; prefix cache recovers most of them
+//! - Supports SWAPPED state for GPU↔CPU KV cache block transfer (CUDA)
+//! - Preemption either frees blocks (prefix cache recovery) or swaps to CPU
 
 use std::collections::{HashMap, VecDeque};
 
@@ -24,6 +24,14 @@ pub struct SchedulerConfig {
 
     /// KV cache configuration (passed through to the KV cache manager).
     pub kv_cache: KVCacheConfig,
+
+    /// Low watermark: fraction of total KV cache blocks (0.0–1.0).
+    /// When usage exceeds this, stop admitting new prefills.
+    pub watermark_low: f64,
+
+    /// High watermark: fraction of total KV cache blocks (0.0–1.0).
+    /// When usage exceeds this, begin aggressive preemption of newest sequences.
+    pub watermark_high: f64,
 }
 
 impl SchedulerConfig {
@@ -33,6 +41,8 @@ impl SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs: 64,
             kv_cache,
+            watermark_low: 0.80,
+            watermark_high: 0.95,
         }
     }
 }
@@ -61,6 +71,12 @@ pub struct SchedulerOutput {
     /// Sequences preempted to free memory.
     pub preempted: Vec<SeqId>,
 
+    /// GPU block IDs to swap out to CPU (GPU→CPU copy needed before forward pass).
+    pub blocks_to_swap_out: Vec<(SeqId, Vec<super::block::BlockId>)>,
+
+    /// Sequences to swap in from CPU (CPU→GPU copy needed before forward pass).
+    pub blocks_to_swap_in: Vec<(SeqId, Vec<super::block::BlockId>)>,
+
     /// Total number of tokens to process in this step.
     pub total_tokens: usize,
 }
@@ -71,6 +87,8 @@ impl SchedulerOutput {
             scheduled: Vec::new(),
             finished: Vec::new(),
             preempted: Vec::new(),
+            blocks_to_swap_out: Vec::new(),
+            blocks_to_swap_in: Vec::new(),
             total_tokens: 0,
         }
     }
@@ -102,7 +120,10 @@ pub struct Scheduler {
     /// Currently running sequences.
     running: Vec<SeqId>,
 
-    /// All sequences by ID (includes waiting, running, and recently finished).
+    /// Sequences whose KV cache blocks are swapped out to CPU.
+    swapped: Vec<SeqId>,
+
+    /// All sequences by ID (includes waiting, running, swapped, and recently finished).
     sequences: HashMap<SeqId, Sequence>,
 
     /// Monotonic counter for arrival ordering.
@@ -121,6 +142,7 @@ impl Scheduler {
             kv_cache,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            swapped: Vec::new(),
             sequences: HashMap::new(),
             next_arrival_order: 0,
             next_seq_id: 1,
@@ -163,6 +185,11 @@ impl Scheduler {
                 SequenceStatus::Running => {
                     seq.status = SequenceStatus::Finished(FinishReason::Cancelled);
                     // Will be cleaned up in the next schedule() call
+                }
+                SequenceStatus::Swapped => {
+                    seq.status = SequenceStatus::Finished(FinishReason::Cancelled);
+                    self.swapped.retain(|&id| id != seq_id);
+                    // The engine loop should discard swap space via SwapManager::discard()
                 }
                 SequenceStatus::Finished(_) => {
                     // Already finished, nothing to do
@@ -209,14 +236,49 @@ impl Scheduler {
         self.kv_cache.num_free_blocks()
     }
 
+    /// Total number of KV cache blocks.
+    pub fn num_total_blocks(&self) -> usize {
+        self.kv_cache.num_total_blocks()
+    }
+
+    /// Prefix cache hit rate (0.0–1.0).
+    pub fn prefix_cache_hit_rate(&self) -> f64 {
+        self.kv_cache.prefix_cache_hit_rate()
+    }
+
+    /// Current KV cache usage ratio (0.0 = empty, 1.0 = full).
+    pub fn kv_cache_usage_ratio(&self) -> f64 {
+        let total = self.kv_cache.num_total_blocks();
+        if total == 0 {
+            return 0.0;
+        }
+        let used = total - self.kv_cache.num_free_blocks();
+        used as f64 / total as f64
+    }
+
+    /// Whether KV cache usage is above the low watermark (stop new prefills).
+    pub fn above_low_watermark(&self) -> bool {
+        self.kv_cache_usage_ratio() >= self.config.watermark_low
+    }
+
+    /// Whether KV cache usage is above the high watermark (aggressive preemption).
+    pub fn above_high_watermark(&self) -> bool {
+        self.kv_cache_usage_ratio() >= self.config.watermark_high
+    }
+
     /// Block size (tokens per block).
     pub fn block_size(&self) -> usize {
         self.kv_cache.block_size()
     }
 
-    /// Whether the scheduler has any work (waiting or running sequences).
+    /// Number of swapped sequences.
+    pub fn num_swapped(&self) -> usize {
+        self.swapped.len()
+    }
+
+    /// Whether the scheduler has any work (waiting, running, or swapped sequences).
     pub fn has_work(&self) -> bool {
-        !self.waiting.is_empty() || !self.running.is_empty()
+        !self.waiting.is_empty() || !self.running.is_empty() || !self.swapped.is_empty()
     }
 
     /// Execute one scheduling step.
@@ -274,17 +336,44 @@ impl Scheduler {
     /// Schedule running sequences for decode (1 token each).
     ///
     /// If a running sequence needs a new KV cache block and allocation
-    /// fails, preempt the most recently arrived running sequence.
+    /// fails, preempt the lowest-priority (highest numeric priority value)
+    /// running sequence, breaking ties by newest arrival.
+    /// When above the high watermark, aggressively preempt lowest-priority
+    /// sequences to bring memory usage back below the threshold.
     fn schedule_running(
         &mut self,
         output: &mut SchedulerOutput,
         remaining_budget: &mut usize,
         remaining_seqs: &mut usize,
     ) {
-        // Sort running by arrival order (oldest first = highest priority)
+        // Sort running by (priority ASC, arrival_order ASC).
+        // Lower priority value = higher importance = scheduled first.
+        // Oldest arrivals at same priority = scheduled first.
         self.running.sort_by_key(|&id| {
-            self.sequences.get(&id).map_or(u64::MAX, |s| s.arrival_order)
+            self.sequences
+                .get(&id)
+                .map_or((i32::MAX, u64::MAX), |s| {
+                    (s.sampling_params.priority, s.arrival_order)
+                })
         });
+
+        // High watermark: aggressively preempt lowest-priority sequences.
+        // Work backwards (lowest priority / newest first) until we drop below threshold.
+        if self.above_high_watermark() {
+            let mut high_wm_preempted = Vec::new();
+            // Iterate in reverse (lowest priority / newest arrivals preempted first)
+            let running_rev: Vec<SeqId> = self.running.iter().copied().rev().collect();
+            for seq_id in running_rev {
+                if !self.above_high_watermark() {
+                    break;
+                }
+                self.preempt_sequence(seq_id);
+                high_wm_preempted.push(seq_id);
+            }
+            // Remove preempted sequences from running list
+            self.running.retain(|id| !high_wm_preempted.contains(id));
+            output.preempted.extend(high_wm_preempted);
+        }
 
         let mut scheduled_running = Vec::new();
         let mut preempted = Vec::new();
@@ -334,12 +423,33 @@ impl Scheduler {
     }
 
     /// Schedule waiting sequences for prefill with the remaining token budget.
+    ///
+    /// Sorts the waiting queue by priority (lower value = higher importance)
+    /// before scheduling, so high-priority requests are prefilled first.
     fn schedule_waiting(
         &mut self,
         output: &mut SchedulerOutput,
         remaining_budget: &mut usize,
         remaining_seqs: &mut usize,
     ) {
+        // Watermark check: stop admitting new prefills when above low watermark
+        if self.above_low_watermark() {
+            return;
+        }
+
+        // Sort waiting queue by (priority ASC, arrival_order ASC)
+        // so higher-priority requests are scheduled first.
+        let waiting_vec: Vec<SeqId> = self.waiting.drain(..).collect();
+        let mut sorted: Vec<SeqId> = waiting_vec;
+        sorted.sort_by_key(|&id| {
+            self.sequences
+                .get(&id)
+                .map_or((i32::MAX, u64::MAX), |s| {
+                    (s.sampling_params.priority, s.arrival_order)
+                })
+        });
+        self.waiting = sorted.into_iter().collect();
+
         let mut newly_running = Vec::new();
 
         while let Some(&seq_id) = self.waiting.front() {
@@ -413,10 +523,12 @@ impl Scheduler {
         self.running.extend(newly_running);
     }
 
-    /// Preempt a running sequence: free all blocks, move back to waiting.
+    /// Preempt a running sequence by freeing blocks, moving back to waiting.
     ///
     /// The prefix cache will retain block hashes, so when the sequence
     /// is re-scheduled, it can recover cached blocks without recomputation.
+    ///
+    /// This is the non-swap path (used when swap space is not configured).
     fn preempt_sequence(&mut self, seq_id: SeqId) {
         if let Some(seq) = self.sequences.get_mut(&seq_id) {
             self.kv_cache.free(&mut seq.blocks);
@@ -427,15 +539,76 @@ impl Scheduler {
         }
     }
 
+    /// Preempt a running sequence by swapping KV cache blocks to CPU.
+    ///
+    /// Returns the block IDs that need to be swapped out. The engine loop
+    /// should call `SwapManager::prepare_swap_out()` and execute the copies.
+    /// The sequence moves to SWAPPED state with its block list preserved.
+    pub fn preempt_to_swap(&mut self, seq_id: SeqId) -> Option<Vec<super::block::BlockId>> {
+        if let Some(seq) = self.sequences.get_mut(&seq_id) {
+            if seq.status != SequenceStatus::Running {
+                return None;
+            }
+            let block_ids = seq.blocks.block_ids.clone();
+            // Free GPU blocks in the KV cache manager
+            self.kv_cache.free(&mut seq.blocks);
+            // But remember the block IDs for swap tracking
+            // (they're stored in the SwapManager's gpu_to_cpu map)
+            seq.status = SequenceStatus::Swapped;
+            self.swapped.push(seq_id);
+            Some(block_ids)
+        } else {
+            None
+        }
+    }
+
+    /// Resume a swapped sequence by allocating new GPU blocks and scheduling swap-in.
+    ///
+    /// Returns `(original_block_ids, new_gpu_block_ids)` if successful.
+    /// The engine loop should call `SwapManager::prepare_swap_in()` and execute copies.
+    pub fn resume_swapped(
+        &mut self,
+        seq_id: SeqId,
+        original_block_ids: &[super::block::BlockId],
+    ) -> Option<Vec<super::block::BlockId>> {
+        let seq = self.sequences.get_mut(&seq_id)?;
+        if seq.status != SequenceStatus::Swapped {
+            return None;
+        }
+
+        // Allocate new GPU blocks for the swapped-in data
+        let num_blocks_needed = original_block_ids.len();
+        if !self.kv_cache.can_allocate(num_blocks_needed) {
+            return None;
+        }
+
+        // Allocate slots — we need to set up the block state properly
+        // The sequence had num_computed_tokens = 0 after free(), but we need
+        // to restore it for the swap-in
+        let total_tokens_needed = num_blocks_needed * self.kv_cache.block_size();
+        let new_blocks = self.kv_cache.allocate_slots(
+            &mut seq.blocks,
+            total_tokens_needed,
+            None,
+        )?;
+
+        seq.status = SequenceStatus::Running;
+        self.swapped.retain(|&id| id != seq_id);
+        self.running.push(seq_id);
+
+        Some(new_blocks)
+    }
+
     /// Look up prefix cache for a sequence.
     ///
     /// Returns block IDs that can be reused from the prefix cache.
-    fn lookup_prefix_cache(&self, seq_id: SeqId) -> Option<Vec<super::block::BlockId>> {
+    fn lookup_prefix_cache(&mut self, seq_id: SeqId) -> Option<Vec<super::block::BlockId>> {
         let seq = self.sequences.get(&seq_id)?;
         if seq.block_hashes.is_empty() {
             return None;
         }
-        let (cached_blocks, _num_tokens) = self.kv_cache.get_computed_blocks(&seq.block_hashes);
+        let hashes = seq.block_hashes.clone();
+        let (cached_blocks, _num_tokens) = self.kv_cache.get_computed_blocks(&hashes);
         if cached_blocks.is_empty() {
             None
         } else {
@@ -469,6 +642,60 @@ impl Scheduler {
         &mut self.kv_cache
     }
 
+    /// Fork a running sequence for beam search.
+    ///
+    /// Creates a new sequence that shares the parent's KV cache blocks via
+    /// Copy-on-Write. The child inherits all prompt tokens, output tokens,
+    /// and computed token state. Returns the new sequence ID.
+    ///
+    /// Returns `None` if the parent sequence doesn't exist or isn't running.
+    pub fn fork_sequence(&mut self, parent_id: SeqId) -> Option<SeqId> {
+        let parent = self.sequences.get(&parent_id)?;
+        if !parent.is_running() {
+            return None;
+        }
+
+        let child_id = self.next_seq_id;
+        self.next_seq_id += 1;
+
+        let arrival_order = self.next_arrival_order;
+        self.next_arrival_order += 1;
+
+        // Fork KV cache blocks (increments ref counts, no data copy)
+        let child_blocks = self.kv_cache.fork_blocks(&parent.blocks);
+
+        let child = Sequence {
+            id: child_id,
+            status: SequenceStatus::Running,
+            prompt_tokens: parent.prompt_tokens.clone(),
+            output_tokens: parent.output_tokens.clone(),
+            blocks: child_blocks,
+            block_hashes: parent.block_hashes.clone(),
+            num_prefix_cached_tokens: parent.num_prefix_cached_tokens,
+            sampling_params: parent.sampling_params.clone(),
+            arrival_order,
+            pending_output: VecDeque::new(),
+        };
+
+        self.sequences.insert(child_id, child);
+        self.running.push(child_id);
+
+        Some(child_id)
+    }
+
+    /// Ensure a sequence's last block is exclusively owned (CoW).
+    ///
+    /// Call this before writing new KV data to a sequence that may share
+    /// blocks with sibling beams. Returns `Some((old, new))` if data needs
+    /// to be copied by the kernel backend.
+    pub fn cow_if_needed(
+        &mut self,
+        seq_id: SeqId,
+    ) -> Option<(super::block::BlockId, super::block::BlockId)> {
+        let seq = self.sequences.get_mut(&seq_id)?;
+        self.kv_cache.cow_block_if_needed(&mut seq.blocks)
+    }
+
     /// Allocate KV cache slots for a sequence.
     ///
     /// Convenience method that avoids borrow conflicts by accessing both
@@ -496,6 +723,7 @@ mod tests {
             head_size: 128,
             num_layers: 32,
             enable_prefix_cache: true,
+            dtype_bytes: 2,
         }
     }
 
@@ -504,6 +732,8 @@ mod tests {
             max_num_batched_tokens: 256,
             max_num_seqs: 8,
             kv_cache: test_kv_config(num_blocks),
+            watermark_low: 0.80,
+            watermark_high: 0.95,
         };
         Scheduler::new(config)
     }
@@ -580,6 +810,8 @@ mod tests {
             max_num_batched_tokens: 20,
             max_num_seqs: 8,
             kv_cache: test_kv_config(16),
+            watermark_low: 0.80,
+            watermark_high: 0.95,
         };
         let mut sched = Scheduler::new(config);
 
@@ -603,6 +835,8 @@ mod tests {
             max_num_batched_tokens: 1000,
             max_num_seqs: 2,
             kv_cache: test_kv_config(32),
+            watermark_low: 0.80,
+            watermark_high: 0.95,
         };
         let mut sched = Scheduler::new(config);
 
@@ -869,6 +1103,8 @@ mod tests {
             max_num_batched_tokens: 10,
             max_num_seqs: 8,
             kv_cache: test_kv_config(16),
+            watermark_low: 0.80,
+            watermark_high: 0.95,
         };
         let mut sched = Scheduler::new(config);
 
@@ -892,5 +1128,271 @@ mod tests {
         // (the chunked prefill tokens are not re-scheduled automatically)
         assert_eq!(output.num_scheduled(), 1);
         assert_eq!(output.scheduled[0].num_tokens, 1);
+    }
+
+    #[test]
+    fn test_low_watermark_blocks_new_prefills() {
+        // 4 blocks, low watermark at 0.50 → usage >= 2/4 blocks stops new prefills
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 8,
+            kv_cache: test_kv_config(4),
+            watermark_low: 0.50,
+            watermark_high: 0.95,
+        };
+        let mut sched = Scheduler::new(config);
+
+        // First request: occupies 1 block (10 tokens, block_size=16)
+        let id1 = sched.add_request(vec![1; 10], default_params());
+        sched.schedule();
+        sched.update_after_step(id1, 10);
+
+        // Second request: occupies 1 block → 2/4 = 0.50 = at low watermark
+        let id2 = sched.add_request(vec![2; 10], default_params());
+        sched.get_sequence_mut(id1).unwrap().append_token(100);
+        sched.schedule();
+        sched.update_after_step(id2, 10);
+        sched.update_after_step(id1, 1);
+
+        // Now at 2/4 blocks used = 0.50. New prefills should be blocked.
+        let _id3 = sched.add_request(vec![3; 5], default_params());
+        sched.get_sequence_mut(id1).unwrap().append_token(101);
+        sched.get_sequence_mut(id2).unwrap().append_token(200);
+
+        let output = sched.schedule();
+        // Only id1 and id2 (running decode) should be scheduled; id3 stays waiting
+        assert_eq!(sched.num_waiting(), 1);
+        assert!(output.scheduled.iter().all(|s| s.seq_id != _id3));
+    }
+
+    #[test]
+    fn test_high_watermark_preempts_newest() {
+        // 4 blocks, high watermark at 0.75 → usage >= 3/4 triggers aggressive preemption
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 8,
+            kv_cache: test_kv_config(4),
+            watermark_low: 0.50,
+            watermark_high: 0.75,
+        };
+        let mut sched = Scheduler::new(config);
+
+        // Fill up 3 blocks with 3 sequences (1 block each)
+        let id1 = sched.add_request(vec![1; 10], default_params());
+        let id2 = sched.add_request(vec![2; 10], default_params());
+        let id3 = sched.add_request(vec![3; 10], default_params());
+
+        // Schedule all three (prefill)
+        sched.schedule();
+        sched.update_after_step(id1, 10);
+        sched.update_after_step(id2, 10);
+        sched.update_after_step(id3, 10);
+
+        // Now 3/4 blocks used = 0.75, at high watermark.
+        // Append tokens so they need decode.
+        sched.get_sequence_mut(id1).unwrap().append_token(100);
+        sched.get_sequence_mut(id2).unwrap().append_token(200);
+        sched.get_sequence_mut(id3).unwrap().append_token(300);
+
+        let output = sched.schedule();
+
+        // id3 (newest) should be preempted to drop below high watermark
+        assert!(
+            output.preempted.contains(&id3),
+            "newest sequence should be preempted: preempted={:?}",
+            output.preempted
+        );
+        // id3 should be back in the waiting queue
+        assert!(sched.num_waiting() > 0);
+    }
+
+    #[test]
+    fn test_fork_sequence_shares_blocks() {
+        let mut sched = test_scheduler(16);
+        let id1 = sched.add_request(vec![1; 32], default_params());
+
+        // Prefill
+        sched.schedule();
+        sched.update_after_step(id1, 32);
+
+        // Fork
+        let id2 = sched.fork_sequence(id1).unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(sched.num_running(), 2);
+
+        let seq1 = sched.get_sequence(id1).unwrap();
+        let seq2 = sched.get_sequence(id2).unwrap();
+
+        // Child shares parent's blocks
+        assert_eq!(seq1.blocks.block_ids, seq2.blocks.block_ids);
+        assert_eq!(seq2.blocks.num_computed_tokens, 32);
+        assert_eq!(seq2.prompt_tokens, seq1.prompt_tokens);
+
+        // Refcounts should be 2
+        for &block_id in &seq1.blocks.block_ids {
+            assert_eq!(sched.kv_cache().block_ref_count(block_id), 2);
+        }
+    }
+
+    #[test]
+    fn test_fork_sequence_cow_on_write() {
+        let mut sched = test_scheduler(16);
+        let id1 = sched.add_request(vec![1; 16], default_params());
+
+        // Prefill (1 block)
+        sched.schedule();
+        sched.update_after_step(id1, 16);
+
+        let original_block = sched.get_sequence(id1).unwrap().blocks.block_ids[0];
+
+        // Fork
+        let id2 = sched.fork_sequence(id1).unwrap();
+        assert_eq!(sched.kv_cache().block_ref_count(original_block), 2);
+
+        // CoW on child — should get a new block since refcount > 1
+        let cow_result = sched.cow_if_needed(id2);
+        assert!(cow_result.is_some());
+        let (old_id, new_id) = cow_result.unwrap();
+        assert_eq!(old_id, original_block);
+        assert_ne!(new_id, original_block);
+
+        // Refcount on original block back to 1 (parent only)
+        assert_eq!(sched.kv_cache().block_ref_count(original_block), 1);
+
+        // Child now has its own exclusive block
+        let child = sched.get_sequence(id2).unwrap();
+        assert_eq!(child.blocks.block_ids[0], new_id);
+        assert_eq!(sched.kv_cache().block_ref_count(new_id), 1);
+    }
+
+    #[test]
+    fn test_fork_blocks_freed_correctly() {
+        let mut sched = test_scheduler(16);
+        let id1 = sched.add_request(vec![1; 16], default_params());
+        sched.schedule();
+        sched.update_after_step(id1, 16);
+
+        // 1 block used, 15 free
+        assert_eq!(sched.num_free_blocks(), 15);
+
+        let id2 = sched.fork_sequence(id1).unwrap();
+        // Fork doesn't allocate new blocks, just increments refcounts
+        assert_eq!(sched.num_free_blocks(), 15);
+
+        // Finish both sequences
+        sched.finish_sequence(id1, FinishReason::EndOfSequence);
+        sched.finish_sequence(id2, FinishReason::EndOfSequence);
+        sched.schedule(); // collects both finished, frees blocks (refcount 2→1→0)
+
+        // Now all 16 blocks should be free
+        assert_eq!(sched.num_free_blocks(), 16);
+    }
+
+    #[test]
+    fn test_priority_preemption_evicts_lowest_priority() {
+        // 4 blocks, high watermark at 0.75 → usage >= 3/4 triggers preemption
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 8,
+            kv_cache: test_kv_config(4),
+            watermark_low: 0.50,
+            watermark_high: 0.75,
+        };
+        let mut sched = Scheduler::new(config);
+
+        // High priority (priority=0)
+        let mut p_high = SamplingParams::default();
+        p_high.priority = 0;
+        let id_high = sched.add_request(vec![1; 10], p_high);
+
+        // Medium priority (priority=5)
+        let mut p_med = SamplingParams::default();
+        p_med.priority = 5;
+        let id_med = sched.add_request(vec![2; 10], p_med);
+
+        // Low priority (priority=10)
+        let mut p_low = SamplingParams::default();
+        p_low.priority = 10;
+        let id_low = sched.add_request(vec![3; 10], p_low);
+
+        // Schedule all three (prefill) — 3/4 blocks used = at high watermark
+        sched.schedule();
+        sched.update_after_step(id_high, 10);
+        sched.update_after_step(id_med, 10);
+        sched.update_after_step(id_low, 10);
+
+        // Append tokens for decode
+        sched.get_sequence_mut(id_high).unwrap().append_token(100);
+        sched.get_sequence_mut(id_med).unwrap().append_token(200);
+        sched.get_sequence_mut(id_low).unwrap().append_token(300);
+
+        let output = sched.schedule();
+
+        // Low-priority sequence should be preempted first
+        assert!(
+            output.preempted.contains(&id_low),
+            "lowest priority should be preempted: preempted={:?}",
+            output.preempted
+        );
+        // High-priority should NOT be preempted
+        assert!(
+            !output.preempted.contains(&id_high),
+            "high priority should not be preempted"
+        );
+
+        let _ = id_med; // may or may not be preempted depending on block math
+    }
+
+    #[test]
+    fn test_priority_waiting_queue_order() {
+        // High budget, plenty of blocks — focus on scheduling order
+        let mut sched = test_scheduler(32);
+
+        // Add requests in arrival order, but with varying priorities
+        let mut p_low = SamplingParams::default();
+        p_low.priority = 10;
+        let id_low = sched.add_request(vec![1; 5], p_low); // arrives first, low priority
+
+        let mut p_high = SamplingParams::default();
+        p_high.priority = -5;
+        let id_high = sched.add_request(vec![2; 5], p_high); // arrives second, high priority
+
+        let id_default = sched.add_request(vec![3; 5], default_params()); // arrives third, priority=0
+
+        let output = sched.schedule();
+        assert_eq!(output.num_scheduled(), 3);
+
+        // High priority (-5) should be scheduled first, then default (0), then low (10)
+        assert_eq!(output.scheduled[0].seq_id, id_high);
+        assert_eq!(output.scheduled[1].seq_id, id_default);
+        assert_eq!(output.scheduled[2].seq_id, id_low);
+    }
+
+    #[test]
+    fn test_priority_same_priority_fcfs() {
+        let mut sched = test_scheduler(32);
+
+        // All same priority — should follow FCFS (arrival order)
+        let id1 = sched.add_request(vec![1; 5], default_params());
+        let id2 = sched.add_request(vec![2; 5], default_params());
+        let id3 = sched.add_request(vec![3; 5], default_params());
+
+        let output = sched.schedule();
+        assert_eq!(output.scheduled[0].seq_id, id1);
+        assert_eq!(output.scheduled[1].seq_id, id2);
+        assert_eq!(output.scheduled[2].seq_id, id3);
+    }
+
+    #[test]
+    fn test_kv_cache_usage_ratio() {
+        let mut sched = test_scheduler(4);
+        assert_eq!(sched.kv_cache_usage_ratio(), 0.0);
+
+        let id1 = sched.add_request(vec![1; 10], default_params());
+        sched.schedule();
+        sched.update_after_step(id1, 10);
+
+        // 1 block used out of 4
+        assert!((sched.kv_cache_usage_ratio() - 0.25).abs() < 0.01);
     }
 }

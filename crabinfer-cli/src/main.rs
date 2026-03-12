@@ -150,7 +150,7 @@ enum Commands {
 
     /// Start OpenAI/Anthropic-compatible API server
     Serve {
-        /// Path to GGUF model file
+        /// Path to GGUF model file or HuggingFace safetensors directory
         #[arg(long)]
         model: String,
 
@@ -185,6 +185,46 @@ enum Commands {
         /// Number of draft tokens per speculative step (default: 4)
         #[arg(long, default_value = "4")]
         num_draft_tokens: u32,
+
+        /// Disable CUDA graphs and use eager execution (for debugging)
+        #[arg(long)]
+        enforce_eager: bool,
+
+        /// Fraction of GPU memory to use for KV cache (0.0-1.0)
+        #[arg(long, default_value = "0.90")]
+        gpu_memory_utilization: f64,
+
+        /// Maximum concurrent sequences (default: 64)
+        #[arg(long, default_value = "64")]
+        max_num_seqs: usize,
+
+        /// Maximum tokens per scheduling step (default: 2048)
+        #[arg(long, default_value = "2048")]
+        max_num_batched_tokens: usize,
+
+        /// Disable prefix caching
+        #[arg(long)]
+        disable_prefix_cache: bool,
+
+        /// Weight quantization method: none, int8 (W8A16), gptq, awq
+        #[arg(long, default_value = "none")]
+        quantization: String,
+
+        /// KV cache data type: auto, fp16, bf16
+        #[arg(long, default_value = "auto")]
+        kv_cache_dtype: String,
+
+        /// Maximum model context length (overrides model default)
+        #[arg(long)]
+        max_model_len: Option<usize>,
+
+        /// Chat template override: architecture name (chatml, llama3, phi3, gemma) or template file path
+        #[arg(long)]
+        chat_template: Option<String>,
+
+        /// CPU swap space for KV cache in GiB (0 = disabled). Default: 0
+        #[arg(long, default_value = "0")]
+        swap_space: f64,
     },
 }
 
@@ -375,6 +415,16 @@ fn main() {
             serving,
             draft_model,
             num_draft_tokens,
+            enforce_eager,
+            gpu_memory_utilization,
+            max_num_seqs,
+            max_num_batched_tokens,
+            disable_prefix_cache,
+            quantization,
+            kv_cache_dtype,
+            max_model_len,
+            chat_template,
+            swap_space,
         } => cmd_serve::run(
             &model,
             &host,
@@ -385,6 +435,16 @@ fn main() {
             serving,
             draft_model,
             num_draft_tokens,
+            enforce_eager,
+            gpu_memory_utilization,
+            max_num_seqs,
+            max_num_batched_tokens,
+            disable_prefix_cache,
+            &quantization,
+            &kv_cache_dtype,
+            max_model_len,
+            chat_template,
+            swap_space,
         ),
     }
 }

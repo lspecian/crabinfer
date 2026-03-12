@@ -21,6 +21,8 @@ pub struct KVCacheConfig {
     pub num_layers: usize,
     /// Whether to enable prefix caching.
     pub enable_prefix_cache: bool,
+    /// Bytes per KV cache element (4 for F32, 2 for F16).
+    pub dtype_bytes: usize,
 }
 
 impl KVCacheConfig {
@@ -29,11 +31,9 @@ impl KVCacheConfig {
     /// Each block stores key and value tensors for all layers.
     /// Key layout: [num_kv_heads, head_size/x, block_size, x] per block per layer
     /// Value layout: [num_kv_heads, head_size, block_size] per block per layer
-    /// Both use 2 bytes per element (float16).
     pub fn total_memory_bytes(&self) -> usize {
-        let bytes_per_element = 2; // float16
         let kv_per_block_per_layer =
-            2 * self.num_kv_heads * self.head_size * self.block_size * bytes_per_element;
+            2 * self.num_kv_heads * self.head_size * self.block_size * self.dtype_bytes;
         self.num_blocks * self.num_layers * kv_per_block_per_layer
     }
 
@@ -44,10 +44,10 @@ impl KVCacheConfig {
         num_kv_heads: usize,
         head_size: usize,
         num_layers: usize,
+        dtype_bytes: usize,
     ) -> usize {
-        let bytes_per_element = 2;
         let kv_per_block_per_layer =
-            2 * num_kv_heads * head_size * block_size * bytes_per_element;
+            2 * num_kv_heads * head_size * block_size * dtype_bytes;
         let bytes_per_block = num_layers * kv_per_block_per_layer;
         if bytes_per_block == 0 {
             return 0;
@@ -126,10 +126,25 @@ impl KVCacheManager {
     /// tokens they cover. The caller should update `seq_blocks.num_computed_tokens`
     /// accordingly.
     pub fn get_computed_blocks(
-        &self,
+        &mut self,
         block_hashes: &[BlockHash],
     ) -> (Vec<BlockId>, usize) {
         self.pool.find_prefix_cache_hit(block_hashes)
+    }
+
+    /// Prefix cache hit rate (0.0–1.0). Returns 0.0 if no lookups yet.
+    pub fn prefix_cache_hit_rate(&self) -> f64 {
+        self.pool.prefix_cache_hit_rate()
+    }
+
+    /// Number of prefix cache hits.
+    pub fn prefix_cache_hits(&self) -> u64 {
+        self.pool.prefix_cache_hits()
+    }
+
+    /// Number of prefix cache misses.
+    pub fn prefix_cache_misses(&self) -> u64 {
+        self.pool.prefix_cache_misses()
     }
 
     /// Allocate KV cache slots for `num_new_tokens` new tokens.
@@ -243,6 +258,51 @@ impl KVCacheManager {
             .collect()
     }
 
+    /// Fork a sequence's blocks for beam search (Copy-on-Write).
+    ///
+    /// Creates a new `SequenceBlocks` that shares the parent's physical blocks
+    /// by incrementing reference counts. No data is copied — the actual KV data
+    /// is shared until a write triggers CoW via `cow_block_if_needed`.
+    pub fn fork_blocks(&mut self, parent: &SequenceBlocks) -> SequenceBlocks {
+        for &block_id in &parent.block_ids {
+            self.pool.increment_ref(block_id);
+        }
+        SequenceBlocks {
+            block_ids: parent.block_ids.clone(),
+            block_hashes: parent.block_hashes.clone(),
+            num_computed_tokens: parent.num_computed_tokens,
+        }
+    }
+
+    /// Copy-on-Write: ensure the last block in a sequence is exclusively owned.
+    ///
+    /// If the last block has refcount > 1 (shared with sibling beams), a new
+    /// block is allocated and the old block's refcount is decremented. The
+    /// caller must copy the KV data from `old_block_id` to `new_block_id`
+    /// via the kernel backend's `copy_blocks` method.
+    ///
+    /// Returns `Some((old_block_id, new_block_id))` if a copy is needed,
+    /// or `None` if the block is already exclusively owned.
+    pub fn cow_block_if_needed(
+        &mut self,
+        seq_blocks: &mut SequenceBlocks,
+    ) -> Option<(BlockId, BlockId)> {
+        let last_idx = seq_blocks.block_ids.len().checked_sub(1)?;
+        let old_block_id = seq_blocks.block_ids[last_idx];
+
+        let new_block_id = self.pool.cow_allocate(old_block_id)?;
+
+        // Update the sequence's block table to point to the new block
+        seq_blocks.block_ids[last_idx] = new_block_id;
+
+        Some((old_block_id, new_block_id))
+    }
+
+    /// Get the reference count of a block.
+    pub fn block_ref_count(&self, block_id: BlockId) -> u32 {
+        self.pool.ref_count(block_id)
+    }
+
     /// Reset prefix cache (invalidate all cached blocks).
     pub fn reset_prefix_cache(&mut self) {
         self.pool.reset_prefix_cache();
@@ -261,6 +321,7 @@ mod tests {
             head_size: 128,
             num_layers: 32,
             enable_prefix_cache: true,
+            dtype_bytes: 2,
         }
     }
 
@@ -281,6 +342,7 @@ mod tests {
             8,                   // num_kv_heads
             128,                 // head_size
             32,                  // num_layers
+            2,                   // dtype_bytes (F16)
         );
         // Each block: 32 layers * 2(kv) * 8 heads * 128 dim * 16 tokens * 2 bytes
         //           = 32 * 2 * 8 * 128 * 16 * 2 = 2,097,152 bytes = 2 MB
@@ -403,6 +465,72 @@ mod tests {
     }
 
     #[test]
+    fn test_fork_blocks_shares_refcounts() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config);
+        let mut parent = SequenceBlocks::new();
+
+        // Allocate 2 blocks for parent
+        mgr.allocate_slots(&mut parent, 32, None).unwrap();
+        parent.num_computed_tokens = 32;
+        assert_eq!(mgr.block_ref_count(parent.block_ids[0]), 1);
+
+        // Fork: child shares parent's blocks
+        let child = mgr.fork_blocks(&parent);
+        assert_eq!(child.block_ids, parent.block_ids);
+        assert_eq!(child.num_computed_tokens, 32);
+        assert_eq!(mgr.block_ref_count(parent.block_ids[0]), 2);
+        assert_eq!(mgr.block_ref_count(parent.block_ids[1]), 2);
+
+        // Freeing parent's blocks decrements refcount but blocks stay allocated
+        mgr.free(&mut parent);
+        assert_eq!(mgr.block_ref_count(child.block_ids[0]), 1);
+    }
+
+    #[test]
+    fn test_cow_block_if_needed_shared() {
+        let config = KVCacheConfig {
+            num_blocks: 8,
+            ..test_config()
+        };
+        let mut mgr = KVCacheManager::new(&config);
+        let mut parent = SequenceBlocks::new();
+
+        // Allocate 2 blocks for parent
+        mgr.allocate_slots(&mut parent, 32, None).unwrap();
+        parent.num_computed_tokens = 32;
+
+        // Fork
+        let mut child = mgr.fork_blocks(&parent);
+
+        // CoW on child's last block (shared, refcount=2)
+        let result = mgr.cow_block_if_needed(&mut child);
+        assert!(result.is_some());
+        let (old_id, new_id) = result.unwrap();
+        assert_eq!(old_id, parent.block_ids[1]);
+        assert_ne!(new_id, old_id);
+
+        // Child's block table updated
+        assert_eq!(child.block_ids[1], new_id);
+        // Parent's block table unchanged
+        assert_eq!(mgr.block_ref_count(parent.block_ids[1]), 1);
+        assert_eq!(mgr.block_ref_count(new_id), 1);
+    }
+
+    #[test]
+    fn test_cow_block_if_needed_exclusive() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config);
+        let mut seq = SequenceBlocks::new();
+
+        mgr.allocate_slots(&mut seq, 32, None).unwrap();
+        seq.num_computed_tokens = 32;
+
+        // No fork, so refcount=1 — CoW should return None
+        assert!(mgr.cow_block_if_needed(&mut seq).is_none());
+    }
+
+    #[test]
     fn test_prefix_cache_through_manager() {
         let config = test_config();
         let mut mgr = KVCacheManager::new(&config);
@@ -434,5 +562,34 @@ mod tests {
         // Should have rescued the 2 cached blocks + allocated 1 new
         assert_eq!(seq2.block_ids.len(), 3);
         assert_eq!(new_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_prefix_cache_hit_rate_through_manager() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config);
+        assert_eq!(mgr.prefix_cache_hit_rate(), 0.0);
+
+        // Cache some blocks
+        let mut seq = SequenceBlocks::new();
+        mgr.allocate_slots(&mut seq, 32, None).unwrap();
+        let hash0 = BlockHash::from_tokens(&[1, 2, 3], None);
+        let hash1 = BlockHash::from_tokens(&[4, 5, 6], Some(hash0));
+        mgr.cache_block(seq.block_ids[0], hash0, 16);
+        mgr.cache_block(seq.block_ids[1], hash1, 16);
+        mgr.free(&mut seq);
+
+        // Hit
+        let (blocks, _) = mgr.get_computed_blocks(&[hash0, hash1]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(mgr.prefix_cache_hits(), 1);
+        assert_eq!(mgr.prefix_cache_hit_rate(), 1.0);
+
+        // Miss
+        let unknown = BlockHash::from_tokens(&[99], None);
+        let (blocks, _) = mgr.get_computed_blocks(&[unknown]);
+        assert!(blocks.is_empty());
+        assert_eq!(mgr.prefix_cache_misses(), 1);
+        assert_eq!(mgr.prefix_cache_hit_rate(), 0.5);
     }
 }

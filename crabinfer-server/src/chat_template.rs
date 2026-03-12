@@ -9,7 +9,7 @@ pub fn apply_chat_template(architecture: &str, messages: &[ChatMessage]) -> Stri
         .iter()
         .map(|m| crabinfer_core::provider::ChatMessage {
             role: m.role.clone(),
-            content: m.content.clone(),
+            content: m.content_str().to_string(),
         })
         .collect();
     crabinfer_core::chat_template::apply_chat_template(architecture, &core_messages)
@@ -23,11 +23,17 @@ mod tests {
         vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are helpful.".to_string(),
+                content: Some("You are helpful.".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: Some("Hello".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
             },
         ]
     }

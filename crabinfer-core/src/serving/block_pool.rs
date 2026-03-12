@@ -29,6 +29,10 @@ pub struct BlockPool {
     free_queue: FreeBlockQueue,
     /// Content hash → block ID mapping for prefix cache.
     hash_map: BlockHashMap,
+    /// Number of prefix cache lookups that found at least one cached block.
+    prefix_cache_hits: u64,
+    /// Number of prefix cache lookups that found zero cached blocks.
+    prefix_cache_misses: u64,
 }
 
 impl BlockPool {
@@ -39,6 +43,8 @@ impl BlockPool {
             config,
             free_queue,
             hash_map: BlockHashMap::new(),
+            prefix_cache_hits: 0,
+            prefix_cache_misses: 0,
         }
     }
 
@@ -147,8 +153,9 @@ impl BlockPool {
     ///
     /// The returned blocks are NOT yet touched (ref_count not incremented).
     /// The caller must call `touch()` before using them.
-    pub fn find_prefix_cache_hit(&self, block_hashes: &[BlockHash]) -> (Vec<BlockId>, usize) {
+    pub fn find_prefix_cache_hit(&mut self, block_hashes: &[BlockHash]) -> (Vec<BlockId>, usize) {
         if !self.config.enable_prefix_cache {
+            self.prefix_cache_misses += 1;
             return (Vec::new(), 0);
         }
 
@@ -175,7 +182,32 @@ impl BlockPool {
             }
         }
 
+        if hit_blocks.is_empty() {
+            self.prefix_cache_misses += 1;
+        } else {
+            self.prefix_cache_hits += 1;
+        }
+
         (hit_blocks, num_tokens)
+    }
+
+    /// Number of prefix cache lookups that found cached blocks.
+    pub fn prefix_cache_hits(&self) -> u64 {
+        self.prefix_cache_hits
+    }
+
+    /// Number of prefix cache lookups that found no cached blocks.
+    pub fn prefix_cache_misses(&self) -> u64 {
+        self.prefix_cache_misses
+    }
+
+    /// Prefix cache hit rate (0.0–1.0). Returns 0.0 if no lookups yet.
+    pub fn prefix_cache_hit_rate(&self) -> f64 {
+        let total = self.prefix_cache_hits + self.prefix_cache_misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.prefix_cache_hits as f64 / total as f64
     }
 
     /// Clear all prefix cache entries without freeing blocks.
@@ -193,6 +225,51 @@ impl BlockPool {
             self.free_queue.get_mut(i).block_hash = None;
         }
         self.hash_map.clear();
+    }
+
+    /// Increment the reference count on a block (for CoW sharing).
+    ///
+    /// Unlike `touch`, this does NOT rescue the block from the free queue —
+    /// it is only valid for blocks that are already allocated (ref_count > 0).
+    pub fn increment_ref(&mut self, block_id: BlockId) {
+        let block = self.free_queue.get_mut(block_id);
+        debug_assert!(block.ref_count > 0, "increment_ref on free block {}", block_id);
+        block.ref_count += 1;
+    }
+
+    /// Get the reference count of a block.
+    pub fn ref_count(&self, block_id: BlockId) -> u32 {
+        self.free_queue.get(block_id).ref_count
+    }
+
+    /// Copy-on-write: if the block has refcount > 1, allocate a fresh block
+    /// and decrement the old block's refcount.
+    ///
+    /// Returns `Some(new_block_id)` if a copy was needed (the caller must
+    /// copy the KV data from `block_id` to the returned block via the kernel
+    /// backend). Returns `None` if the block is already exclusively owned
+    /// (refcount == 1), meaning no copy is needed.
+    pub fn cow_allocate(&mut self, block_id: BlockId) -> Option<BlockId> {
+        let ref_count = self.free_queue.get(block_id).ref_count;
+        if ref_count <= 1 {
+            return None; // Already exclusively owned
+        }
+
+        // Allocate a fresh block
+        let new_block_id = self.allocate(1)?.into_iter().next()?;
+
+        // Decrement refcount on the shared block
+        let old_block = self.free_queue.get_mut(block_id);
+        old_block.ref_count -= 1;
+        if old_block.ref_count == 0 {
+            self.free_queue.append(block_id);
+        }
+
+        // Copy metadata to the new block
+        let num_tokens = self.free_queue.get(block_id).num_tokens;
+        self.free_queue.get_mut(new_block_id).num_tokens = num_tokens;
+
+        Some(new_block_id)
     }
 
     /// Update the number of tokens stored in a block.
@@ -385,6 +462,116 @@ mod tests {
         let _blocks = pool.allocate(2).unwrap();
         assert!(pool.can_allocate(1));
         assert!(!pool.can_allocate(2));
+    }
+
+    #[test]
+    fn test_increment_ref() {
+        let mut pool = BlockPool::new(test_config(4));
+        let blocks = pool.allocate(2).unwrap();
+        assert_eq!(pool.ref_count(blocks[0]), 1);
+
+        pool.increment_ref(blocks[0]);
+        assert_eq!(pool.ref_count(blocks[0]), 2);
+
+        // Freeing once should not return to free queue (refcount 2 → 1)
+        pool.free(&[blocks[0]]);
+        assert_eq!(pool.ref_count(blocks[0]), 1);
+        assert_eq!(pool.num_free_blocks(), 2); // only the 2 unallocated blocks
+
+        // Freeing again returns to free queue (refcount 1 → 0)
+        pool.free(&[blocks[0]]);
+        assert_eq!(pool.num_free_blocks(), 3);
+    }
+
+    #[test]
+    fn test_cow_allocate_shared_block() {
+        let mut pool = BlockPool::new(test_config(4));
+        let blocks = pool.allocate(2).unwrap();
+        pool.set_block_tokens(blocks[0], 16);
+        pool.set_block_tokens(blocks[1], 10);
+
+        // Share block 1 (refcount 1 → 2)
+        pool.increment_ref(blocks[1]);
+        assert_eq!(pool.ref_count(blocks[1]), 2);
+
+        // CoW on shared block — should allocate a new block
+        let new_id = pool.cow_allocate(blocks[1]).unwrap();
+        assert_ne!(new_id, blocks[1]);
+
+        // Old block refcount decremented (2 → 1)
+        assert_eq!(pool.ref_count(blocks[1]), 1);
+        // New block has refcount 1 and inherited num_tokens
+        assert_eq!(pool.ref_count(new_id), 1);
+        assert_eq!(pool.get_block(new_id).num_tokens, 10);
+    }
+
+    #[test]
+    fn test_cow_allocate_exclusive_block() {
+        let mut pool = BlockPool::new(test_config(4));
+        let blocks = pool.allocate(2).unwrap();
+
+        // CoW on exclusively owned block — no copy needed
+        assert!(pool.cow_allocate(blocks[0]).is_none());
+    }
+
+    #[test]
+    fn test_cow_allocate_no_free_blocks() {
+        let mut pool = BlockPool::new(test_config(2));
+        let blocks = pool.allocate(2).unwrap();
+        pool.increment_ref(blocks[0]);
+
+        // All blocks allocated, CoW should fail
+        assert!(pool.cow_allocate(blocks[0]).is_none());
+    }
+
+    #[test]
+    fn test_prefix_cache_hit_rate_tracking() {
+        let mut pool = BlockPool::new(test_config(8));
+        assert_eq!(pool.prefix_cache_hits(), 0);
+        assert_eq!(pool.prefix_cache_misses(), 0);
+        assert_eq!(pool.prefix_cache_hit_rate(), 0.0);
+
+        // Allocate, cache, and free 2 blocks
+        let blocks = pool.allocate(2).unwrap();
+        let hash0 = BlockHash::from_tokens(&[1, 2, 3], None);
+        let hash1 = BlockHash::from_tokens(&[4, 5, 6], Some(hash0));
+        pool.set_block_tokens(blocks[0], 16);
+        pool.set_block_tokens(blocks[1], 16);
+        pool.cache_block(blocks[0], hash0);
+        pool.cache_block(blocks[1], hash1);
+        pool.free(&blocks);
+
+        // Lookup with matching hashes → hit
+        let (hit, _) = pool.find_prefix_cache_hit(&[hash0, hash1]);
+        assert_eq!(hit.len(), 2);
+        assert_eq!(pool.prefix_cache_hits(), 1);
+        assert_eq!(pool.prefix_cache_misses(), 0);
+        assert_eq!(pool.prefix_cache_hit_rate(), 1.0);
+
+        // Lookup with non-matching hash → miss
+        let unknown = BlockHash::from_tokens(&[99, 98, 97], None);
+        let (hit, _) = pool.find_prefix_cache_hit(&[unknown]);
+        assert!(hit.is_empty());
+        assert_eq!(pool.prefix_cache_hits(), 1);
+        assert_eq!(pool.prefix_cache_misses(), 1);
+        assert_eq!(pool.prefix_cache_hit_rate(), 0.5);
+    }
+
+    #[test]
+    fn test_prefix_cache_hit_rate_disabled() {
+        let config = BlockPoolConfig {
+            block_size: 16,
+            num_blocks: 4,
+            enable_prefix_cache: false,
+        };
+        let mut pool = BlockPool::new(config);
+
+        // Lookups on disabled cache always miss
+        let hash = BlockHash::from_tokens(&[1, 2, 3], None);
+        let (hit, _) = pool.find_prefix_cache_hit(&[hash]);
+        assert!(hit.is_empty());
+        assert_eq!(pool.prefix_cache_misses(), 1);
+        assert_eq!(pool.prefix_cache_hit_rate(), 0.0);
     }
 
     #[test]

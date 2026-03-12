@@ -13,8 +13,15 @@ path = "src/lib.rs"
 name = "crabinfer-server"
 path = "src/main.rs"
 
+[features]
+default = ["metal"]
+metal = ["crabinfer-core/metal"]
+cuda = ["crabinfer-core/cuda"]
+flash-attn = ["crabinfer-core/flash-attn"]
+cpu-only = ["crabinfer-core/cpu-only"]
+
 [dependencies]
-crabinfer-core = { path = "../crabinfer-core", features = ["providers"] }
+crabinfer-core = { path = "../crabinfer-core", default-features = false, features = ["providers"] }
 
 # Candle (for GGUF loading in serving engine path)
 candle-core = { git = "https://github.com/lspecian/candle", branch = "ios-metal-fix" }

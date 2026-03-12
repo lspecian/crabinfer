@@ -14,8 +14,9 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
-        // Health & metrics
+        // Health, readiness & metrics
         .route("/health", get(health::health))
+        .route("/ready", get(health::ready))
         .route("/metrics", get(health::metrics))
         // OpenAI-compatible
         .route("/v1/models", get(openai::list_models))

@@ -15,6 +15,7 @@ use candle_nn::Module;
 
 use super::attention::{precompute_rope, PagedAttentionLayer};
 use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
+use crate::serving::quantization::{MaybeQuantizedLinear, QuantizationMethod};
 
 // ─── Transformer layer ───────────────────────────────────────────────────
 
@@ -22,12 +23,12 @@ use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
 struct LlamaLayer {
     /// Pre-attention RMS normalization.
     attn_norm: RmsNorm,
-    /// Query projection (quantized).
-    attn_q: QMatMul,
-    /// Key projection (quantized).
-    attn_k: QMatMul,
-    /// Value projection (quantized).
-    attn_v: QMatMul,
+    /// Query projection (may be GGUF-quantized or INT8).
+    attn_q: MaybeQuantizedLinear,
+    /// Key projection (may be GGUF-quantized or INT8).
+    attn_k: MaybeQuantizedLinear,
+    /// Value projection (may be GGUF-quantized or INT8).
+    attn_v: MaybeQuantizedLinear,
     /// Optional QKV biases (required by Qwen2, absent in Llama).
     attn_q_bias: Option<Tensor>,
     attn_k_bias: Option<Tensor>,
@@ -35,8 +36,8 @@ struct LlamaLayer {
     /// Optional QK normalization (Qwen3 applies RMSNorm to Q and K per-head).
     attn_q_norm: Option<RmsNorm>,
     attn_k_norm: Option<RmsNorm>,
-    /// Output projection after attention (quantized).
-    attn_output: QMatMul,
+    /// Output projection after attention (may be GGUF-quantized or INT8).
+    attn_output: MaybeQuantizedLinear,
     /// Pre-MLP RMS normalization.
     ffn_norm: RmsNorm,
     /// SwiGLU feed-forward network.
@@ -47,9 +48,9 @@ struct LlamaLayer {
 
 impl LlamaLayer {
     fn forward(&self, x: &Tensor, ctx: &ForwardContext, layer_idx: usize) -> Result<Tensor> {
-        // Pre-norm attention
+        // Pre-norm attention (fused RMSNorm on CUDA)
         let residual = x;
-        let x = self.attn_norm.forward(x)?;
+        let x = self.attn_norm.forward_fused(x, ctx.backend)?;
 
         // QKV projections (+ optional biases for Qwen2)
         let mut q = self.attn_q.forward(&x)?;
@@ -83,15 +84,15 @@ impl LlamaLayer {
         // Paged attention (includes RoPE + cache write + attention dispatch)
         let attn_out = self.attention.forward(&q, &k, &v, ctx, layer_idx)?;
 
-        // Output projection + residual
-        let x = self.attn_output.forward(&attn_out)?;
-        let x = (x + residual)?;
+        // Output projection
+        let attn_proj = self.attn_output.forward(&attn_out)?;
 
-        // Pre-norm MLP
-        let residual = &x;
-        let x = self.ffn_norm.forward(&x)?;
-        let x = self.mlp.forward(&x)?;
-        x + residual
+        // Fused residual add + RMSNorm for MLP (eliminates intermediate tensor on CUDA)
+        let (x, residual) = self.ffn_norm.forward_add_fused(&attn_proj, residual, ctx.backend)?;
+
+        // MLP (fused SiLU+mul on CUDA) + residual
+        let x = self.mlp.forward_fused(&x, ctx.backend)?;
+        x + &residual
     }
 }
 
@@ -112,7 +113,7 @@ pub struct LlamaModel {
     /// Final RMS normalization before output projection.
     norm: RmsNorm,
     /// Output projection to vocabulary (lm_head).
-    lm_head: QMatMul,
+    lm_head: MaybeQuantizedLinear,
     /// Model configuration.
     config: ModelConfig,
 }
@@ -124,10 +125,12 @@ impl LlamaModel {
     /// - `ct`: parsed GGUF content (metadata + tensor directory)
     /// - `reader`: seekable reader for loading tensor data
     /// - `device`: target device (CPU or Metal)
+    /// - `quantization`: weight quantization method to apply at load time
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+        quantization: QuantizationMethod,
     ) -> Result<Self> {
         let md = &ct.metadata;
 
@@ -189,11 +192,16 @@ impl LlamaModel {
         let embed_table = embed_q.dequantize(device)?;
         let vocab_size = embed_table.dims()[0];
 
+        // Helper: load a QMatMul and optionally re-quantize to INT8
+        let wrap = |qmm: QMatMul| -> Result<MaybeQuantizedLinear> {
+            MaybeQuantizedLinear::from_qmatmul(qmm, quantization, device)
+        };
+
         // ── Load output projection ──
         // Some models share token_embd and output weights (tied embeddings)
         let lm_head = match ct.tensor(reader, "output.weight", device) {
-            Ok(t) => QMatMul::from_qtensor(t)?,
-            Err(_) => QMatMul::from_qtensor(ct.tensor(reader, "token_embd.weight", device)?)?,
+            Ok(t) => wrap(QMatMul::from_qtensor(t)?)?,
+            Err(_) => wrap(QMatMul::from_qtensor(ct.tensor(reader, "token_embd.weight", device)?)?)?,
         };
 
         // ── Load output normalization ──
@@ -219,15 +227,15 @@ impl LlamaModel {
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let attn_q = QMatMul::from_qtensor(
+            let attn_q = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?,
-            )?;
-            let attn_k = QMatMul::from_qtensor(
+            )?)?;
+            let attn_k = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?,
-            )?;
-            let attn_v = QMatMul::from_qtensor(
+            )?)?;
+            let attn_v = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?,
-            )?;
+            )?)?;
             // Optional QKV biases (Qwen2 has them, Llama does not)
             let attn_q_bias = ct
                 .tensor(reader, &format!("{prefix}.attn_q.bias"), device)
@@ -254,24 +262,24 @@ impl LlamaModel {
                 .map(|t| RmsNorm::from_qtensor(t, rms_norm_eps))
                 .transpose()?;
 
-            let attn_output = QMatMul::from_qtensor(
+            let attn_output = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?,
-            )?;
+            )?)?;
 
             // MLP weights
             let ffn_norm = RmsNorm::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let gate = QMatMul::from_qtensor(
+            let gate = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?,
-            )?;
-            let down = QMatMul::from_qtensor(
+            )?)?;
+            let down = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?,
-            )?;
-            let up = QMatMul::from_qtensor(
+            )?)?;
+            let up = wrap(QMatMul::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?,
-            )?;
+            )?)?;
             let mlp = SwiGluMlp::new(gate, down, up);
 
             // Paged attention layer (shares RoPE tables via Tensor clone = Arc refcount)
@@ -317,11 +325,11 @@ impl LlamaModel {
         let has_qkv_bias = layers.first().map_or(false, |l| l.attn_q_bias.is_some());
         let has_qk_norm = layers.first().map_or(false, |l| l.attn_q_norm.is_some());
         tracing::info!(
-            "Model config: hidden={} heads={} kv_heads={} head_size={} layers={} vocab={} rope_theta={} rope_dim={} max_seq={} intermediate={} qkv_bias={} qk_norm={}",
+            "Model config: hidden={} heads={} kv_heads={} head_size={} layers={} vocab={} rope_theta={} rope_dim={} max_seq={} intermediate={} qkv_bias={} qk_norm={} quantization={}",
             config.hidden_size, config.num_heads, config.num_kv_heads,
             config.head_size, config.num_layers, config.vocab_size,
             config.rope_theta, config.rope_dim, config.max_seq_len, config.intermediate_size,
-            has_qkv_bias, has_qk_norm,
+            has_qkv_bias, has_qk_norm, quantization,
         );
 
         Ok(Self {
@@ -345,7 +353,7 @@ impl ModelRunner for LlamaModel {
         }
 
         // Final norm + output projection: [total_tokens, hidden_size] -> [total_tokens, vocab_size]
-        let hidden_states = self.norm.forward(&hidden_states)?;
+        let hidden_states = self.norm.forward_fused(&hidden_states, ctx.backend)?;
         self.lm_head.forward(&hidden_states)
     }
 

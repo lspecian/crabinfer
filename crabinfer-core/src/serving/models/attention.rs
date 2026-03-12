@@ -1,16 +1,16 @@
 //! Paged attention layer shared across all model architectures.
 //!
-//! Handles both prefill (standard SDPA) and decode (Metal paged attention kernel).
+//! Handles both prefill (standard SDPA) and decode (paged attention kernel).
 //! During both modes, new K/V tokens are written to the paged cache via
 //! `reshape_and_cache` so subsequent decode steps can read them.
+//!
+//! Dispatch is through the `KernelBackend` trait (Metal, CUDA, or CPU)
+//! carried on `ForwardContext::backend`.
 
 use candle_core::{Device, Result, Tensor};
 
 use super::ForwardContext;
-use crate::serving::kernels::HeadSize;
-
-#[cfg(feature = "metal")]
-use crate::serving::kernels::metal_dispatch;
+use crate::serving::kernels::backend::PagedAttentionConfig;
 
 // ─── PagedAttentionLayer ──────────────────────────────────────────────────
 
@@ -69,9 +69,9 @@ impl PagedAttentionLayer {
     /// Steps:
     /// 1. Reshape Q/K/V to `[total_tokens, num_heads, head_size]`
     /// 2. Apply RoPE to Q and K using position tensor
-    /// 3. Write K, V to paged cache via `reshape_and_cache`
+    /// 3. Write K, V to paged cache via backend's `reshape_and_cache`
     /// 4. Compute attention:
-    ///    - Decode (all seqs have 1 token): Metal paged attention kernel
+    ///    - Decode (all seqs have 1 token): backend's paged attention kernel
     ///    - Prefill: standard SDPA per sequence
     ///
     /// # Arguments
@@ -98,19 +98,20 @@ impl PagedAttentionLayer {
         let k = key.reshape((total_tokens, self.num_kv_heads, self.head_size))?;
         let v = value.reshape((total_tokens, self.num_kv_heads, self.head_size))?;
 
-        // Apply RoPE using position tensor
-        let q = self.apply_rope(&q, ctx.positions)?;
-        let k = self.apply_rope(&k, ctx.positions)?;
+        // Apply RoPE using fused kernel (CUDA) or unfused path (CPU/Metal)
+        let q = ctx.backend.fused_rope(
+            &q, ctx.positions, &self.cos, &self.sin,
+            self.num_heads, self.head_size, self.cos.dims()[1] * 2,
+        )?;
+        let k = ctx.backend.fused_rope(
+            &k, ctx.positions, &self.cos, &self.sin,
+            self.num_kv_heads, self.head_size, self.cos.dims()[1] * 2,
+        )?;
 
-        // Write K, V to paged cache
+        // Write K, V to paged cache via backend
         let (key_cache, value_cache) = &ctx.kv_caches[layer_idx];
-
-        #[cfg(feature = "metal")]
-        metal_dispatch::reshape_and_cache(&k, &v, key_cache, value_cache, ctx.slot_mapping)?;
-
-        // On non-Metal, reshape_and_cache is a no-op (CPU paged cache not yet implemented)
-        #[cfg(not(feature = "metal"))]
-        let _ = (key_cache, value_cache);
+        ctx.backend
+            .reshape_and_cache(&k, &v, key_cache, value_cache, ctx.slot_mapping)?;
 
         // Dispatch attention
         if ctx.is_all_decode {
@@ -124,24 +125,7 @@ impl PagedAttentionLayer {
         }
     }
 
-    /// Apply RoPE to a `[total_tokens, num_heads, head_size]` tensor.
-    ///
-    /// Gathers cos/sin by position index, then applies the rotary transform.
-    fn apply_rope(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
-        // Gather cos/sin for the given positions: [total_tokens, rope_dim/2]
-        let cos = self.cos.index_select(positions, 0)?;
-        let sin = self.sin.index_select(positions, 0)?;
-
-        // candle_nn::rotary_emb::rope expects [batch, num_heads, seq_len, head_size]
-        // Reshape: [total_tokens, num_heads, head_size] -> [1, num_heads, total_tokens, head_size]
-        let x = x.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let result = candle_nn::rotary_emb::rope(&x, &cos, &sin)?;
-
-        // Reshape back: [1, num_heads, total_tokens, head_size] -> [total_tokens, num_heads, head_size]
-        result.squeeze(0)?.transpose(0, 1)?.contiguous()
-    }
-
-    /// Decode attention: use Metal paged attention kernel.
+    /// Decode attention: dispatch to backend's paged attention kernel.
     ///
     /// All sequences have exactly 1 new token, so query is `[num_seqs, num_heads, head_size]`.
     fn decode_attention(
@@ -153,54 +137,116 @@ impl PagedAttentionLayer {
     ) -> Result<Tensor> {
         let num_seqs = ctx.seq_lens.len();
 
-        #[cfg(feature = "metal")]
-        {
-            let head_size = HeadSize::from_usize(self.head_size).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "unsupported head size {} for paged attention (supported: 64, 128)",
-                    self.head_size
-                ))
-            })?;
+        let output = Tensor::zeros(
+            (num_seqs, self.num_heads, self.head_size),
+            query.dtype(),
+            query.device(),
+        )?;
 
-            let output = Tensor::zeros(
-                (num_seqs, self.num_heads, self.head_size),
-                query.dtype(),
-                query.device(),
-            )?;
+        let config = PagedAttentionConfig {
+            head_size: self.head_size,
+            num_kv_heads: self.num_kv_heads,
+            scale: self.scale,
+            max_context_len: ctx.max_context_len,
+        };
 
-            let config = metal_dispatch::PagedAttentionConfig {
-                head_size,
-                num_kv_heads: self.num_kv_heads,
-                scale: self.scale,
-                max_context_len: ctx.max_context_len,
-            };
+        ctx.backend.paged_attention(
+            &output,
+            query,
+            key_cache,
+            value_cache,
+            ctx.block_table,
+            ctx.context_lens,
+            &config,
+        )?;
 
-            metal_dispatch::paged_attention(
-                &output,
-                query,
-                key_cache,
-                value_cache,
-                ctx.block_table,
-                ctx.context_lens,
-                &config,
-            )?;
-
-            // Reshape to [num_seqs, num_heads * head_size]
-            output.reshape((num_seqs, self.num_heads * self.head_size))
-        }
-
-        #[cfg(not(feature = "metal"))]
-        {
-            let _ = (query, key_cache, value_cache, ctx, num_seqs);
-            candle_core::bail!("paged attention decode requires the metal feature")
-        }
+        // Reshape to [num_seqs, num_heads * head_size]
+        output.reshape((num_seqs, self.num_heads * self.head_size))
     }
 
-    /// Prefill attention: standard SDPA per sequence.
+    /// Prefill attention: dispatches to FlashAttention-2 (if available) or
+    /// falls back to standard SDPA per sequence.
+    fn prefill_attention(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        ctx: &ForwardContext,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "flash-attn")]
+        {
+            // FlashAttention-2 via candle-flash-attn: IO-aware tiled attention,
+            // 2-4x faster than standard SDPA for long sequences.
+            // Supports GQA natively (num_heads_q must be divisible by num_heads_kv).
+            // Only works with f16/bf16 on CUDA sm_80+.
+            if matches!(query.device(), Device::Cuda(_))
+                && matches!(query.dtype(), candle_core::DType::F16 | candle_core::DType::BF16)
+            {
+                return self.flash_attn_prefill(query, key, value, ctx);
+            }
+        }
+        self.sdpa_prefill(query, key, value, ctx)
+    }
+
+    /// FlashAttention-2 prefill using variable-length batching.
+    ///
+    /// Uses `flash_attn_varlen` which handles multiple sequences of different
+    /// lengths packed into a single tensor — perfect for continuous batching.
+    ///
+    /// Tensors are `[total_tokens, num_heads, head_size]` with cumulative
+    /// sequence lengths to demarcate boundaries.
+    #[cfg(feature = "flash-attn")]
+    fn flash_attn_prefill(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        ctx: &ForwardContext,
+    ) -> Result<Tensor> {
+        // Handle GQA: flash_attn_varlen supports it natively when
+        // num_heads_q % num_heads_kv == 0, so no need to repeat KV heads.
+
+        // Build cumulative sequence lengths as u32 tensor on the same device.
+        // flash_attn_varlen expects seqlens_q and seqlens_k of shape [batch_size + 1].
+        let seqlens: Vec<u32> = ctx.query_start_loc.iter().map(|&x| x as u32).collect();
+        let seqlens_q = Tensor::new(&seqlens[..], query.device())?;
+        let seqlens_k = seqlens_q.clone();
+
+        let max_seqlen = ctx.query_start_loc
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .unwrap_or(0);
+
+        // q, k, v are [total_tokens, num_heads, head_size] — already in the right layout
+        // for flash_attn_varlen which expects [total_tokens, num_heads, head_size]
+        let q_contig = query.contiguous()?;
+        let k_contig = key.contiguous()?;
+        let v_contig = value.contiguous()?;
+
+        let attn_output = candle_flash_attn::flash_attn_varlen(
+            &q_contig,
+            &k_contig,
+            &v_contig,
+            &seqlens_q,
+            &seqlens_k,
+            max_seqlen,
+            max_seqlen,
+            self.scale,
+            true, // causal
+        )?;
+
+        // Output is [total_tokens, num_heads, head_size]
+        // Reshape to [total_tokens, num_heads * head_size]
+        let total_tokens = query.dims()[0];
+        attn_output.reshape((total_tokens, self.num_heads * self.head_size))
+    }
+
+    /// Standard SDPA prefill: per-sequence scaled dot-product attention.
     ///
     /// For each sequence, extracts its Q/K/V slice and computes causally-masked
     /// attention. This handles GQA by repeating KV heads.
-    fn prefill_attention(
+    fn sdpa_prefill(
         &self,
         query: &Tensor,
         key: &Tensor,
@@ -225,7 +271,7 @@ impl PagedAttentionLayer {
             let v_seq = value.narrow(0, start, seq_len)?;
 
             // Reshape to [1, num_heads, seq_len, head_size] for batched matmul
-            // Must call .contiguous() after transpose to satisfy Metal GEMM stride requirements
+            // Must call .contiguous() after transpose to satisfy GPU GEMM stride requirements
             let q_seq = q_seq.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
             let k_seq = k_seq.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
             let v_seq = v_seq.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;

@@ -18,6 +18,8 @@ pub enum SequenceStatus {
     Waiting,
     /// Actively running (has KV cache blocks allocated).
     Running,
+    /// KV cache blocks swapped to CPU; waiting to be swapped back in.
+    Swapped,
     /// Generation complete (EOS, max tokens, or stop string).
     Finished(FinishReason),
 }
@@ -31,6 +33,8 @@ pub enum FinishReason {
     MaxTokens,
     /// Hit a stop string/token.
     Stop,
+    /// Model produced tool call(s).
+    ToolCalls,
     /// Cancelled by the client (e.g., SSE disconnect).
     Cancelled,
     /// Preempted by the scheduler due to memory pressure.
@@ -52,6 +56,13 @@ pub struct SamplingParams {
     pub stop_token_ids: Vec<u32>,
     /// Repetition penalty. 1.0 = no penalty.
     pub repetition_penalty: f32,
+    /// Whether to return log probabilities of the sampled token.
+    pub logprobs: bool,
+    /// Number of top log probabilities to return per token position (0-20).
+    pub top_logprobs: usize,
+    /// Request priority. Lower value = higher priority. Default: 0.
+    /// Used for priority-aware scheduling and preemption ordering.
+    pub priority: i32,
 }
 
 impl Default for SamplingParams {
@@ -63,6 +74,9 @@ impl Default for SamplingParams {
             max_tokens: 2048,
             stop_token_ids: Vec::new(),
             repetition_penalty: 1.0,
+            logprobs: false,
+            top_logprobs: 0,
+            priority: 0,
         }
     }
 }

@@ -13,9 +13,12 @@
 pub mod attention;
 pub mod llama;
 
-use candle_core::quantized::QMatMul;
-use candle_core::{Result, Tensor};
+use candle_core::quantized::gguf_file;
+use candle_core::{Device, Result, Tensor};
 use candle_nn::Module;
+
+use crate::serving::kernels::KernelBackend;
+use crate::serving::quantization::{MaybeQuantizedLinear, QuantizationMethod};
 
 // ─── Forward context ──────────────────────────────────────────────────────
 
@@ -45,6 +48,8 @@ pub struct ForwardContext<'a> {
     /// When true, the paged attention kernel is used directly.
     /// When false, standard SDPA is used for prefill sequences.
     pub is_all_decode: bool,
+    /// Kernel backend for dispatching paged attention operations.
+    pub backend: &'a dyn KernelBackend,
 }
 
 // ─── Model config ─────────────────────────────────────────────────────────
@@ -94,6 +99,94 @@ pub trait ModelRunner: Send + Sync {
     fn config(&self) -> &ModelConfig;
 }
 
+// ─── Architecture registry ───────────────────────────────────────────────
+
+/// Factory function type for loading a model from a GGUF file.
+///
+/// Takes the parsed GGUF content, the open file handle, the target device,
+/// and quantization method. Returns a boxed ModelRunner.
+pub type ModelFactory = fn(
+    gguf_file::Content,
+    &mut std::fs::File,
+    &Device,
+    QuantizationMethod,
+) -> Result<Box<dyn ModelRunner>>;
+
+/// Registry entry for a model architecture.
+struct ArchitectureEntry {
+    /// GGUF `general.architecture` value(s) this loader handles.
+    names: &'static [&'static str],
+    /// Factory function to load the model.
+    factory: ModelFactory,
+}
+
+/// Global architecture registry.
+///
+/// Add new architectures by appending to this array.
+static ARCHITECTURE_REGISTRY: &[ArchitectureEntry] = &[ArchitectureEntry {
+    names: &["llama"],
+    factory: llama_factory,
+}];
+
+/// Factory wrapper for LlamaModel.
+fn llama_factory(
+    ct: gguf_file::Content,
+    file: &mut std::fs::File,
+    device: &Device,
+    quantization: QuantizationMethod,
+) -> Result<Box<dyn ModelRunner>> {
+    let model = llama::LlamaModel::from_gguf(ct, file, device, quantization)?;
+    Ok(Box::new(model))
+}
+
+/// Look up a model factory by GGUF architecture name.
+///
+/// Returns the factory function if a matching architecture is registered,
+/// or `None` if the architecture is not supported.
+pub fn find_architecture(arch: &str) -> Option<ModelFactory> {
+    let arch_lower = arch.to_lowercase();
+    ARCHITECTURE_REGISTRY
+        .iter()
+        .find(|entry| entry.names.iter().any(|n| *n == arch_lower))
+        .map(|entry| entry.factory)
+}
+
+/// Load a model from a GGUF file using the architecture registry.
+///
+/// Reads `general.architecture` from GGUF metadata, looks up the appropriate
+/// loader, and returns a boxed `ModelRunner`.
+pub fn load_model_from_gguf(
+    ct: gguf_file::Content,
+    file: &mut std::fs::File,
+    device: &Device,
+    quantization: QuantizationMethod,
+) -> Result<Box<dyn ModelRunner>> {
+    let arch = ct
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "llama".to_string());
+
+    let factory = find_architecture(&arch).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "Unsupported model architecture: '{}'. Supported: {}",
+            arch,
+            supported_architectures().join(", ")
+        ))
+    })?;
+
+    factory(ct, file, device, quantization)
+}
+
+/// List all supported architecture names.
+pub fn supported_architectures() -> Vec<&'static str> {
+    ARCHITECTURE_REGISTRY
+        .iter()
+        .flat_map(|entry| entry.names.iter().copied())
+        .collect()
+}
+
 // ─── Shared building blocks ───────────────────────────────────────────────
 
 /// RMS Layer Normalization.
@@ -101,8 +194,8 @@ pub trait ModelRunner: Send + Sync {
 /// Dequantizes the GGUF weight at construction time and applies
 /// `candle_nn::ops::rms_norm` during forward.
 pub struct RmsNorm {
-    weight: Tensor,
-    eps: f32,
+    pub(crate) weight: Tensor,
+    pub(crate) eps: f32,
 }
 
 impl RmsNorm {
@@ -118,19 +211,39 @@ impl RmsNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         candle_nn::ops::rms_norm(x, &self.weight, self.eps)
     }
+
+    /// Forward pass using fused RMSNorm kernel when available.
+    ///
+    /// On CUDA, this computes the entire normalization in a single kernel pass.
+    pub fn forward_fused(&self, x: &Tensor, backend: &dyn KernelBackend) -> Result<Tensor> {
+        backend.fused_rmsnorm(x, &self.weight, self.eps)
+    }
+
+    /// Fused residual add + RMSNorm.
+    ///
+    /// Computes `x_out = x + residual`, then normalizes in one kernel pass on CUDA.
+    /// Returns `(normed, x_out)` where `x_out` is used as the next residual.
+    pub fn forward_add_fused(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        backend: &dyn KernelBackend,
+    ) -> Result<(Tensor, Tensor)> {
+        backend.fused_add_rmsnorm(x, residual, &self.weight, self.eps)
+    }
 }
 
 /// SwiGLU MLP: `output = down(silu(gate(x)) * up(x))`
 ///
 /// Used by Llama, Qwen2, Phi3, and Gemma architectures.
 pub struct SwiGluMlp {
-    gate: QMatMul,
-    down: QMatMul,
-    up: QMatMul,
+    gate: MaybeQuantizedLinear,
+    down: MaybeQuantizedLinear,
+    up: MaybeQuantizedLinear,
 }
 
 impl SwiGluMlp {
-    pub fn new(gate: QMatMul, down: QMatMul, up: QMatMul) -> Self {
+    pub fn new(gate: MaybeQuantizedLinear, down: MaybeQuantizedLinear, up: MaybeQuantizedLinear) -> Self {
         Self { gate, down, up }
     }
 
@@ -138,6 +251,17 @@ impl SwiGluMlp {
         let gate = candle_nn::ops::silu(&self.gate.forward(x)?)?;
         let up = self.up.forward(x)?;
         self.down.forward(&(gate * up)?)
+    }
+
+    /// Forward pass using fused SiLU+multiply kernel when available.
+    ///
+    /// On CUDA, this eliminates 2 intermediate tensor allocations by computing
+    /// `silu(gate(x)) * up(x)` in a single kernel pass.
+    pub fn forward_fused(&self, x: &Tensor, backend: &dyn KernelBackend) -> Result<Tensor> {
+        let gate_out = self.gate.forward(x)?;
+        let up_out = self.up.forward(x)?;
+        let fused = backend.fused_silu_mul(&gate_out, &up_out)?;
+        self.down.forward(&fused)
     }
 }
 
@@ -175,6 +299,26 @@ mod tests {
         for v in data {
             assert!((v - 1.0).abs() < 1e-4, "expected ~1.0, got {v}");
         }
+    }
+
+    #[test]
+    fn test_find_architecture_llama() {
+        assert!(find_architecture("llama").is_some());
+        assert!(find_architecture("Llama").is_some());
+        assert!(find_architecture("LLAMA").is_some());
+    }
+
+    #[test]
+    fn test_find_architecture_unknown() {
+        assert!(find_architecture("gpt2").is_none());
+        assert!(find_architecture("mamba").is_none());
+    }
+
+    #[test]
+    fn test_supported_architectures() {
+        let archs = supported_architectures();
+        assert!(archs.contains(&"llama"));
+        assert!(!archs.is_empty());
     }
 
     #[test]

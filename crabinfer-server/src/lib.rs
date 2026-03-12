@@ -5,7 +5,6 @@ pub mod state;
 pub mod types;
 
 use crate::state::AppState;
-use crabinfer_core::serving::models::ModelRunner;
 use crabinfer_core::{EngineConfig, ModelInfo, engine::CrabInferEngine};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,13 +25,101 @@ pub struct ServerConfig {
     pub draft_model_path: Option<String>,
     /// Number of draft tokens per speculative step (default: 4).
     pub num_draft_tokens: u32,
+    /// Disable CUDA graphs and use eager execution (for debugging).
+    pub enforce_eager: bool,
+    /// Fraction of GPU memory to use for KV cache (0.0-1.0, default 0.90).
+    pub gpu_memory_utilization: f64,
+    /// Maximum concurrent sequences in the serving engine (default: 64).
+    pub max_num_seqs: usize,
+    /// Maximum tokens per scheduling step (default: 2048).
+    pub max_num_batched_tokens: usize,
+    /// Disable prefix caching.
+    pub disable_prefix_cache: bool,
+    /// Weight quantization method (none, int8). Default: none.
+    pub quantization: String,
+    /// KV cache data type (auto, fp16, bf16). Default: auto.
+    pub kv_cache_dtype: String,
+    /// Maximum model context length. None = use model default.
+    pub max_model_len: Option<usize>,
+    /// Chat template override. Architecture name (e.g., "chatml", "llama3")
+    /// or path to a template file. None = auto-detect from model metadata.
+    pub chat_template: Option<String>,
+    /// CPU swap space for KV cache in GiB (0.0 = disabled). Default: 0.0.
+    /// When > 0, preempted sequences have their KV cache blocks swapped to
+    /// pinned CPU memory instead of being discarded.
+    pub swap_space: f64,
+}
+
+/// Apply environment variable overrides to a ServerConfig.
+///
+/// Supported variables:
+/// - `CRABINFER_HOST` — host to bind to
+/// - `CRABINFER_PORT` — port number
+/// - `CRABINFER_GPU_MEMORY_UTILIZATION` — GPU memory fraction (0.0-1.0)
+/// - `CRABINFER_MAX_NUM_SEQS` — maximum concurrent sequences
+/// - `CRABINFER_MAX_NUM_BATCHED_TOKENS` — max tokens per scheduling step
+/// - `CRABINFER_MAX_MODEL_LEN` — override model context length
+/// - `CRABINFER_QUANTIZATION` — weight quantization method
+/// - `CRABINFER_KV_CACHE_DTYPE` — KV cache data type
+/// - `CRABINFER_CHAT_TEMPLATE` — chat template override
+/// - `CRABINFER_ENFORCE_EAGER` — set to "1" or "true" to disable CUDA graphs
+/// - `CRABINFER_SWAP_SPACE` — CPU swap space for KV cache in GiB (0 = disabled)
+fn apply_env_overrides(config: &mut ServerConfig) {
+    use std::env;
+
+    if let Ok(v) = env::var("CRABINFER_HOST") {
+        config.host = v;
+    }
+    if let Ok(v) = env::var("CRABINFER_PORT") {
+        if let Ok(p) = v.parse() {
+            config.port = p;
+        }
+    }
+    if let Ok(v) = env::var("CRABINFER_GPU_MEMORY_UTILIZATION") {
+        if let Ok(f) = v.parse() {
+            config.gpu_memory_utilization = f;
+        }
+    }
+    if let Ok(v) = env::var("CRABINFER_MAX_NUM_SEQS") {
+        if let Ok(n) = v.parse() {
+            config.max_num_seqs = n;
+        }
+    }
+    if let Ok(v) = env::var("CRABINFER_MAX_NUM_BATCHED_TOKENS") {
+        if let Ok(n) = v.parse() {
+            config.max_num_batched_tokens = n;
+        }
+    }
+    if let Ok(v) = env::var("CRABINFER_MAX_MODEL_LEN") {
+        if let Ok(n) = v.parse() {
+            config.max_model_len = Some(n);
+        }
+    }
+    if let Ok(v) = env::var("CRABINFER_QUANTIZATION") {
+        config.quantization = v;
+    }
+    if let Ok(v) = env::var("CRABINFER_KV_CACHE_DTYPE") {
+        config.kv_cache_dtype = v;
+    }
+    if let Ok(v) = env::var("CRABINFER_CHAT_TEMPLATE") {
+        config.chat_template = Some(v);
+    }
+    if let Ok(v) = env::var("CRABINFER_ENFORCE_EAGER") {
+        config.enforce_eager = v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Ok(v) = env::var("CRABINFER_SWAP_SPACE") {
+        if let Ok(f) = v.parse() {
+            config.swap_space = f;
+        }
+    }
 }
 
 /// Start the CrabInfer API server with the given configuration.
 ///
 /// Loads the model, binds to `host:port`, and serves OpenAI + Anthropic
 /// compatible endpoints until a SIGINT is received.
-pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(mut config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    apply_env_overrides(&mut config);
     tracing::info!("Loading model: {}", config.model_path);
 
     let created_at = SystemTime::now()
@@ -61,6 +148,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
         model_id,
         created_at,
         metrics: state::ServerMetrics::new(),
+        chat_template: config.chat_template.clone(),
     });
 
     let app = routes::create_router(state.clone());
@@ -71,6 +159,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
     tracing::info!("Server ready. Endpoints:");
     tracing::info!("  GET  http://{}/health", addr);
+    tracing::info!("  GET  http://{}/ready", addr);
     tracing::info!("  GET  http://{}/v1/models", addr);
     tracing::info!("  POST http://{}/v1/chat/completions", addr);
     tracing::info!("  POST http://{}/v1/messages", addr);
@@ -165,9 +254,11 @@ fn load_serving_engine(
 > {
     use candle_core::quantized::gguf_file;
     use crabinfer_core::serving::engine_loop::{EngineHandle, ServingEngineConfig};
-    use crabinfer_core::serving::models::llama::LlamaModel;
+    use crabinfer_core::serving::models::load_model_from_gguf;
+    use crabinfer_core::serving::quantization::QuantizationMethod;
 
     let model_path = std::path::Path::new(&config.model_path);
+    let is_safetensors = crabinfer_core::serving::safetensors_loader::is_safetensors_dir(model_path);
 
     // ── Select device ──
     let device = if config.cpu {
@@ -177,39 +268,102 @@ fn load_serving_engine(
     };
     tracing::info!("Serving engine device: {:?}", device);
 
-    // ── Open GGUF file and load model ──
-    let mut file = std::fs::File::open(model_path)
-        .map_err(|e| format!("Failed to open model file: {e}"))?;
-    let ct = gguf_file::Content::read(&mut file)
-        .map_err(|e| format!("Failed to read GGUF content: {e}"))?;
+    let quantization: QuantizationMethod = config
+        .quantization
+        .parse()
+        .map_err(|e: String| format!("Invalid quantization method: {e}"))?;
+    if quantization != QuantizationMethod::None {
+        tracing::info!("Weight quantization: {quantization}");
+    }
 
-    // Extract model info and EOS token from GGUF metadata before loading weights
-    let model_info = extract_model_info(&ct, model_path)?;
-    let model_id = model_info.model_name.clone();
+    let kv_cache_dtype: crabinfer_core::serving::quantization::KVCacheDType = config
+        .kv_cache_dtype
+        .parse()
+        .map_err(|e: String| format!("Invalid KV cache dtype: {e}"))?;
 
-    // Read EOS token ID from GGUF metadata (most models include this)
-    let gguf_eos = ct
-        .metadata
-        .get("tokenizer.ggml.eos_token_id")
-        .and_then(|v| v.to_u32().ok());
+    // ── Load model + tokenizer + model info (branching on format) ──
+    let (model, model_info, model_id, tokenizer, eos_token_id) = if is_safetensors {
+        tracing::info!("Detected HuggingFace safetensors directory");
+        tracing::info!("Loading paged-attention model from safetensors...");
 
-    tracing::info!("Loading paged-attention model from GGUF...");
-    let model = LlamaModel::from_gguf(ct, &mut file, &device)
-        .map_err(|e| format!("Failed to load model: {e}"))?;
+        let model = crabinfer_core::serving::safetensors_loader::load_model_from_safetensors(
+            model_path, &device, quantization,
+        )
+        .map_err(|e| format!("Failed to load safetensors model: {e}"))?;
+
+        let model_config = model.config();
+        let model_name = model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let model_info = ModelInfo {
+            model_name: model_name.clone(),
+            architecture: "llama".to_string(),
+            parameter_count: 0, // Not easily available from safetensors without counting
+            active_parameter_count: 0,
+            quantization: quantization.to_string(),
+            file_size_bytes: 0,
+            context_length: model_config.max_seq_len as u32,
+            vocab_size: model_config.vocab_size as u32,
+            is_moe: false,
+            expert_count: 0,
+            expert_used_count: 0,
+        };
+
+        // Tokenizer: expect tokenizer.json inside the model directory
+        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer = if tokenizer_path.exists() {
+            tracing::info!("Loading tokenizer from: {}", tokenizer_path.display());
+            tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| format!("Failed to load tokenizer: {e}"))?
+        } else {
+            return Err(format!(
+                "No tokenizer.json found in {}", model_path.display()
+            ).into());
+        };
+
+        // Detect EOS from tokenizer (no GGUF metadata available)
+        let eos = tokenizer.token_to_id("<|endoftext|>")
+            .or_else(|| tokenizer.token_to_id("<|end|>"))
+            .or_else(|| tokenizer.token_to_id("</s>"))
+            .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
+            .or_else(|| tokenizer.token_to_id("<|end_of_text|>"))
+            .unwrap_or(2);
+
+        (model, model_info, model_name, tokenizer, eos)
+    } else {
+        // ── GGUF path ──
+        let mut file = std::fs::File::open(model_path)
+            .map_err(|e| format!("Failed to open model file: {e}"))?;
+        let ct = gguf_file::Content::read(&mut file)
+            .map_err(|e| format!("Failed to read GGUF content: {e}"))?;
+
+        let model_info = extract_model_info(&ct, model_path)?;
+        let model_id = model_info.model_name.clone();
+
+        let gguf_eos = ct
+            .metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.to_u32().ok());
+
+        tracing::info!("Loading paged-attention model from GGUF...");
+        let model = load_model_from_gguf(ct, &mut file, &device, quantization)
+            .map_err(|e| format!("Failed to load model: {e}"))?;
+
+        let tokenizer = load_tokenizer(model_path)?;
+
+        let eos = gguf_eos
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .or_else(|| tokenizer.token_to_id("<|end|>"))
+            .or_else(|| tokenizer.token_to_id("</s>"))
+            .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
+            .unwrap_or(2);
+
+        (model, model_info, model_id, tokenizer, eos)
+    };
 
     let model_config = model.config().clone();
-
-    // ── Load tokenizer ──
-    let tokenizer = load_tokenizer(model_path)?;
-
-    // ── Detect EOS token ──
-    // Prefer GGUF metadata, fall back to common EOS token strings
-    let eos_token_id = gguf_eos
-        .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-        .or_else(|| tokenizer.token_to_id("<|end|>"))
-        .or_else(|| tokenizer.token_to_id("</s>"))
-        .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
-        .unwrap_or(2);
     tracing::info!("EOS token ID: {eos_token_id}");
 
     // ── Calculate KV cache blocks based on available memory ──
@@ -232,10 +386,16 @@ fn load_serving_engine(
 
     // ── Create engine ──
     let engine_config = ServingEngineConfig {
-        max_num_seqs: 64,
-        max_num_batched_tokens: 2048,
-        num_kv_cache_blocks: target_blocks,
-        enable_prefix_cache: true,
+        max_num_seqs: config.max_num_seqs,
+        max_num_batched_tokens: config.max_num_batched_tokens,
+        num_kv_cache_blocks: Some(target_blocks),
+        enable_prefix_cache: !config.disable_prefix_cache,
+        enforce_eager: config.enforce_eager,
+        gpu_memory_utilization: config.gpu_memory_utilization,
+        quantization,
+        kv_cache_dtype,
+        max_model_len: config.max_model_len,
+        ..ServingEngineConfig::default()
     };
 
     // ── Load draft model for speculative decoding (if configured) ──
@@ -252,7 +412,7 @@ fn load_serving_engine(
         let draft_ct = gguf_file::Content::read(&mut draft_file)
             .map_err(|e| format!("Failed to read draft GGUF content: {e}"))?;
 
-        let draft_model = LlamaModel::from_gguf(draft_ct, &mut draft_file, &device)
+        let draft_model = load_model_from_gguf(draft_ct, &mut draft_file, &device, quantization)
             .map_err(|e| format!("Failed to load draft model: {e}"))?;
 
         tracing::info!(
@@ -271,7 +431,7 @@ fn load_serving_engine(
         };
 
         let speculative = SpeculativeState::new(
-            Box::new(draft_model),
+            draft_model,
             &device,
             draft_blocks,
             spec_config,
@@ -285,7 +445,7 @@ fn load_serving_engine(
         );
 
         EngineHandle::start_with_draft(
-            Box::new(model),
+            model,
             tokenizer,
             eos_token_id,
             device,
@@ -295,7 +455,7 @@ fn load_serving_engine(
         .map_err(|e| format!("Failed to start serving engine with speculative: {e}"))?
     } else {
         EngineHandle::start(
-            Box::new(model),
+            model,
             tokenizer,
             eos_token_id,
             device,
@@ -555,26 +715,48 @@ fn get_total_system_memory() -> usize {
 }
 
 async fn shutdown_signal(state: Arc<AppState>) {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
+    // Wait for SIGINT (Ctrl+C) or SIGTERM (Docker/K8s)
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to install CTRL+C handler");
+    }
+
     tracing::info!("Shutdown signal received, draining in-flight requests...");
 
     // Signal the engine to stop accepting new work
     if let Some(ref engine) = state.serving_engine {
         engine.shutdown();
 
-        // Give in-flight requests up to 10 seconds to complete
+        // Wait for in-flight requests to complete (up to 30s)
         let drain_deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(10);
+            + std::time::Duration::from_secs(30);
         loop {
-            if tokio::time::Instant::now() >= drain_deadline {
-                tracing::warn!("Drain timeout reached, forcing shutdown");
+            let in_flight = engine.in_flight_count();
+            if in_flight == 0 {
+                tracing::info!("All in-flight requests completed");
                 break;
             }
-            // Engine loop will exit on its own when shutdown flag is set
-            // and all sequences finish. We just wait here.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if tokio::time::Instant::now() >= drain_deadline {
+                tracing::warn!(
+                    "Drain timeout reached with {} requests still in-flight, forcing shutdown",
+                    in_flight
+                );
+                break;
+            }
+            tracing::debug!("Waiting for {} in-flight requests to drain...", in_flight);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         tracing::info!("Serving engine shut down");
     }

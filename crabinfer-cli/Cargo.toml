@@ -9,9 +9,16 @@ license = "Apache-2.0"
 name = "crabinfer"
 path = "src/main.rs"
 
+[features]
+default = ["metal"]
+metal = ["crabinfer-core/metal", "crabinfer-server/metal"]
+cuda = ["crabinfer-core/cuda", "crabinfer-server/cuda"]
+flash-attn = ["crabinfer-core/flash-attn", "crabinfer-server/flash-attn"]
+cpu-only = ["crabinfer-core/cpu-only", "crabinfer-server/cpu-only"]
+
 [dependencies]
-crabinfer-core = { path = "../crabinfer-core", features = ["providers"] }
-crabinfer-server = { path = "../crabinfer-server" }
+crabinfer-core = { path = "../crabinfer-core", default-features = false, features = ["providers"] }
+crabinfer-server = { path = "../crabinfer-server", default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

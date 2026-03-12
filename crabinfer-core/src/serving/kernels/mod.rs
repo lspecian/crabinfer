@@ -1,18 +1,39 @@
-//! Metal kernel dispatch for paged attention operations.
+//! Kernel dispatch for paged attention operations.
 //!
-//! Compiles and caches Metal compute pipelines at first use.
-//! Provides three main operations:
+//! Provides a `KernelBackend` trait abstraction over GPU-specific
+//! implementations (Metal, CUDA) and a CPU fallback. The engine loop
+//! calls `detect_backend()` at startup to select the best available backend.
+//!
+//! Three core operations:
 //! - `paged_attention`: batched attention over paged KV cache
 //! - `reshape_and_cache`: write new K/V tokens into the paged cache
 //! - `copy_blocks`: copy KV cache blocks for prefix sharing
+
+pub mod backend;
+pub mod cpu_backend;
 
 #[cfg(feature = "metal")]
 pub(crate) mod metal_dispatch;
 
 #[cfg(feature = "metal")]
-pub use metal_dispatch::*;
+pub mod metal_backend;
 
-/// Supported attention head sizes.
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
+
+// Re-exports
+pub use backend::{KernelBackend, PagedAttentionConfig};
+pub use cpu_backend::CpuBackend;
+
+#[cfg(feature = "metal")]
+pub use metal_backend::MetalBackend;
+#[cfg(feature = "metal")]
+pub use metal_dispatch::allocate_kv_caches;
+
+#[cfg(feature = "cuda")]
+pub use cuda_backend::CudaBackend;
+
+/// Supported attention head sizes (used by Metal dispatch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadSize {
     H64 = 64,
@@ -41,3 +62,33 @@ pub const PARTITION_SIZE: usize = 512;
 
 /// Number of threads per threadgroup (fixed for all kernels).
 pub const NUM_THREADS: usize = 256;
+
+/// Detect and return the best available kernel backend for this platform.
+///
+/// Selection order:
+/// 1. CUDA (if `cuda` feature enabled and NVIDIA GPU available)
+/// 2. Metal (if `metal` feature enabled — Apple Silicon)
+/// 3. CPU (always available, used for CI and testing)
+pub fn detect_backend() -> Box<dyn KernelBackend> {
+    #[cfg(feature = "cuda")]
+    {
+        match CudaBackend::new(0) {
+            Ok(backend) => {
+                tracing::info!("Kernel backend: CUDA (device 0)");
+                return Box::new(backend);
+            }
+            Err(e) => {
+                tracing::warn!("CUDA backend unavailable: {e}, falling back");
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        tracing::info!("Kernel backend: Metal");
+        return Box::new(MetalBackend::new());
+    }
+
+    tracing::info!("Kernel backend: CPU (fallback)");
+    Box::new(CpuBackend::new())
+}

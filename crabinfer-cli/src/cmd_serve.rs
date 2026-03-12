@@ -10,6 +10,16 @@ pub fn run(
     serving: bool,
     draft_model: Option<String>,
     num_draft_tokens: u32,
+    enforce_eager: bool,
+    gpu_memory_utilization: f64,
+    max_num_seqs: usize,
+    max_num_batched_tokens: usize,
+    disable_prefix_cache: bool,
+    quantization: &str,
+    kv_cache_dtype: &str,
+    max_model_len: Option<usize>,
+    chat_template: Option<String>,
+    swap_space: f64,
 ) {
     if draft_model.is_some() && !serving {
         eprintln!("Error: --draft-model requires --serving flag");
@@ -26,6 +36,16 @@ pub fn run(
         serving,
         draft_model_path: draft_model,
         num_draft_tokens,
+        enforce_eager,
+        gpu_memory_utilization,
+        max_num_seqs,
+        max_num_batched_tokens,
+        disable_prefix_cache,
+        quantization: quantization.to_string(),
+        kv_cache_dtype: kv_cache_dtype.to_string(),
+        max_model_len,
+        chat_template,
+        swap_space,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {

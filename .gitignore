@@ -54,3 +54,4 @@ docs/build/*
 
 .mcp.json
 node_modules
+.planning/

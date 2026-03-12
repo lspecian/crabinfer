@@ -114,6 +114,7 @@ impl SpeculativeState {
             head_size: draft_config.head_size,
             num_layers: draft_config.num_layers,
             enable_prefix_cache: false, // No prefix caching for draft model
+            dtype_bytes: 4, // F32 KV cache
         };
         let draft_kv_manager = KVCacheManager::new(&kv_cache_config);
 
@@ -572,6 +573,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -603,6 +605,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -634,6 +637,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4, // At max
@@ -665,6 +669,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 1, // At min
@@ -696,6 +701,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -721,6 +727,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -753,6 +760,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -786,6 +794,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,
@@ -810,6 +819,7 @@ mod tests {
                 head_size: 16,
                 num_layers: 1,
                 enable_prefix_cache: false,
+                dtype_bytes: 2,
             }),
             draft_blocks: HashMap::new(),
             current_k: 4,

@@ -3,6 +3,7 @@ use crate::error::ServerError;
 use crate::state::AppState;
 use crate::types::anthropic::*;
 use crate::types::common::ChatMessage;
+use super::openai::resolve_architecture;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -27,7 +28,10 @@ pub async fn messages(
     if let Some(ref system) = req.system {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: system.clone(),
+            content: Some(system.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
         });
     }
     messages.extend(req.messages.iter().cloned());
@@ -45,8 +49,8 @@ pub async fn messages(
 
     let _lock = state.inference_lock.lock().await;
 
-    let architecture = &state.model_info.architecture;
-    let prompt = apply_chat_template(architecture, &messages);
+    let architecture = resolve_architecture(&state);
+    let prompt = apply_chat_template(&architecture, &messages);
     let temperature = req.temperature.unwrap_or(0.7);
 
     let engine = Arc::clone(engine);
@@ -105,8 +109,8 @@ async fn serving_messages(
 ) -> Result<axum::response::Response, ServerError> {
     use crabinfer_core::serving::sequence::SamplingParams;
 
-    let architecture = &state.model_info.architecture;
-    let prompt = apply_chat_template(architecture, messages);
+    let architecture = resolve_architecture(&state);
+    let prompt = apply_chat_template(&architecture, messages);
 
     let prompt_tokens = engine
         .encode(&prompt)
@@ -184,7 +188,10 @@ async fn messages_stream(
     if let Some(ref system) = req.system {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: system.clone(),
+            content: Some(system.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
         });
     }
     messages.extend(req.messages.iter().cloned());
@@ -200,7 +207,7 @@ async fn messages_stream(
         .as_ref()
         .ok_or_else(|| ServerError::internal("no engine available"))?;
 
-    let architecture = state.model_info.architecture.clone();
+    let architecture = resolve_architecture(&state);
     let model_id = state.model_id.clone();
 
     let prompt = apply_chat_template(&architecture, &messages);
@@ -359,7 +366,7 @@ async fn serving_messages_stream(
 > {
     use crabinfer_core::serving::sequence::SamplingParams;
 
-    let architecture = state.model_info.architecture.clone();
+    let architecture = resolve_architecture(&state);
     let model_id = state.model_id.clone();
     let prompt = apply_chat_template(&architecture, &messages);
 
@@ -518,12 +525,13 @@ fn finish_reason_to_anthropic(
         FinishReason::EndOfSequence => "end_turn",
         FinishReason::MaxTokens => "max_tokens",
         FinishReason::Stop => "end_turn",
+        FinishReason::ToolCalls => "tool_use",
         FinishReason::Cancelled => "end_turn",
         FinishReason::Preempted => "end_turn",
     }
 }
 
 fn estimate_tokens_anthropic(messages: &[ChatMessage]) -> u32 {
-    let total_chars: usize = messages.iter().map(|m| m.content.len() + m.role.len()).sum();
+    let total_chars: usize = messages.iter().map(|m| m.content_str().len() + m.role.len()).sum();
     (total_chars / 4).max(1) as u32
 }
