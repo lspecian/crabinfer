@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-03-12T22:57:01.579Z"
+stopped_at: Completed 01-model-loading-and-quantization-01-PLAN.md
+last_updated: "2026-03-12T22:59:16.108Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 4
-  completed_plans: 1
+  completed_plans: 3
   percent: 25
 ---
 
@@ -51,6 +51,8 @@ Progress: [███░░░░░░░] 25%
 
 *Updated after each plan completion*
 | Phase 01 P02 | 8 | 2 tasks | 4 files |
+| Phase 01-model-loading-and-quantization P00 | 15 | 1 tasks | 5 files |
+| Phase 01-model-loading-and-quantization P01 | 12min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -65,6 +67,11 @@ Recent decisions affecting current work:
 - [Phase 01]: Norm weights and embeddings always loaded as FP in quantized models
 - [Phase 01]: GptqLinear qweight_marlin and backend fields default to None — Plan 03 populates
 - [Phase 01]: reformat_for_marlin() stub returns Ok(false) — Plan 03 implements real Marlin reformatting
+- [Phase 01-model-loading-and-quantization]: Plan 00: Test stubs upgraded to concrete tests because implementations existed from prior session commits (b03b5ab, b8e95fe, 1f1062a)
+- [Phase 01-model-loading-and-quantization]: sha2 and anyhow made non-optional dependencies since verify_sha256 is core functionality (not cloud-only)
+- [Phase 01-model-loading-and-quantization]: sha2 made non-optional (always-on) — SHA-256 is core security, not just for providers
+- [Phase 01-model-loading-and-quantization]: tokio::runtime::Handle::current().block_on() for sync-to-async bridge in load_serving_engine
+- [Phase 01-model-loading-and-quantization]: HF repo ID used as model_id instead of directory basename for consistent reporting
 
 ### Pending Todos
 
@@ -77,6 +84,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-12T22:57:01.577Z
-Stopped at: Completed 01-02-PLAN.md
+Last session: 2026-03-12T22:59:16.106Z
+Stopped at: Completed 01-model-loading-and-quantization-01-PLAN.md
 Resume file: None
