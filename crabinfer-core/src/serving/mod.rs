@@ -11,6 +11,7 @@ pub mod block_pool;
 pub mod cuda_graphs;
 pub mod engine_loop;
 pub mod gpu_memory;
+pub mod hub_download;
 pub mod kernels;
 pub mod kv_cache;
 pub mod models;
@@ -21,3 +22,10 @@ pub mod scheduler;
 pub mod sequence;
 pub mod speculative;
 pub mod swap;
+
+#[cfg(test)]
+mod hub_download_tests;
+#[cfg(test)]
+mod safetensors_loader_tests;
+#[cfg(test)]
+mod quantization_tests;
