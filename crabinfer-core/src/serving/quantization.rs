@@ -8,6 +8,8 @@
 //! needing pre-quantized checkpoints (GPTQ/AWQ). The quantization happens at
 //! model load time with no calibration data required.
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
 
@@ -299,6 +301,12 @@ pub struct GptqLinear {
     in_features: usize,
     /// Number of output features.
     out_features: usize,
+    /// Weights reformatted into Marlin tile layout for fast CUDA GEMM.
+    /// `None` until `reformat_for_marlin()` is called (Plan 03).
+    pub(crate) qweight_marlin: Option<Tensor>,
+    /// Kernel backend for dispatching fused ops (set after model load in Plan 03).
+    /// `None` when running on CPU or Metal.
+    pub(crate) backend: Option<Arc<dyn super::kernels::backend::KernelBackend>>,
 }
 
 impl GptqLinear {
@@ -330,6 +338,8 @@ impl GptqLinear {
             group_size,
             in_features,
             out_features,
+            qweight_marlin: None,
+            backend: None,
         })
     }
 
@@ -434,7 +444,26 @@ impl GptqLinear {
             group_size,
             in_features,
             out_features,
+            qweight_marlin: None,
+            backend: None,
         })
+    }
+
+    /// Reformat weights into Marlin tile layout (call once at load time on CUDA).
+    ///
+    /// Returns `Ok(true)` if reformatted, `Ok(false)` if skipped (non-CUDA or unaligned
+    /// dimensions).
+    ///
+    /// Alignment requirement: both `out_features` (N) and `in_features` (K) must be
+    /// multiples of 16 for the Marlin tile layout.
+    ///
+    /// NOTE: Full implementation in Plan 03. This stub always returns `Ok(false)`.
+    pub fn reformat_for_marlin(
+        &mut self,
+        _backend: &dyn super::kernels::backend::KernelBackend,
+    ) -> Result<bool> {
+        // Stub — implemented in Plan 03
+        Ok(false)
     }
 
     /// Dequantize weights to the given dtype.
@@ -508,7 +537,18 @@ impl GptqLinear {
 
 impl Module for GptqLinear {
     /// Forward pass: dequantize INT4 weights and perform matmul.
+    ///
+    /// Dispatch order:
+    /// 1. Marlin fast path (Plan 03: populated qweight_marlin + backend) — currently stub
+    /// 2. Naive dequant + matmul path (always active)
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Marlin fast path (Plan 03 will populate qweight_marlin and backend)
+        if let Some(ref _qw_marlin) = self.qweight_marlin {
+            // TODO: dispatch to self.backend.marlin_gemm() in Plan 03
+            // For now, fall through to naive path
+        }
+
+        // Naive dequant + matmul path
         let input_dtype = xs.dtype();
         let w = self.dequantize(input_dtype)?;
 
