@@ -28,7 +28,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. An interrupted download resumes from where it left off and the server rejects a corrupted file (failed SHA256) with a clear error
   3. AWQ models load using the same CLI flag and produce correct outputs (QLOAD-02 reuses GPTQ INT4 infrastructure)
   4. Marlin fused dequant+GEMM kernel is used for GPTQ/AWQ inference and delivers measurable throughput improvement over the naive dequant-then-matmul path (target 1.5-2x)
-**Plans:** 4 plans
+**Plans:** 1/4 plans executed
 
 Plans:
 - [ ] 01-00-PLAN.md — Wave 0: failing test stubs for all 9 Phase 1 behaviors (Nyquist compliance)
@@ -75,7 +75,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Model Loading and Quantization | 0/4 | Planning complete | - |
+| 1. Model Loading and Quantization | 1/4 | In Progress|  |
 | 2. Performance Optimization | 0/TBD | Not started | - |
 | 3. Guided Decoding | 0/TBD | Not started | - |
 | 4. Production Infrastructure | 0/TBD | Not started | - |
