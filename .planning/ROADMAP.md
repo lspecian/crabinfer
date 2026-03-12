@@ -28,12 +28,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. An interrupted download resumes from where it left off and the server rejects a corrupted file (failed SHA256) with a clear error
   3. AWQ models load using the same CLI flag and produce correct outputs (QLOAD-02 reuses GPTQ INT4 infrastructure)
   4. Marlin fused dequant+GEMM kernel is used for GPTQ/AWQ inference and delivers measurable throughput improvement over the naive dequant-then-matmul path (target 1.5-2x)
-**Plans:** 3 plans
+**Plans:** 4 plans
 
 Plans:
+- [ ] 01-00-PLAN.md — Wave 0: failing test stubs for all 9 Phase 1 behaviors (Nyquist compliance)
 - [ ] 01-01-PLAN.md — HuggingFace Hub download client with caching and SHA256 verification
 - [ ] 01-02-PLAN.md — GPTQ/AWQ weight loading from HuggingFace safetensors format
-- [ ] 01-03-PLAN.md — Marlin fused dequant+GEMM CUDA kernel
+- [ ] 01-03-PLAN.md — Marlin fused dequant+GEMM CUDA kernel with model-load activation
 
 ### Phase 2: Performance Optimization
 **Goal**: The inference hot path runs with zero per-request GPU allocations, fused LayerNorm+linear, and parallel tokenization — maximizing tokens-per-second on RTX 3060
@@ -74,7 +75,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Model Loading and Quantization | 0/3 | Planning complete | - |
+| 1. Model Loading and Quantization | 0/4 | Planning complete | - |
 | 2. Performance Optimization | 0/TBD | Not started | - |
 | 3. Guided Decoding | 0/TBD | Not started | - |
 | 4. Production Infrastructure | 0/TBD | Not started | - |
