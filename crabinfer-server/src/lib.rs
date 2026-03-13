@@ -223,12 +223,12 @@ fn load_serving_engine(
         if crabinfer_core::serving::hub_download::is_hf_repo_id(&config.model_path) {
             tracing::info!("Detected HuggingFace repo ID: {}", config.model_path);
             let repo_id = config.model_path.clone();
-            let rt = tokio::runtime::Handle::current();
-            let local_dir = rt
-                .block_on(async {
+            let local_dir = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
                     crabinfer_core::serving::hub_download::ensure_model_cached(&repo_id).await
                 })
-                .map_err(|e| format!("Failed to download model from HuggingFace Hub: {e}"))?;
+            })
+            .map_err(|e| format!("Failed to download model from HuggingFace Hub: {e}"))?;
             tracing::info!("Model cached at: {}", local_dir.display());
             (local_dir, Some(config.model_path.clone()))
         } else {
