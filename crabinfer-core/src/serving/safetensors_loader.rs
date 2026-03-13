@@ -753,22 +753,27 @@ fn load_gptq_linear(
 ) -> Result<MaybeQuantizedLinear> {
     use super::quantization::GptqLinear;
 
-    let qweight = load_raw_tensor(weights, &format!("{prefix}.qweight"), device)?;
+    // Load qweight on CPU first — transpose may need .contiguous() which
+    // requires a strided copy kernel that candle doesn't have for I32 on CUDA.
+    let qweight_cpu = weights
+        .get(&format!("{prefix}.qweight"))
+        .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {prefix}.qweight")))?
+        .to_device(&Device::Cpu)?;
+
+    // Detect transposed layout on CPU where .contiguous() always works.
+    let qweight_cpu = if qweight_cpu.dim(1)? > qweight_cpu.dim(0)? * 8 {
+        qweight_cpu.t()?.contiguous()?
+    } else {
+        qweight_cpu
+    };
+
+    let qweight = qweight_cpu.to_device(device)?;
     let qzeros = load_raw_tensor(weights, &format!("{prefix}.qzeros"), device)?;
     let scales = load_raw_tensor(weights, &format!("{prefix}.scales"), device)?;
     let bias = if weights.contains_key(&format!("{prefix}.bias")) {
         Some(load_raw_tensor(weights, &format!("{prefix}.bias"), device)?)
     } else {
         None
-    };
-
-    // Detect transposed layout: some HF publishers store qweight as
-    // [out_features, in_features/8] (column-major) instead of [in_features/8, out_features].
-    // If dim(1) > dim(0) * 8, the tensor is transposed.
-    let qweight = if qweight.dim(1)? > qweight.dim(0)? * 8 {
-        qweight.t()?.contiguous()?
-    } else {
-        qweight
     };
 
     let layer = GptqLinear::from_parts(qweight, scales, qzeros, bias, group_size)?;
@@ -787,20 +792,27 @@ fn load_awq_linear(
 ) -> Result<MaybeQuantizedLinear> {
     use super::quantization::AwqLinear;
 
-    let qweight = load_raw_tensor(weights, &format!("{prefix}.qweight"), device)?;
+    // Load qweight on CPU first — transpose may need .contiguous() which
+    // requires a strided copy kernel that candle doesn't have for I32 on CUDA.
+    let qweight_cpu = weights
+        .get(&format!("{prefix}.qweight"))
+        .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {prefix}.qweight")))?
+        .to_device(&Device::Cpu)?;
+
+    // Detect transposed layout on CPU where .contiguous() always works.
+    let qweight_cpu = if qweight_cpu.dim(1)? > qweight_cpu.dim(0)? * 8 {
+        qweight_cpu.t()?.contiguous()?
+    } else {
+        qweight_cpu
+    };
+
+    let qweight = qweight_cpu.to_device(device)?;
     let qzeros = load_raw_tensor(weights, &format!("{prefix}.qzeros"), device)?;
     let scales = load_raw_tensor(weights, &format!("{prefix}.scales"), device)?;
     let bias = if weights.contains_key(&format!("{prefix}.bias")) {
         Some(load_raw_tensor(weights, &format!("{prefix}.bias"), device)?)
     } else {
         None
-    };
-
-    // Detect transposed layout (same as GPTQ)
-    let qweight = if qweight.dim(1)? > qweight.dim(0)? * 8 {
-        qweight.t()?.contiguous()?
-    } else {
-        qweight
     };
 
     let layer = AwqLinear::from_parts(qweight, scales, qzeros, bias, group_size)?;
