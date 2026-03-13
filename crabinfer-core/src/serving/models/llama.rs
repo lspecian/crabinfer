@@ -443,6 +443,26 @@ mod tests {
         assert_eq!(hidden.dims(), &[4, hidden_size]);
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_index_select() {
+        let dev = Device::new_cuda(0).expect("no CUDA device");
+        let vocab_size = 100;
+        let hidden_size = 16;
+        let embed_table =
+            Tensor::randn(0f32, 1.0, (vocab_size, hidden_size), &dev).unwrap();
+
+        // Test I64 indices
+        let ids_i64 = Tensor::new(&[0i64, 5, 99, 42], &dev).unwrap();
+        let result = embed_table.index_select(&ids_i64, 0).unwrap();
+        assert_eq!(result.dims(), &[4, hidden_size]);
+
+        // Test U32 indices
+        let ids_u32 = Tensor::new(&[0u32, 5, 99, 42], &dev).unwrap();
+        let result = embed_table.index_select(&ids_u32, 0).unwrap();
+        assert_eq!(result.dims(), &[4, hidden_size]);
+    }
+
     #[test]
     fn test_llama_layer_forward_shape() {
         // Test the forward pass shape through a minimal "layer" using CPU tensors.
