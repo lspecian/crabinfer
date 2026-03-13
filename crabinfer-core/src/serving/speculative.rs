@@ -30,6 +30,19 @@ pub struct SpeculativeConfig {
     pub min_draft_tokens: usize,
     /// Maximum K for adaptive tuning.
     pub max_draft_tokens: usize,
+    /// Whether to share KV cache between draft and target models.
+    ///
+    /// When the draft model has the same `num_kv_heads` and `head_size`
+    /// as the target model, the draft model can write to the target's
+    /// KV cache blocks directly. This eliminates the entire draft model's
+    /// KV cache allocation (often 100s of MB).
+    ///
+    /// After verification:
+    /// - Accepted tokens' KV entries are already correct (written by draft)
+    /// - Only the correction token needs recomputation by target
+    ///
+    /// Falls back to separate caches when dimensions don't match.
+    pub shared_kv_cache: bool,
 }
 
 impl Default for SpeculativeConfig {
@@ -39,6 +52,7 @@ impl Default for SpeculativeConfig {
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         }
     }
 }
@@ -52,10 +66,13 @@ pub struct SpeculativeState {
     /// The draft model (smaller, faster).
     pub draft_model: Box<dyn ModelRunner>,
     /// Draft model KV caches (separate from target).
+    /// Empty when `shared_kv_cache` is true and dimensions match.
     pub draft_kv_caches: Vec<(Tensor, Tensor)>,
     /// Draft model KV cache block manager.
+    /// When sharing KV cache, this is unused (target's manager is used instead).
     pub draft_kv_manager: KVCacheManager,
     /// Per-sequence draft block tracking.
+    /// When sharing KV cache, this is unused (target's blocks are used).
     pub draft_blocks: HashMap<SeqId, SequenceBlocks>,
     /// Current K (may be adapted over time).
     pub current_k: usize,
@@ -63,60 +80,125 @@ pub struct SpeculativeState {
     pub total_accepted: u64,
     /// Total tokens drafted across all speculative steps (for adaptive K).
     pub total_drafted: u64,
+    /// Whether KV cache is shared with the target model.
+    ///
+    /// True when `config.shared_kv_cache` was requested AND the draft model's
+    /// `num_kv_heads` and `head_size` match the target model's dimensions.
+    /// When true, `draft_kv_caches` is empty and `draft_kv_manager`/`draft_blocks`
+    /// are unused.
+    pub using_shared_kv: bool,
 }
 
 impl SpeculativeState {
     /// Create a new speculative state.
     ///
     /// Allocates draft model KV caches on the given device.
+    /// If `shared_kv_cache` is enabled and the draft model's KV dimensions
+    /// match the target model's, no separate draft KV caches are allocated.
     pub fn new(
         draft_model: Box<dyn ModelRunner>,
         device: &Device,
         num_draft_kv_blocks: usize,
         config: SpeculativeConfig,
     ) -> CandleResult<Self> {
-        let draft_config = draft_model.config();
-        let kv_dtype = DType::F32;
+        Self::new_with_target_config(draft_model, device, num_draft_kv_blocks, config, None)
+    }
 
-        // Allocate draft KV caches
-        let x = 16 / kv_dtype.size_in_bytes();
-        let block_size = super::kernels::BLOCK_SIZE;
-        let mut draft_kv_caches = Vec::with_capacity(draft_config.num_layers);
-        for _ in 0..draft_config.num_layers {
-            let key_cache = Tensor::zeros(
-                (
-                    num_draft_kv_blocks,
-                    draft_config.num_kv_heads,
-                    draft_config.head_size / x,
-                    block_size,
-                    x,
-                ),
-                kv_dtype,
-                device,
-            )?;
-            let value_cache = Tensor::zeros(
-                (
-                    num_draft_kv_blocks,
-                    draft_config.num_kv_heads,
-                    draft_config.head_size,
-                    block_size,
-                ),
-                kv_dtype,
-                device,
-            )?;
-            draft_kv_caches.push((key_cache, value_cache));
+    /// Create a new speculative state with optional target model config for shared KV.
+    ///
+    /// When `target_config` is provided and `config.shared_kv_cache` is true,
+    /// checks if dimensions match. If they do, skips draft KV cache allocation.
+    pub fn new_with_target_config(
+        draft_model: Box<dyn ModelRunner>,
+        device: &Device,
+        num_draft_kv_blocks: usize,
+        config: SpeculativeConfig,
+        target_config: Option<&super::models::ModelConfig>,
+    ) -> CandleResult<Self> {
+        let draft_config = draft_model.config();
+
+        // Check if shared KV cache is possible
+        let can_share = config.shared_kv_cache
+            && target_config.map_or(false, |tc| {
+                can_share_kv_cache(draft_config, tc)
+            });
+
+        if can_share {
+            tracing::info!(
+                "Shared KV cache enabled: draft and target have matching KV dimensions \
+                 (num_kv_heads={}, head_size={})",
+                draft_config.num_kv_heads,
+                draft_config.head_size,
+            );
+        } else if config.shared_kv_cache && target_config.is_some() {
+            let tc = target_config.unwrap();
+            tracing::warn!(
+                "Shared KV cache requested but dimensions mismatch: \
+                 draft (kv_heads={}, head_size={}) vs target (kv_heads={}, head_size={}). \
+                 Falling back to separate caches.",
+                draft_config.num_kv_heads,
+                draft_config.head_size,
+                tc.num_kv_heads,
+                tc.head_size,
+            );
         }
 
-        let kv_cache_config = KVCacheConfig {
-            block_size,
-            num_blocks: num_draft_kv_blocks,
-            num_kv_heads: draft_config.num_kv_heads,
-            head_size: draft_config.head_size,
-            num_layers: draft_config.num_layers,
-            enable_prefix_cache: false, // No prefix caching for draft model
-            dtype_bytes: 4, // F32 KV cache
+        let kv_dtype = DType::F32;
+        let block_size = super::kernels::BLOCK_SIZE;
+
+        let (draft_kv_caches, draft_kv_manager) = if can_share {
+            // Shared mode: no separate draft KV caches needed.
+            // Create a minimal manager (won't be used for allocation).
+            let minimal_config = KVCacheConfig {
+                block_size,
+                num_blocks: 0,
+                num_kv_heads: draft_config.num_kv_heads,
+                head_size: draft_config.head_size,
+                num_layers: draft_config.num_layers,
+                enable_prefix_cache: false,
+                dtype_bytes: 4,
+            };
+            (Vec::new(), KVCacheManager::new(&minimal_config))
+        } else {
+            // Separate mode: allocate draft KV caches
+            let x = 16 / kv_dtype.size_in_bytes();
+            let mut caches = Vec::with_capacity(draft_config.num_layers);
+            for _ in 0..draft_config.num_layers {
+                let key_cache = Tensor::zeros(
+                    (
+                        num_draft_kv_blocks,
+                        draft_config.num_kv_heads,
+                        draft_config.head_size / x,
+                        block_size,
+                        x,
+                    ),
+                    kv_dtype,
+                    device,
+                )?;
+                let value_cache = Tensor::zeros(
+                    (
+                        num_draft_kv_blocks,
+                        draft_config.num_kv_heads,
+                        draft_config.head_size,
+                        block_size,
+                    ),
+                    kv_dtype,
+                    device,
+                )?;
+                caches.push((key_cache, value_cache));
+            }
+
+            let kv_cache_config = KVCacheConfig {
+                block_size,
+                num_blocks: num_draft_kv_blocks,
+                num_kv_heads: draft_config.num_kv_heads,
+                head_size: draft_config.head_size,
+                num_layers: draft_config.num_layers,
+                enable_prefix_cache: false,
+                dtype_bytes: 4,
+            };
+            (caches, KVCacheManager::new(&kv_cache_config))
         };
-        let draft_kv_manager = KVCacheManager::new(&kv_cache_config);
 
         let current_k = config.num_draft_tokens;
 
@@ -129,19 +211,28 @@ impl SpeculativeState {
             current_k,
             total_accepted: 0,
             total_drafted: 0,
+            using_shared_kv: can_share,
         })
     }
 
     /// Start tracking a new sequence in the draft model.
+    ///
+    /// When using shared KV cache, no separate draft blocks are allocated.
     pub fn add_sequence(&mut self, seq_id: SeqId) {
-        self.draft_blocks.insert(seq_id, SequenceBlocks::new());
+        if !self.using_shared_kv {
+            self.draft_blocks.insert(seq_id, SequenceBlocks::new());
+        }
+        // In shared mode, the draft uses the target's blocks directly
     }
 
     /// Stop tracking a sequence and free its draft blocks.
     pub fn remove_sequence(&mut self, seq_id: SeqId) {
-        if let Some(mut blocks) = self.draft_blocks.remove(&seq_id) {
-            self.draft_kv_manager.free(&mut blocks);
+        if !self.using_shared_kv {
+            if let Some(mut blocks) = self.draft_blocks.remove(&seq_id) {
+                self.draft_kv_manager.free(&mut blocks);
+            }
         }
+        // In shared mode, the target's cleanup handles block freeing
     }
 
     /// Sync draft model state after speculative verification.
@@ -149,10 +240,48 @@ impl SpeculativeState {
     /// Sets the draft model's `num_computed_tokens` to match the target model.
     /// Stale KV entries beyond this point will be overwritten in the next
     /// draft phase via `reshape_and_cache`.
+    ///
+    /// In shared KV mode, this is a no-op since draft and target share state.
     pub fn sync_after_verify(&mut self, seq_id: SeqId, target_num_computed: usize) {
+        if self.using_shared_kv {
+            // Shared mode: draft and target share KV cache, so the target's
+            // num_computed_tokens is already correct. The draft just needs to
+            // know where to resume, but this is handled by the target's blocks.
+            return;
+        }
         if let Some(blocks) = self.draft_blocks.get_mut(&seq_id) {
             blocks.num_computed_tokens = target_num_computed;
         }
+    }
+
+    /// Get the KV caches for the draft model's forward pass.
+    ///
+    /// In shared mode, returns None (the caller should use the target's caches).
+    /// In separate mode, returns the draft's own KV caches.
+    pub fn draft_kv_caches_for_forward(&self) -> Option<&[(Tensor, Tensor)]> {
+        if self.using_shared_kv {
+            None
+        } else {
+            Some(&self.draft_kv_caches)
+        }
+    }
+
+    /// Returns the memory saved by using shared KV cache, in bytes.
+    ///
+    /// When not in shared mode, returns 0.
+    pub fn shared_kv_memory_savings(&self) -> usize {
+        if !self.using_shared_kv {
+            return 0;
+        }
+        // Calculate what the draft KV caches would have cost
+        let draft_config = self.draft_model.config();
+        let block_size = super::kernels::BLOCK_SIZE;
+        let dtype_bytes = 4; // F32
+        let kv_per_block_per_layer =
+            2 * draft_config.num_kv_heads * draft_config.head_size * block_size * dtype_bytes;
+        // Use the config's num_draft_tokens as a rough proxy for blocks
+        // (actual savings depend on how many blocks would have been allocated)
+        draft_config.num_layers * kv_per_block_per_layer
     }
 
     /// Update the adaptive K based on running acceptance rate.
@@ -192,6 +321,22 @@ impl SpeculativeState {
             self.total_accepted as f64 / self.total_drafted as f64
         }
     }
+}
+
+// ─── Shared KV cache compatibility check ─────────────────────────────────
+
+/// Check whether draft and target models can share a KV cache.
+///
+/// Returns true if both models have the same `num_kv_heads` and `head_size`,
+/// meaning their KV tensors have identical shapes per layer. The number of
+/// layers can differ (the draft model simply uses fewer layers of the same
+/// shaped cache).
+pub fn can_share_kv_cache(
+    draft_config: &super::models::ModelConfig,
+    target_config: &super::models::ModelConfig,
+) -> bool {
+    draft_config.num_kv_heads == target_config.num_kv_heads
+        && draft_config.head_size == target_config.head_size
 }
 
 // ─── Accept/reject algorithm ─────────────────────────────────────────────
@@ -559,6 +704,7 @@ mod tests {
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         // Use a minimal mock — we only need config, not actual model/caches
@@ -579,6 +725,7 @@ mod tests {
             current_k: 4,
             total_accepted: 90,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         state.update_adaptive_k();
@@ -592,6 +739,7 @@ mod tests {
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let mut state = SpeculativeState {
@@ -611,6 +759,7 @@ mod tests {
             current_k: 4,
             total_accepted: 30,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         state.update_adaptive_k();
@@ -624,6 +773,7 @@ mod tests {
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 4, // Already at max
+            shared_kv_cache: false,
         };
 
         let mut state = SpeculativeState {
@@ -643,6 +793,7 @@ mod tests {
             current_k: 4, // At max
             total_accepted: 95,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         state.update_adaptive_k();
@@ -656,6 +807,7 @@ mod tests {
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let mut state = SpeculativeState {
@@ -675,6 +827,7 @@ mod tests {
             current_k: 1, // At min
             total_accepted: 10,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         state.update_adaptive_k();
@@ -688,6 +841,7 @@ mod tests {
             adaptive: false,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let mut state = SpeculativeState {
@@ -707,6 +861,7 @@ mod tests {
             current_k: 4,
             total_accepted: 95,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         state.update_adaptive_k();
@@ -733,6 +888,7 @@ mod tests {
             current_k: 4,
             total_accepted: 0,
             total_drafted: 0,
+            using_shared_kv: false,
         };
 
         state.add_sequence(1);
@@ -766,6 +922,7 @@ mod tests {
             current_k: 4,
             total_accepted: 0,
             total_drafted: 0,
+            using_shared_kv: false,
         };
 
         state.add_sequence(1);
@@ -800,6 +957,7 @@ mod tests {
             current_k: 4,
             total_accepted: 75,
             total_drafted: 100,
+            using_shared_kv: false,
         };
 
         assert!((state.acceptance_rate() - 0.75).abs() < 1e-10);
@@ -825,6 +983,7 @@ mod tests {
             current_k: 4,
             total_accepted: 0,
             total_drafted: 0,
+            using_shared_kv: false,
         };
 
         assert_eq!(state.acceptance_rate(), 0.0);
@@ -837,6 +996,7 @@ mod tests {
         assert!(config.adaptive);
         assert_eq!(config.min_draft_tokens, 1);
         assert_eq!(config.max_draft_tokens, 8);
+        assert!(!config.shared_kv_cache);
     }
 
     /// Minimal mock model for testing SpeculativeState methods that don't
@@ -874,6 +1034,11 @@ mod tests {
             let total = input_ids.dims()[0];
             Tensor::zeros((total, self.config.vocab_size), DType::F32, input_ids.device())
         }
+        fn clone_model(&self) -> Box<dyn ModelRunner> {
+            Box::new(MockModelForTest {
+                config: self.config.clone(),
+            })
+        }
         fn num_layers(&self) -> usize {
             self.config.num_layers
         }
@@ -889,5 +1054,227 @@ mod tests {
         fn config(&self) -> &super::super::models::ModelConfig {
             &self.config
         }
+    }
+
+    fn mock_model_config(num_kv_heads: usize, head_size: usize) -> super::super::models::ModelConfig {
+        super::super::models::ModelConfig {
+            hidden_size: 64,
+            intermediate_size: 256,
+            num_heads: 4,
+            num_kv_heads,
+            num_layers: 2,
+            head_size,
+            vocab_size: 100,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_dim: head_size,
+            max_seq_len: 512,
+        }
+    }
+
+    #[test]
+    fn test_can_share_kv_cache_matching() {
+        let draft = mock_model_config(8, 128);
+        let target = mock_model_config(8, 128);
+        assert!(can_share_kv_cache(&draft, &target));
+    }
+
+    #[test]
+    fn test_can_share_kv_cache_different_kv_heads() {
+        let draft = mock_model_config(4, 128);
+        let target = mock_model_config(8, 128);
+        assert!(!can_share_kv_cache(&draft, &target));
+    }
+
+    #[test]
+    fn test_can_share_kv_cache_different_head_size() {
+        let draft = mock_model_config(8, 64);
+        let target = mock_model_config(8, 128);
+        assert!(!can_share_kv_cache(&draft, &target));
+    }
+
+    #[test]
+    fn test_can_share_kv_cache_both_different() {
+        let draft = mock_model_config(4, 64);
+        let target = mock_model_config(8, 128);
+        assert!(!can_share_kv_cache(&draft, &target));
+    }
+
+    #[test]
+    fn test_shared_kv_add_remove_sequence() {
+        let config = SpeculativeConfig {
+            shared_kv_cache: true,
+            ..SpeculativeConfig::default()
+        };
+        let mut state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 0,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: true,
+        };
+
+        // In shared mode, add_sequence should NOT create draft blocks
+        state.add_sequence(1);
+        assert!(!state.draft_blocks.contains_key(&1));
+
+        // remove_sequence should be a no-op in shared mode
+        state.remove_sequence(1);
+        assert!(state.draft_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_shared_kv_sync_after_verify_noop() {
+        let config = SpeculativeConfig {
+            shared_kv_cache: true,
+            ..SpeculativeConfig::default()
+        };
+        let mut state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 0,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: true,
+        };
+
+        // Should not panic; it's a no-op in shared mode
+        state.sync_after_verify(1, 100);
+    }
+
+    #[test]
+    fn test_draft_kv_caches_for_forward_shared() {
+        let config = SpeculativeConfig {
+            shared_kv_cache: true,
+            ..SpeculativeConfig::default()
+        };
+        let state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 0,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: true,
+        };
+
+        // Shared mode: returns None (use target's caches)
+        assert!(state.draft_kv_caches_for_forward().is_none());
+    }
+
+    #[test]
+    fn test_draft_kv_caches_for_forward_separate() {
+        let config = SpeculativeConfig::default();
+        let state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 4,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: false,
+        };
+
+        // Separate mode: returns Some (draft's own caches)
+        assert!(state.draft_kv_caches_for_forward().is_some());
+    }
+
+    #[test]
+    fn test_shared_kv_memory_savings_when_shared() {
+        let config = SpeculativeConfig {
+            shared_kv_cache: true,
+            ..SpeculativeConfig::default()
+        };
+        let state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 0,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: true,
+        };
+
+        let savings = state.shared_kv_memory_savings();
+        assert!(savings > 0, "shared mode should report memory savings");
+    }
+
+    #[test]
+    fn test_shared_kv_memory_savings_when_separate() {
+        let config = SpeculativeConfig::default();
+        let state = SpeculativeState {
+            config,
+            draft_model: Box::new(MockModelForTest::default()),
+            draft_kv_caches: Vec::new(),
+            draft_kv_manager: KVCacheManager::new(&KVCacheConfig {
+                block_size: 16,
+                num_blocks: 4,
+                num_kv_heads: 1,
+                head_size: 16,
+                num_layers: 1,
+                enable_prefix_cache: false,
+                dtype_bytes: 2,
+            }),
+            draft_blocks: HashMap::new(),
+            current_k: 4,
+            total_accepted: 0,
+            total_drafted: 0,
+            using_shared_kv: false,
+        };
+
+        assert_eq!(state.shared_kv_memory_savings(), 0);
     }
 }

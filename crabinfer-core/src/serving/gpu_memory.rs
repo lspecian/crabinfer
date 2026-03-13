@@ -29,6 +29,10 @@ pub struct GpuMemoryProfile {
 /// Each block stores `BLOCK_SIZE` tokens of KV data across all layers:
 /// - K cache: `[num_kv_heads, head_size/x, BLOCK_SIZE, x]` per layer
 /// - V cache: `[num_kv_heads, head_size, BLOCK_SIZE]` per layer
+///
+/// For FP8 E4M3 (dtype_bytes=1), this returns the data-only size.
+/// Scale factor overhead (~3% for head_size=128) is not included here
+/// but is accounted for in the engine's total memory calculation.
 pub fn kv_cache_block_bytes(
     model_config: &ModelConfig,
     dtype_bytes: usize,
@@ -294,6 +298,18 @@ mod tests {
         let bytes = kv_cache_block_bytes(&config, 2); // F16
         let expected = 2 * 8 * 128 * 16 * 2 * 32;
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn test_kv_cache_block_bytes_fp8() {
+        let config = test_model_config();
+        let bytes_fp8 = kv_cache_block_bytes(&config, 1); // FP8 = 1 byte
+        let bytes_f16 = kv_cache_block_bytes(&config, 2); // F16 = 2 bytes
+        // FP8 data should be exactly half of F16
+        assert_eq!(bytes_fp8 * 2, bytes_f16);
+        // Verify absolute value
+        let expected = 2 * 8 * 128 * 16 * 1 * 32;
+        assert_eq!(bytes_fp8, expected);
     }
 
     #[test]

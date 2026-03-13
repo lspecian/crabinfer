@@ -23,14 +23,14 @@ mod tests {
         vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: Some("You are helpful.".to_string()),
+                content: Some("You are helpful.".into()),
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: Some("Hello".to_string()),
+                content: Some("Hello".into()),
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,

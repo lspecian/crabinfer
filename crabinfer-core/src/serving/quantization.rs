@@ -31,6 +31,10 @@ pub enum QuantizationMethod {
     /// Same INT4 packed format as GPTQ but uses activation-aware calibration
     /// for better accuracy. Dequantization: `w_float = (w_int4 - zeros) * scales`
     Awq,
+    /// FP8 E4M3 weight-only (W8A16): 8-bit floating point weights, FP16/FP32 activations.
+    /// Per-tensor scaling: `w_float = fp8_to_f32(w_fp8) * scale`.
+    /// ~2x memory savings vs FP16 with ~98% throughput retention on Hopper+ GPUs.
+    Fp8,
 }
 
 impl Default for QuantizationMethod {
@@ -46,6 +50,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::Int8WeightOnly => write!(f, "int8"),
             Self::Gptq => write!(f, "gptq"),
             Self::Awq => write!(f, "awq"),
+            Self::Fp8 => write!(f, "fp8"),
         }
     }
 }
@@ -59,6 +64,7 @@ impl std::str::FromStr for QuantizationMethod {
             "int8" | "int8-wo" | "w8a16" => Ok(Self::Int8WeightOnly),
             "gptq" | "w4a16" => Ok(Self::Gptq),
             "awq" => Ok(Self::Awq),
+            "fp8" | "fp8-e4m3" | "w8a16-fp8" => Ok(Self::Fp8),
             other => Err(format!("unknown quantization method: {other}")),
         }
     }
@@ -79,6 +85,10 @@ pub enum KVCacheDType {
     /// BF16 — 2x memory savings with better dynamic range than F16.
     /// Preferred for large models that produce extreme KV values.
     BF16,
+    /// FP8 E4M3 — 4x memory savings vs F32 (1 byte per element).
+    /// Stores KV cache in 8-bit floating point with per-head scaling factors.
+    /// Enables 2x longer context vs FP16 at the cost of slight accuracy loss.
+    Fp8E4M3,
 }
 
 impl Default for KVCacheDType {
@@ -89,12 +99,35 @@ impl Default for KVCacheDType {
 
 impl KVCacheDType {
     /// Resolve to a concrete `DType`. `Auto` maps to the provided default.
+    ///
+    /// For `Fp8E4M3`, returns `U8` since candle has no native FP8 dtype.
+    /// The actual FP8 encoding/decoding is handled by the KV cache quantization layer.
     pub fn resolve(&self, default: DType) -> DType {
         match self {
             Self::Auto => default,
             Self::F16 => DType::F16,
             Self::BF16 => DType::BF16,
+            Self::Fp8E4M3 => DType::U8,
         }
+    }
+
+    /// Returns the number of bytes per KV cache element for this dtype.
+    ///
+    /// This accounts for the storage overhead:
+    /// - F16/BF16: 2 bytes per element
+    /// - Fp8E4M3: 1 byte per element (scale factors stored separately)
+    /// - Auto: defers to the provided default size
+    pub fn storage_bytes_per_element(&self, default_dtype_bytes: usize) -> usize {
+        match self {
+            Self::Auto => default_dtype_bytes,
+            Self::F16 | Self::BF16 => 2,
+            Self::Fp8E4M3 => 1,
+        }
+    }
+
+    /// Whether this dtype requires separate scale tensors for quantization.
+    pub fn needs_scales(&self) -> bool {
+        matches!(self, Self::Fp8E4M3)
     }
 }
 
@@ -104,6 +137,7 @@ impl std::fmt::Display for KVCacheDType {
             Self::Auto => write!(f, "auto"),
             Self::F16 => write!(f, "fp16"),
             Self::BF16 => write!(f, "bf16"),
+            Self::Fp8E4M3 => write!(f, "fp8"),
         }
     }
 }
@@ -116,7 +150,8 @@ impl std::str::FromStr for KVCacheDType {
             "auto" | "" => Ok(Self::Auto),
             "fp16" | "f16" | "half" => Ok(Self::F16),
             "bf16" | "bfloat16" => Ok(Self::BF16),
-            other => Err(format!("unknown KV cache dtype: {other} (valid: auto, fp16, bf16)")),
+            "fp8" | "fp8e4m3" | "fp8_e4m3" => Ok(Self::Fp8E4M3),
+            other => Err(format!("unknown KV cache dtype: {other} (valid: auto, fp16, bf16, fp8)")),
         }
     }
 }
@@ -137,6 +172,7 @@ impl std::str::FromStr for KVCacheDType {
 /// Compared to FP16:
 /// - 2x memory reduction for weights
 /// - Slight overhead from dequantization (typically <5% for large matrices)
+#[derive(Clone)]
 pub struct QuantizedLinear {
     /// Quantized weight matrix `[out_features, in_features]` stored as U8
     /// (representing signed i8 values via offset: stored = i8_val + 128).
@@ -285,6 +321,7 @@ impl Module for QuantizedLinear {
 /// - 4x memory reduction for weights (4-bit vs 16-bit)
 /// - Slight overhead from dequantization
 /// - Group size 128 is typical (tradeoff: smaller groups = better accuracy, more scales)
+#[derive(Clone)]
 pub struct GptqLinear {
     /// Packed 4-bit weights `[in_features / 8, out_features]` as U32.
     /// Each u32 stores 8 INT4 values in the low bits: bits[3:0] = w0, bits[7:4] = w1, etc.
@@ -454,16 +491,49 @@ impl GptqLinear {
     /// Returns `Ok(true)` if reformatted, `Ok(false)` if skipped (non-CUDA or unaligned
     /// dimensions).
     ///
-    /// Alignment requirement: both `out_features` (N) and `in_features` (K) must be
-    /// multiples of 16 for the Marlin tile layout.
+    /// Alignment requirement: `out_features` (N) must be a multiple of 64 and
+    /// `in_features` (K) must be a multiple of 16 for the Marlin tile layout.
     ///
-    /// NOTE: Full implementation in Plan 03. This stub always returns `Ok(false)`.
+    /// The Marlin tile layout packs weights into `[K/16, N/64, 128]` u32 tiles,
+    /// where each 128-element u32 block encodes a 16x64 sub-tile of INT4 weights.
+    /// Within each tile, values are packed as:
+    ///   linear_idx = row * 64 + col  (0..1023)
+    ///   u32_idx = linear_idx / 8
+    ///   bit_pos = linear_idx % 8
     pub fn reformat_for_marlin(
         &mut self,
-        _backend: &dyn super::kernels::backend::KernelBackend,
+        backend: &dyn super::kernels::backend::KernelBackend,
     ) -> Result<bool> {
-        // Stub — implemented in Plan 03
-        Ok(false)
+        // Only reformat on CUDA backend
+        if backend.name() != "cuda" {
+            return Ok(false);
+        }
+
+        let (pack_rows, out_features) = self.qweight.dims2()?;
+        let in_features = pack_rows * 8;
+
+        // Alignment check: Marlin requires N % 64 == 0 and K % 16 == 0
+        if out_features % 64 != 0 || in_features % 16 != 0 {
+            tracing::warn!(
+                "Skipping Marlin reformat for layer with N={out_features}, K={in_features} (alignment)"
+            );
+            return Ok(false);
+        }
+
+        // Reformat on CPU then transfer to device
+        let qw_cpu = self.qweight.to_device(&Device::Cpu)?;
+        let qw_data: Vec<u32> = qw_cpu.flatten_all()?.to_vec1()?;
+
+        let marlin_data = reformat_gptq_to_marlin(&qw_data, in_features, out_features);
+        let marlin_tensor = Tensor::from_vec(
+            marlin_data,
+            (in_features / 16, out_features / 64, 128),
+            &Device::Cpu,
+        )?
+        .to_device(self.qweight.device())?;
+
+        self.qweight_marlin = Some(marlin_tensor);
+        Ok(true)
     }
 
     /// Dequantize weights to the given dtype.
@@ -539,16 +609,23 @@ impl Module for GptqLinear {
     /// Forward pass: dequantize INT4 weights and perform matmul.
     ///
     /// Dispatch order:
-    /// 1. Marlin fast path (Plan 03: populated qweight_marlin + backend) — currently stub
-    /// 2. Naive dequant + matmul path (always active)
+    /// 1. Marlin fast path: fused dequant+GEMM via backend kernel (requires both
+    ///    `qweight_marlin` and `backend` to be populated at model load time)
+    /// 2. Naive fallback: dequantize then matmul (always available)
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // Marlin fast path (Plan 03 will populate qweight_marlin and backend)
-        if let Some(ref _qw_marlin) = self.qweight_marlin {
-            // TODO: dispatch to self.backend.marlin_gemm() in Plan 03
-            // For now, fall through to naive path
+        // Marlin fast path: requires both reformatted weights AND a backend
+        if let (Some(ref qw_marlin), Some(ref backend)) = (&self.qweight_marlin, &self.backend) {
+            let result = backend.marlin_gemm(xs, qw_marlin, &self.scales, &self.qzeros, self.group_size)?;
+            return match &self.bias {
+                Some(b) => {
+                    let b = b.to_dtype(result.dtype())?;
+                    result.broadcast_add(&b)
+                }
+                None => Ok(result),
+            };
         }
 
-        // Naive dequant + matmul path
+        // Naive dequant + matmul fallback
         let input_dtype = xs.dtype();
         let w = self.dequantize(input_dtype)?;
 
@@ -581,6 +658,7 @@ impl Module for GptqLinear {
 /// - `scales`: `[in_features / group_size, out_features]` as `F16/F32`
 /// - `qzeros`: `[in_features / group_size, out_features / 8]` as `U32` — packed 4-bit zeros
 /// - Optional `bias`: `[out_features]`
+#[derive(Clone)]
 pub struct AwqLinear {
     /// The underlying GPTQ-format layer. AWQ reuses the same packed format.
     inner: GptqLinear,
@@ -642,12 +720,66 @@ impl AwqLinear {
     pub fn group_size(&self) -> usize {
         self.inner.group_size()
     }
+
+    /// Mutable access to the inner GptqLinear (for Marlin reformatting).
+    pub fn inner_mut(&mut self) -> &mut GptqLinear {
+        &mut self.inner
+    }
 }
 
 impl Module for AwqLinear {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.inner.forward(xs)
     }
+}
+
+// ─── Marlin tile layout reformatting ──────────────────────────────────────
+
+/// Reformat GPTQ packed INT4 weights into Marlin tile layout.
+///
+/// Input: `qw` is flat `[K/8, N]` u32 data (8 INT4 values packed per u32, along K dim).
+/// Output: `[K/16, N/64, 128]` u32 data in Marlin tile layout.
+///
+/// Each output tile is a 16x64 sub-matrix of the weight matrix. Within each tile,
+/// the 1024 INT4 values are packed into 128 u32 values (8 nibbles each):
+///   linear_idx = row * 64 + col
+///   u32_idx = linear_idx / 8
+///   bit_pos = linear_idx % 8
+fn reformat_gptq_to_marlin(qw: &[u32], k: usize, n: usize) -> Vec<u32> {
+    let num_k_tiles = k / 16;
+    let num_n_tiles = n / 64;
+    let total_u32 = num_k_tiles * num_n_tiles * 128;
+    let mut out = vec![0u32; total_u32];
+
+    // Helper: extract INT4 value at position (row, col) in the original GPTQ layout.
+    // GPTQ layout: qw is [K/8, N] where each u32 at [pack_row, col] holds 8 INT4 values
+    // for rows pack_row*8 .. pack_row*8+7.
+    let get_int4 = |row: usize, col: usize| -> u32 {
+        let pack_row = row / 8;
+        let bit_pos = row % 8;
+        let packed = qw[pack_row * n + col];
+        (packed >> (bit_pos as u32 * 4)) & 0xF
+    };
+
+    for kt in 0..num_k_tiles {
+        for nt in 0..num_n_tiles {
+            let tile_base = (kt * num_n_tiles + nt) * 128;
+            // Pack 16x64 = 1024 INT4 values into 128 u32 values
+            for r in 0..16usize {
+                for c in 0..64usize {
+                    let linear_idx = r * 64 + c;
+                    let u32_idx = linear_idx / 8;
+                    let bit_pos = linear_idx % 8;
+                    let row = kt * 16 + r;
+                    let col = nt * 64 + c;
+                    let nibble = get_int4(row, col);
+                    out[tile_base + u32_idx] |= nibble << (bit_pos as u32 * 4);
+                }
+            }
+        }
+    }
+
+    out
 }
 
 // ─── INT4 packing / unpacking helpers ─────────────────────────────────────
@@ -748,6 +880,7 @@ fn unpack_int4_tensor(packed: &Tensor, pack_dim: usize, target_size: usize) -> R
 ///
 /// This is the main interface used by model code — it wraps either a
 /// standard `QMatMul` (from GGUF) or an `Int8` quantized linear layer.
+#[derive(Clone)]
 pub enum MaybeQuantizedLinear {
     /// Standard candle quantized matmul (GGUF native quantization).
     QMatMul(candle_core::quantized::QMatMul),
@@ -757,6 +890,8 @@ pub enum MaybeQuantizedLinear {
     Gptq(GptqLinear),
     /// AWQ 4-bit quantization (W4A16).
     Awq(AwqLinear),
+    /// FP8 E4M3 weight-only quantization (W8A16).
+    Fp8(super::fp8::Fp8Linear),
 }
 
 impl Module for MaybeQuantizedLinear {
@@ -766,6 +901,7 @@ impl Module for MaybeQuantizedLinear {
             Self::Int8(ql) => ql.forward(xs),
             Self::Gptq(gl) => gl.forward(xs),
             Self::Awq(al) => al.forward(xs),
+            Self::Fp8(fl) => fl.forward(xs),
         }
     }
 }
@@ -783,6 +919,22 @@ fn dequant_qmatmul(
 }
 
 impl MaybeQuantizedLinear {
+    /// Return a reference to the dense weight tensor, if this linear is unquantized.
+    ///
+    /// Returns `Some(&Tensor)` for `QMatMul::Tensor` and `QMatMul::TensorF16` variants,
+    /// `None` for quantized variants (QTensor, Int8, Gptq, Awq).
+    /// The returned tensor has shape `[out_features, in_features]`.
+    pub fn weight_tensor(&self) -> Option<&Tensor> {
+        match self {
+            Self::QMatMul(qmm) => match qmm {
+                candle_core::quantized::QMatMul::Tensor(t) => Some(t),
+                candle_core::quantized::QMatMul::TensorF16(t) => Some(t),
+                candle_core::quantized::QMatMul::QTensor(_) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Create from a candle QMatMul, optionally quantizing to INT8 or GPTQ.
     pub fn from_qmatmul(
         qmm: candle_core::quantized::QMatMul,
@@ -807,6 +959,16 @@ impl MaybeQuantizedLinear {
                 let w_f32 = dequant_qmatmul(&qmm, device)?;
                 let al = AwqLinear::from_float(&w_f32, None, 128)?;
                 Ok(Self::Awq(al))
+            }
+            QuantizationMethod::Fp8 => {
+                // Dequantize to F32, then re-quantize to FP8 E4M3
+                let w_f32 = dequant_qmatmul(&qmm, device)?;
+                let fl = super::fp8::Fp8Linear::from_float(
+                    &w_f32,
+                    None,
+                    super::fp8::Fp8Config::default(),
+                )?;
+                Ok(Self::Fp8(fl))
             }
         }
     }
@@ -977,7 +1139,14 @@ mod tests {
             "w4a16".parse::<QuantizationMethod>().unwrap(),
             QuantizationMethod::Gptq
         );
-        assert!("fp8".parse::<QuantizationMethod>().is_err());
+        assert_eq!(
+            "fp8".parse::<QuantizationMethod>().unwrap(),
+            QuantizationMethod::Fp8
+        );
+        assert_eq!(
+            "fp8-e4m3".parse::<QuantizationMethod>().unwrap(),
+            QuantizationMethod::Fp8
+        );
     }
 
     #[test]
@@ -1228,7 +1397,9 @@ mod tests {
         assert_eq!("half".parse::<KVCacheDType>().unwrap(), KVCacheDType::F16);
         assert_eq!("bf16".parse::<KVCacheDType>().unwrap(), KVCacheDType::BF16);
         assert_eq!("bfloat16".parse::<KVCacheDType>().unwrap(), KVCacheDType::BF16);
-        assert!("fp8".parse::<KVCacheDType>().is_err());
+        assert_eq!("fp8".parse::<KVCacheDType>().unwrap(), KVCacheDType::Fp8E4M3);
+        assert_eq!("fp8e4m3".parse::<KVCacheDType>().unwrap(), KVCacheDType::Fp8E4M3);
+        assert_eq!("fp8_e4m3".parse::<KVCacheDType>().unwrap(), KVCacheDType::Fp8E4M3);
     }
 
     #[test]
@@ -1237,6 +1408,7 @@ mod tests {
         assert_eq!(KVCacheDType::Auto.resolve(DType::F16), DType::F16);
         assert_eq!(KVCacheDType::F16.resolve(DType::F32), DType::F16);
         assert_eq!(KVCacheDType::BF16.resolve(DType::F32), DType::BF16);
+        assert_eq!(KVCacheDType::Fp8E4M3.resolve(DType::F32), DType::U8);
     }
 
     #[test]
@@ -1244,6 +1416,7 @@ mod tests {
         assert_eq!(KVCacheDType::Auto.to_string(), "auto");
         assert_eq!(KVCacheDType::F16.to_string(), "fp16");
         assert_eq!(KVCacheDType::BF16.to_string(), "bf16");
+        assert_eq!(KVCacheDType::Fp8E4M3.to_string(), "fp8");
     }
 
     // ── AWQ tests ───────────────────────────────────────────────────────

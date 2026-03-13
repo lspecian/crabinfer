@@ -5,6 +5,7 @@
 //! and sampling parameters.
 
 use super::block::BlockHash;
+use super::guided::GuidedConstraint;
 use super::kv_cache::SequenceBlocks;
 use std::collections::VecDeque;
 
@@ -63,6 +64,43 @@ pub struct SamplingParams {
     /// Request priority. Lower value = higher priority. Default: 0.
     /// Used for priority-aware scheduling and preemption ordering.
     pub priority: i32,
+    /// Optional guided decoding constraint (JSON Schema or regex).
+    /// When set, token generation is constrained to match the pattern.
+    pub guided_constraint: Option<GuidedConstraint>,
+    /// Optional cache salt for tenant isolation.
+    ///
+    /// When set, prefix cache block hashes include this salt, preventing
+    /// KV cache sharing between requests with different salt values.
+    /// Used in multi-tenant deployments for security isolation.
+    pub cache_salt: Option<String>,
+    /// Optional LoRA adapter name for this request.
+    ///
+    /// When set, the serving engine applies the specified LoRA adapter
+    /// on top of the base model's forward pass. The adapter must be
+    /// registered via `--lora-modules name=path` or loaded dynamically.
+    /// Parsed from the `model` field as `"base-model:adapter-name"`.
+    pub lora_adapter: Option<String>,
+    /// Number of candidate sequences to generate and return the best from.
+    ///
+    /// When `best_of > 1`, beam search is used instead of independent sampling.
+    /// The engine generates `best_of` candidate beams and returns the top `n`
+    /// (where `n` defaults to 1). Must be >= 1.
+    pub best_of: Option<usize>,
+    /// Length penalty for beam search scoring.
+    ///
+    /// score = cumulative_log_prob / (length ^ length_penalty)
+    /// - 0.0: no length normalization (raw cumulative log prob)
+    /// - 1.0: divide by length (average log prob per token)
+    /// - >1.0: favor longer sequences
+    /// - <1.0: favor shorter sequences
+    /// Default: 1.0. Only used when `best_of > 1`.
+    pub length_penalty: f32,
+    /// Early stopping for beam search.
+    ///
+    /// When true, beam search stops as soon as `n` complete sequences are
+    /// found and no active beam could possibly beat the worst finished beam.
+    /// Default: false. Only used when `best_of > 1`.
+    pub early_stopping: bool,
 }
 
 impl Default for SamplingParams {
@@ -77,6 +115,12 @@ impl Default for SamplingParams {
             logprobs: false,
             top_logprobs: 0,
             priority: 0,
+            guided_constraint: None,
+            cache_salt: None,
+            lora_adapter: None,
+            best_of: None,
+            length_penalty: 1.0,
+            early_stopping: false,
         }
     }
 }
@@ -352,5 +396,21 @@ mod tests {
         assert_eq!(params.max_tokens, 2048);
         assert!(params.stop_token_ids.is_empty());
         assert_eq!(params.repetition_penalty, 1.0);
+        assert!(params.best_of.is_none());
+        assert_eq!(params.length_penalty, 1.0);
+        assert!(!params.early_stopping);
+    }
+
+    #[test]
+    fn test_sampling_params_beam_search_fields() {
+        let params = SamplingParams {
+            best_of: Some(4),
+            length_penalty: 0.8,
+            early_stopping: true,
+            ..SamplingParams::default()
+        };
+        assert_eq!(params.best_of, Some(4));
+        assert_eq!(params.length_penalty, 0.8);
+        assert!(params.early_stopping);
     }
 }

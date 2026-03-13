@@ -138,6 +138,45 @@ pub struct JsonSchemaSpec {
 }
 
 // ---------------------------------------------------------------------------
+// Vision / multimodal content parts
+// ---------------------------------------------------------------------------
+
+/// A single part of a multimodal message content array.
+///
+/// OpenAI vision format: `[{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}]`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    /// Text content part.
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+    },
+    /// Image URL content part (base64 data URI or HTTP URL).
+    #[serde(rename = "image_url")]
+    ImageUrl {
+        image_url: ImageUrl,
+    },
+}
+
+/// Image URL with optional detail level.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageUrl {
+    /// Image source: `data:image/png;base64,...` or `https://...`
+    pub url: String,
+    /// Detail level for image processing. Default: "auto".
+    /// - `"auto"` — server decides based on image size
+    /// - `"low"` — resize to 512x512, fewer tokens
+    /// - `"high"` — use higher resolution, more tokens
+    #[serde(default = "default_detail")]
+    pub detail: String,
+}
+
+fn default_detail() -> String {
+    "auto".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Non-streaming response
 // ---------------------------------------------------------------------------
 

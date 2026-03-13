@@ -28,7 +28,7 @@ pub async fn messages(
     if let Some(ref system) = req.system {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(system.clone()),
+            content: Some(system.clone().into()),
             tool_call_id: None,
             tool_calls: None,
             name: None,
@@ -103,7 +103,7 @@ pub async fn messages(
 /// Non-streaming messages via the serving engine.
 async fn serving_messages(
     state: &AppState,
-    engine: &crabinfer_core::serving::engine_loop::EngineHandle,
+    engine: &crabinfer_core::serving::worker_pool::WorkerPool,
     messages: &[ChatMessage],
     req: &MessagesRequest,
 ) -> Result<axum::response::Response, ServerError> {
@@ -121,10 +121,15 @@ async fn serving_messages(
     let temperature = req.temperature.unwrap_or(0.7);
     let top_p = req.top_p.unwrap_or(0.9);
 
+    // Parse optional LoRA adapter from model field (e.g., "model:adapter")
+    let (_base_model, lora_adapter) = crabinfer_core::serving::lora::parse_model_adapter(&req.model);
+    let lora_adapter = lora_adapter.map(|s| s.to_string());
+
     let params = SamplingParams {
         temperature,
         top_p,
         max_tokens,
+        lora_adapter,
         ..SamplingParams::default()
     };
 
@@ -188,7 +193,7 @@ async fn messages_stream(
     if let Some(ref system) = req.system {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(system.clone()),
+            content: Some(system.clone().into()),
             tool_call_id: None,
             tool_calls: None,
             name: None,
@@ -357,7 +362,7 @@ async fn messages_stream(
 /// Streaming messages via the serving engine.
 async fn serving_messages_stream(
     state: Arc<AppState>,
-    engine: crabinfer_core::serving::engine_loop::EngineHandle,
+    engine: crabinfer_core::serving::worker_pool::WorkerPool,
     messages: Vec<ChatMessage>,
     req: MessagesRequest,
 ) -> Result<
@@ -379,10 +384,15 @@ async fn serving_messages_stream(
     let temperature = req.temperature.unwrap_or(0.7);
     let top_p = req.top_p.unwrap_or(0.9);
 
+    // Parse optional LoRA adapter from model field
+    let (_base_model, lora_adapter) = crabinfer_core::serving::lora::parse_model_adapter(&req.model);
+    let lora_adapter = lora_adapter.map(|s| s.to_string());
+
     let params = SamplingParams {
         temperature,
         top_p,
         max_tokens,
+        lora_adapter,
         ..SamplingParams::default()
     };
 

@@ -44,6 +44,12 @@ tracing-subscriber = "0.3"
 # Error handling
 thiserror = "2"
 
+# LRU cache for tokenizer encoding cache (TOKN-02)
+lru = "0.12"
+
+# Parallel batch encoding (TOKN-01)
+rayon = "1.10"
+
 # Half-precision float types (f16/bf16) for CUDA kernel dispatch
 half = "2.7"
 
@@ -65,6 +71,15 @@ sha2 = "0.10"
 
 # Flexible error handling (used by hub_download and other modules)
 anyhow = "1"
+
+# Guided decoding: JSON Schema -> regex -> DFA token masking
+outlines-core = "0.2"
+
+# Image decoding for vision/multimodal support
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# Base64 decoding for data URI image inputs
+base64 = "0.22"
 
 # HuggingFace Hub client for model downloads
 hf-hub = { version = "0.5", features = ["tokio"], optional = true }

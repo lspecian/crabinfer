@@ -1,4 +1,5 @@
 pub mod chat_template;
+pub mod config;
 pub mod error;
 pub mod routes;
 pub mod state;
@@ -48,70 +49,25 @@ pub struct ServerConfig {
     /// When > 0, preempted sequences have their KV cache blocks swapped to
     /// pinned CPU memory instead of being discarded.
     pub swap_space: f64,
-}
-
-/// Apply environment variable overrides to a ServerConfig.
-///
-/// Supported variables:
-/// - `CRABINFER_HOST` — host to bind to
-/// - `CRABINFER_PORT` — port number
-/// - `CRABINFER_GPU_MEMORY_UTILIZATION` — GPU memory fraction (0.0-1.0)
-/// - `CRABINFER_MAX_NUM_SEQS` — maximum concurrent sequences
-/// - `CRABINFER_MAX_NUM_BATCHED_TOKENS` — max tokens per scheduling step
-/// - `CRABINFER_MAX_MODEL_LEN` — override model context length
-/// - `CRABINFER_QUANTIZATION` — weight quantization method
-/// - `CRABINFER_KV_CACHE_DTYPE` — KV cache data type
-/// - `CRABINFER_CHAT_TEMPLATE` — chat template override
-/// - `CRABINFER_ENFORCE_EAGER` — set to "1" or "true" to disable CUDA graphs
-/// - `CRABINFER_SWAP_SPACE` — CPU swap space for KV cache in GiB (0 = disabled)
-fn apply_env_overrides(config: &mut ServerConfig) {
-    use std::env;
-
-    if let Ok(v) = env::var("CRABINFER_HOST") {
-        config.host = v;
-    }
-    if let Ok(v) = env::var("CRABINFER_PORT") {
-        if let Ok(p) = v.parse() {
-            config.port = p;
-        }
-    }
-    if let Ok(v) = env::var("CRABINFER_GPU_MEMORY_UTILIZATION") {
-        if let Ok(f) = v.parse() {
-            config.gpu_memory_utilization = f;
-        }
-    }
-    if let Ok(v) = env::var("CRABINFER_MAX_NUM_SEQS") {
-        if let Ok(n) = v.parse() {
-            config.max_num_seqs = n;
-        }
-    }
-    if let Ok(v) = env::var("CRABINFER_MAX_NUM_BATCHED_TOKENS") {
-        if let Ok(n) = v.parse() {
-            config.max_num_batched_tokens = n;
-        }
-    }
-    if let Ok(v) = env::var("CRABINFER_MAX_MODEL_LEN") {
-        if let Ok(n) = v.parse() {
-            config.max_model_len = Some(n);
-        }
-    }
-    if let Ok(v) = env::var("CRABINFER_QUANTIZATION") {
-        config.quantization = v;
-    }
-    if let Ok(v) = env::var("CRABINFER_KV_CACHE_DTYPE") {
-        config.kv_cache_dtype = v;
-    }
-    if let Ok(v) = env::var("CRABINFER_CHAT_TEMPLATE") {
-        config.chat_template = Some(v);
-    }
-    if let Ok(v) = env::var("CRABINFER_ENFORCE_EAGER") {
-        config.enforce_eager = v == "1" || v.eq_ignore_ascii_case("true");
-    }
-    if let Ok(v) = env::var("CRABINFER_SWAP_SPACE") {
-        if let Ok(f) = v.parse() {
-            config.swap_space = f;
-        }
-    }
+    /// Number of inference workers (default: 1). Multiple workers share model
+    /// weights but each has its own KV cache and scheduler. Requests are
+    /// distributed round-robin across workers.
+    pub workers: usize,
+    /// Enable LoRA adapter serving.
+    pub enable_lora: bool,
+    /// Maximum number of LoRA adapters to keep in GPU memory simultaneously.
+    pub max_loras: usize,
+    /// Pre-registered LoRA adapter modules: `"name1=path1,name2=path2"`.
+    pub lora_modules: Option<String>,
+    /// Tokens per KV cache block. Must be a power of 2 between 8 and 64.
+    /// Default: 16.
+    pub block_size: usize,
+    /// Number of GPUs for tensor parallelism (default: 1 = no TP).
+    /// Model weights are sharded across GPUs using NCCL for communication.
+    pub tensor_parallel_size: usize,
+    /// Number of pipeline parallel stages (default: 1 = disabled).
+    /// Model layers are partitioned across stages for pipeline parallelism.
+    pub pipeline_parallel_stages: usize,
 }
 
 /// Start the CrabInfer API server with the given configuration.
@@ -119,7 +75,7 @@ fn apply_env_overrides(config: &mut ServerConfig) {
 /// Loads the model, binds to `host:port`, and serves OpenAI + Anthropic
 /// compatible endpoints until a SIGINT is received.
 pub async fn run_server(mut config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    apply_env_overrides(&mut config);
+    config::apply_env_overrides(&mut config);
     tracing::info!("Loading model: {}", config.model_path);
 
     let created_at = SystemTime::now()
@@ -216,7 +172,7 @@ fn load_legacy_engine(
 ) -> Result<
     (
         Option<Arc<CrabInferEngine>>,
-        Option<crabinfer_core::serving::engine_loop::EngineHandle>,
+        Option<crabinfer_core::serving::worker_pool::WorkerPool>,
         ModelInfo,
         String,
     ),
@@ -241,12 +197,16 @@ fn load_legacy_engine(
 }
 
 /// Load the GGUF model directly and create the PagedAttention serving engine.
+///
+/// When `config.workers > 1`, multiple engine workers are created sharing the
+/// same model weights (candle tensors are Arc-based internally) but each with
+/// its own KV cache. KV cache blocks are split evenly across workers.
 fn load_serving_engine(
     config: &ServerConfig,
 ) -> Result<
     (
         Option<Arc<CrabInferEngine>>,
-        Option<crabinfer_core::serving::engine_loop::EngineHandle>,
+        Option<crabinfer_core::serving::worker_pool::WorkerPool>,
         ModelInfo,
         String,
     ),
@@ -256,6 +216,7 @@ fn load_serving_engine(
     use crabinfer_core::serving::engine_loop::{EngineHandle, ServingEngineConfig};
     use crabinfer_core::serving::models::load_model_from_gguf;
     use crabinfer_core::serving::quantization::QuantizationMethod;
+    use crabinfer_core::serving::worker_pool::WorkerPool;
 
     // ── Resolve HF repo ID to local cache if needed ──
     let (resolved_model_path, hf_repo_id) =
@@ -389,7 +350,7 @@ fn load_serving_engine(
     tracing::info!("EOS token ID: {eos_token_id}");
 
     // ── Calculate KV cache blocks based on available memory ──
-    let total_blocks = estimate_kv_cache_blocks(&model_config, &device);
+    let total_blocks = estimate_kv_cache_blocks(&model_config, &device, config.block_size);
 
     // If a draft model is specified, split the KV cache budget
     let (target_blocks, draft_info) = if config.draft_model_path.is_some() {
@@ -402,14 +363,35 @@ fn load_serving_engine(
     };
 
     tracing::info!(
-        "KV cache: {target_blocks} blocks ({} tokens capacity)",
-        target_blocks * crabinfer_core::serving::kernels::BLOCK_SIZE,
+        "KV cache: {target_blocks} blocks ({} tokens capacity, block_size={})",
+        target_blocks * config.block_size,
+        config.block_size,
     );
+
+    // ── Parse LoRA modules ──
+    let lora_modules = if let Some(ref lora_str) = config.lora_modules {
+        crabinfer_core::serving::lora::parse_lora_modules(lora_str)
+            .map_err(|e| format!("Failed to parse --lora-modules: {e}"))?
+    } else {
+        Vec::new()
+    };
+
+    if config.enable_lora {
+        tracing::info!(
+            "LoRA serving enabled: max_loras={}, registered adapters={}",
+            config.max_loras,
+            lora_modules.len(),
+        );
+        for (name, path) in &lora_modules {
+            tracing::info!("  LoRA adapter: {} -> {}", name, path);
+        }
+    }
 
     // ── Create engine ──
     let engine_config = ServingEngineConfig {
         max_num_seqs: config.max_num_seqs,
         max_num_batched_tokens: config.max_num_batched_tokens,
+        block_size: config.block_size,
         num_kv_cache_blocks: Some(target_blocks),
         enable_prefix_cache: !config.disable_prefix_cache,
         enforce_eager: config.enforce_eager,
@@ -417,8 +399,45 @@ fn load_serving_engine(
         quantization,
         kv_cache_dtype,
         max_model_len: config.max_model_len,
+        enable_lora: config.enable_lora,
+        max_loras: config.max_loras,
+        lora_modules,
+        tensor_parallel_size: config.tensor_parallel_size,
+        pipeline_parallel_stages: config.pipeline_parallel_stages,
         ..ServingEngineConfig::default()
     };
+
+    if config.pipeline_parallel_stages > 1 {
+        tracing::info!(
+            "Pipeline parallelism: {} stages (model layers will be partitioned)",
+            config.pipeline_parallel_stages,
+        );
+    }
+
+    if config.tensor_parallel_size > 1 {
+        tracing::info!(
+            "Tensor parallelism: {} GPUs (model weights will be sharded)",
+            config.tensor_parallel_size,
+        );
+    }
+
+    // ── Prepare for multi-worker mode ──
+    // If more than 1 worker is requested, keep a clone-capable reference
+    // to the model and clone tokenizer/device/config so we can create
+    // additional workers after the first. clone_model() is cheap: candle
+    // tensors share storage via Arc.
+    let num_workers = config.workers.max(1);
+    let model_for_cloning: Option<Box<dyn crabinfer_core::serving::models::ModelRunner>> =
+        if num_workers > 1 {
+            Some(model.clone_model())
+        } else {
+            None
+        };
+
+    // Pre-clone values consumed by EngineHandle::start() that we need
+    // again for additional workers.
+    let extra_tokenizer = if num_workers > 1 { Some(tokenizer.clone()) } else { None };
+    let extra_device = if num_workers > 1 { Some(device.clone()) } else { None };
 
     // ── Load draft model for speculative decoding (if configured) ──
     let handle = if let (Some(draft_path), Some(draft_blocks)) =
@@ -450,6 +469,7 @@ fn load_serving_engine(
             adaptive: true,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let speculative = SpeculativeState::new(
@@ -471,7 +491,7 @@ fn load_serving_engine(
             tokenizer,
             eos_token_id,
             device,
-            engine_config,
+            engine_config.clone(),
             speculative,
         )
         .map_err(|e| format!("Failed to start serving engine with speculative: {e}"))?
@@ -481,14 +501,63 @@ fn load_serving_engine(
             tokenizer,
             eos_token_id,
             device,
-            engine_config,
+            engine_config.clone(),
         )
         .map_err(|e| format!("Failed to start serving engine: {e}"))?
     };
 
-    tracing::info!("PagedAttention serving engine started");
+    // ── Wrap in WorkerPool ──
+    // For num_workers == 1, this is a thin wrapper with no overhead.
+    // For num_workers > 1, additional workers are created by cloning the
+    // model (sharing Arc-based weight tensors) and starting separate
+    // EngineHandle instances. Each worker gets its own KV cache, scheduler,
+    // and engine thread. Requests are distributed round-robin.
+    let mut handles = vec![handle];
 
-    Ok((None, Some(handle), model_info, model_id))
+    if num_workers > 1 {
+        tracing::info!(
+            "Multi-worker mode: {} workers requested (model weight sharing via Arc tensors)",
+            num_workers,
+        );
+
+        // Each worker gets its own KV cache allocation (same size as worker 0).
+        // All workers share model weights via tensor Arc cloning.
+        let blocks_per_worker = target_blocks;
+        let model_template = model_for_cloning
+            .expect("model_for_cloning must be Some when num_workers > 1");
+        let tok = extra_tokenizer.expect("extra_tokenizer must be Some when num_workers > 1");
+        let dev = extra_device.expect("extra_device must be Some when num_workers > 1");
+
+        for worker_idx in 1..num_workers {
+            let cloned_model = model_template.clone_model();
+            let worker_config = ServingEngineConfig {
+                num_kv_cache_blocks: Some(blocks_per_worker),
+                ..engine_config.clone()
+            };
+
+            let worker_handle = EngineHandle::start(
+                cloned_model,
+                tok.clone(),
+                eos_token_id,
+                dev.clone(),
+                worker_config,
+            )
+            .map_err(|e| format!("Failed to start worker {worker_idx}: {e}"))?;
+
+            handles.push(worker_handle);
+            tracing::info!("Worker {worker_idx} started ({blocks_per_worker} KV blocks)");
+        }
+    }
+
+    let pool = WorkerPool::new(handles);
+
+    tracing::info!(
+        "PagedAttention serving engine started ({} worker{})",
+        pool.num_workers(),
+        if pool.num_workers() == 1 { "" } else { "s" },
+    );
+
+    Ok((None, Some(pool), model_info, model_id))
 }
 
 /// Extract ModelInfo from GGUF metadata.
@@ -662,15 +731,14 @@ fn model_stem_to_dirs(stem: &str) -> Vec<String> {
 fn estimate_kv_cache_blocks(
     model_config: &crabinfer_core::serving::models::ModelConfig,
     _device: &candle_core::Device,
+    block_size: usize,
 ) -> usize {
-    use crabinfer_core::serving::kernels::BLOCK_SIZE;
-
-    // Each block stores BLOCK_SIZE tokens of KV data per layer per head
-    // K: [num_kv_heads, head_size/x, BLOCK_SIZE, x] per layer
-    // V: [num_kv_heads, head_size, BLOCK_SIZE] per layer
-    // With F32: bytes_per_block = 4 * num_kv_heads * head_size * BLOCK_SIZE * 2 (K+V) * num_layers
+    // Each block stores block_size tokens of KV data per layer per head
+    // K: [num_kv_heads, head_size/x, block_size, x] per layer
+    // V: [num_kv_heads, head_size, block_size] per layer
+    // With F32: bytes_per_block = 4 * num_kv_heads * head_size * block_size * 2 (K+V) * num_layers
     let bytes_per_block_per_layer =
-        4 * model_config.num_kv_heads * model_config.head_size * BLOCK_SIZE * 2; // 4 bytes for F32, *2 for K+V
+        4 * model_config.num_kv_heads * model_config.head_size * block_size * 2; // 4 bytes for F32, *2 for K+V
     let bytes_per_block = bytes_per_block_per_layer * model_config.num_layers;
 
     // Query system memory and allocate a reasonable fraction for KV cache.

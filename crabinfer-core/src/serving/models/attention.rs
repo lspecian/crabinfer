@@ -19,15 +19,16 @@ use crate::serving::kernels::backend::PagedAttentionConfig;
 ///
 /// Each transformer layer creates one of these. The RoPE cos/sin tables
 /// can be shared across layers by cloning (Tensor clone is O(1) via Arc).
+#[derive(Clone)]
 pub struct PagedAttentionLayer {
-    pub(super) num_heads: usize,
-    pub(super) num_kv_heads: usize,
-    pub(super) head_size: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_size: usize,
     scale: f32,
     /// Precomputed RoPE cosines `[max_seq_len, rope_dim/2]`.
-    cos: Tensor,
+    pub(crate) cos: Tensor,
     /// Precomputed RoPE sines `[max_seq_len, rope_dim/2]`.
-    sin: Tensor,
+    pub(crate) sin: Tensor,
 }
 
 impl PagedAttentionLayer {

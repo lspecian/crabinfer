@@ -150,21 +150,25 @@ enum Commands {
 
     /// Start OpenAI/Anthropic-compatible API server
     Serve {
+        /// Path to a crabinfer.toml configuration file
+        #[arg(long)]
+        config: Option<String>,
+
         /// Path to GGUF model file or HuggingFace safetensors directory
         #[arg(long)]
-        model: String,
+        model: Option<String>,
 
         /// Port to listen on
-        #[arg(long, default_value = "8080")]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(long)]
+        host: Option<String>,
 
         /// Context length (max tokens the model can see)
-        #[arg(long, default_value = "4096")]
-        context_length: u32,
+        #[arg(long)]
+        context_length: Option<u32>,
 
         /// Disable Metal GPU acceleration (CPU only)
         #[arg(long)]
@@ -182,37 +186,37 @@ enum Commands {
         #[arg(long)]
         draft_model: Option<String>,
 
-        /// Number of draft tokens per speculative step (default: 4)
-        #[arg(long, default_value = "4")]
-        num_draft_tokens: u32,
+        /// Number of draft tokens per speculative step
+        #[arg(long)]
+        num_draft_tokens: Option<u32>,
 
         /// Disable CUDA graphs and use eager execution (for debugging)
         #[arg(long)]
         enforce_eager: bool,
 
         /// Fraction of GPU memory to use for KV cache (0.0-1.0)
-        #[arg(long, default_value = "0.90")]
-        gpu_memory_utilization: f64,
+        #[arg(long)]
+        gpu_memory_utilization: Option<f64>,
 
-        /// Maximum concurrent sequences (default: 64)
-        #[arg(long, default_value = "64")]
-        max_num_seqs: usize,
+        /// Maximum concurrent sequences
+        #[arg(long)]
+        max_num_seqs: Option<usize>,
 
-        /// Maximum tokens per scheduling step (default: 2048)
-        #[arg(long, default_value = "2048")]
-        max_num_batched_tokens: usize,
+        /// Maximum tokens per scheduling step
+        #[arg(long)]
+        max_num_batched_tokens: Option<usize>,
 
         /// Disable prefix caching
         #[arg(long)]
         disable_prefix_cache: bool,
 
-        /// Weight quantization method: none, int8 (W8A16), gptq, awq
-        #[arg(long, default_value = "none")]
-        quantization: String,
+        /// Weight quantization method: none, int8 (W8A16), gptq, awq, fp8 (E4M3)
+        #[arg(long)]
+        quantization: Option<String>,
 
         /// KV cache data type: auto, fp16, bf16
-        #[arg(long, default_value = "auto")]
-        kv_cache_dtype: String,
+        #[arg(long)]
+        kv_cache_dtype: Option<String>,
 
         /// Maximum model context length (overrides model default)
         #[arg(long)]
@@ -222,9 +226,37 @@ enum Commands {
         #[arg(long)]
         chat_template: Option<String>,
 
-        /// CPU swap space for KV cache in GiB (0 = disabled). Default: 0
-        #[arg(long, default_value = "0")]
-        swap_space: f64,
+        /// CPU swap space for KV cache in GiB (0 = disabled)
+        #[arg(long)]
+        swap_space: Option<f64>,
+
+        /// Number of inference workers (default: 1)
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Enable LoRA adapter serving (requires --serving)
+        #[arg(long)]
+        enable_lora: bool,
+
+        /// Maximum number of LoRA adapters to keep in GPU memory simultaneously (default: 4)
+        #[arg(long)]
+        max_loras: Option<usize>,
+
+        /// Pre-register LoRA adapter modules: name1=path1,name2=path2
+        #[arg(long)]
+        lora_modules: Option<String>,
+
+        /// Tokens per KV cache block (must be power of 2 between 8 and 64, default 16)
+        #[arg(long)]
+        block_size: Option<usize>,
+
+        /// Number of GPUs for tensor parallelism (default: 1 = no TP)
+        #[arg(long)]
+        tensor_parallel_size: Option<usize>,
+
+        /// Number of pipeline parallel stages (default: 1 = disabled)
+        #[arg(long)]
+        pipeline_parallel_stages: Option<usize>,
     },
 }
 
@@ -406,6 +438,7 @@ fn main() {
             McpAction::Serve => cmd_mcp::serve(),
         },
         Commands::Serve {
+            config,
             model,
             port,
             host,
@@ -425,9 +458,17 @@ fn main() {
             max_model_len,
             chat_template,
             swap_space,
+            workers,
+            enable_lora,
+            max_loras,
+            lora_modules,
+            block_size,
+            tensor_parallel_size,
+            pipeline_parallel_stages,
         } => cmd_serve::run(
-            &model,
-            &host,
+            config.as_deref(),
+            model.as_deref(),
+            host.as_deref(),
             port,
             context_length,
             cpu,
@@ -440,11 +481,18 @@ fn main() {
             max_num_seqs,
             max_num_batched_tokens,
             disable_prefix_cache,
-            &quantization,
-            &kv_cache_dtype,
+            quantization.as_deref(),
+            kv_cache_dtype.as_deref(),
             max_model_len,
             chat_template,
             swap_space,
+            workers,
+            enable_lora,
+            max_loras,
+            lora_modules,
+            block_size,
+            tensor_parallel_size,
+            pipeline_parallel_stages,
         ),
     }
 }

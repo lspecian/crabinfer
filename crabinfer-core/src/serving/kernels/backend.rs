@@ -88,6 +88,58 @@ pub trait KernelBackend: Send + Sync {
 
     // ─── Fused kernels (optional, with default fallbacks) ────────────────
 
+    /// FP8 E4M3 dequantize + GEMM.
+    ///
+    /// Default: dequantize FP8 weights to the input dtype, then perform standard matmul.
+    /// On Hopper GPUs (H100/H200), the CUDA backend can override this with
+    /// `cublasLtMatmul` using native `CUDA_R_8F_E4M3` input types.
+    ///
+    /// # Arguments
+    /// - `input`: `[M, K]` activations in FP16/FP32
+    /// - `weight_fp8`: `[N, K]` weights stored as U8 (FP8 E4M3 bit patterns)
+    /// - `scale`: `[1]` or `[N]` per-tensor or per-channel scale factors
+    /// - `bias`: optional `[N]` bias
+    /// - `per_channel`: whether scale is per-channel
+    ///
+    /// # Returns
+    /// `[M, N]` output tensor in input dtype
+    fn fp8_gemm(
+        &self,
+        _input: &Tensor,
+        _weight_fp8: &Tensor,
+        _scale: &Tensor,
+        _bias: Option<&Tensor>,
+        _per_channel: bool,
+    ) -> Result<Tensor> {
+        candle_core::bail!("fp8_gemm not supported on {} backend", self.name())
+    }
+
+    /// Fused INT4 dequant + GEMM (Marlin-style).
+    ///
+    /// Performs a fused dequantization and matrix multiplication for GPTQ/AWQ INT4
+    /// weights that have been pre-reformatted into Marlin tile layout. Eliminates
+    /// the intermediate FP16 weight materialization in global memory.
+    ///
+    /// # Arguments
+    /// - `input`: `[M, K]` FP16 activations
+    /// - `qweight_marlin`: `[K/16, N/64, 128]` u32 Marlin tile layout
+    /// - `scales`: `[K/group_size, N]` FP16 per-group scale factors
+    /// - `qzeros`: `[K/group_size, N/8]` u32 packed INT4 zero points
+    /// - `group_size`: number of input features sharing the same scale/zero
+    ///
+    /// # Returns
+    /// `[M, N]` FP16 output tensor
+    fn marlin_gemm(
+        &self,
+        _input: &Tensor,
+        _qweight_marlin: &Tensor,
+        _scales: &Tensor,
+        _qzeros: &Tensor,
+        _group_size: usize,
+    ) -> Result<Tensor> {
+        candle_core::bail!("marlin_gemm not supported on {} backend", self.name())
+    }
+
     /// Fused SiLU activation + element-wise multiply.
     ///
     /// Computes `output = silu(gate) * up` in a single kernel pass,
@@ -149,6 +201,31 @@ pub trait KernelBackend: Send + Sync {
         Ok((normed, x_plus_res))
     }
 
+    /// Fused RMSNorm + linear projection.
+    ///
+    /// Computes `output = rmsnorm(x, norm_weight, eps) @ linear_weight^T` in a single
+    /// kernel pass, eliminating the intermediate normalized tensor in global memory.
+    ///
+    /// # Arguments
+    /// - `x`: `[num_rows, hidden_size]` input
+    /// - `norm_weight`: `[hidden_size]` RMSNorm scale
+    /// - `eps`: normalization epsilon
+    /// - `linear_weight`: `[out_features, hidden_size]` projection weight
+    ///
+    /// # Returns
+    /// `[num_rows, out_features]`
+    fn fused_layernorm_linear(
+        &self,
+        x: &Tensor,
+        norm_weight: &Tensor,
+        eps: f32,
+        linear_weight: &Tensor,
+    ) -> Result<Tensor> {
+        // Default: unfused path
+        let normed = candle_nn::ops::rms_norm(x, norm_weight, eps)?;
+        normed.matmul(&linear_weight.t()?)
+    }
+
     /// Fused RoPE (Rotary Positional Embedding) applied in-place.
     ///
     /// Applies rotary embeddings directly to `[total_tokens, num_heads, head_size]`
@@ -189,4 +266,81 @@ pub struct PagedAttentionConfig {
     pub num_kv_heads: usize,
     pub scale: f32,
     pub max_context_len: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serving::kernels::cpu_backend::CpuBackend;
+
+    // KERN-01 + KERN-02: Fused LayerNorm+linear
+
+    #[test]
+    fn test_fused_layernorm_linear_produces_correct_shape() {
+        // backend.fused_layernorm_linear(x, norm_weight, eps, linear_weight) returns [batch, out_features]
+        let b = CpuBackend::new();
+        let dev = &Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0, (4, 64), dev).unwrap();
+        let norm_weight = Tensor::ones(64, DType::F32, dev).unwrap();
+        // linear_weight: [out_features, hidden_size] = [128, 64]
+        let linear_weight = Tensor::randn(0f32, 1.0, (128, 64), dev).unwrap();
+        let result = b
+            .fused_layernorm_linear(&x, &norm_weight, 1e-5, &linear_weight)
+            .unwrap();
+        assert_eq!(result.dims(), &[4, 128]);
+    }
+
+    #[test]
+    fn test_fused_layernorm_linear_matches_unfused() {
+        // Fused result matches sequential rmsnorm then matmul within tolerance
+        let b = CpuBackend::new();
+        let dev = &Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0, (8, 64), dev).unwrap();
+        let norm_weight = Tensor::randn(0f32, 1.0, 64, dev).unwrap();
+        let linear_weight = Tensor::randn(0f32, 1.0, (128, 64), dev).unwrap();
+        let eps = 1e-5f32;
+
+        // Fused path (via default impl)
+        let fused = b
+            .fused_layernorm_linear(&x, &norm_weight, eps, &linear_weight)
+            .unwrap();
+
+        // Manual unfused reference
+        let normed = candle_nn::ops::rms_norm(&x, &norm_weight, eps).unwrap();
+        let unfused = normed.matmul(&linear_weight.t().unwrap()).unwrap();
+
+        let diff = (&fused - &unfused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max_diff < 1e-3,
+            "fused vs unfused max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_fused_layernorm_linear_default_fallback() {
+        // Default trait impl (used by CpuBackend) produces valid output
+        let b = CpuBackend::new();
+        let dev = &Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0, (4, 32), dev).unwrap();
+        let norm_weight = Tensor::ones(32, DType::F32, dev).unwrap();
+        let linear_weight = Tensor::randn(0f32, 1.0, (16, 32), dev).unwrap();
+
+        let result = b
+            .fused_layernorm_linear(&x, &norm_weight, 1e-5, &linear_weight)
+            .unwrap();
+
+        // Output should be finite and have correct shape
+        assert_eq!(result.dims(), &[4, 16]);
+        let data: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, v) in data.iter().enumerate() {
+            assert!(v.is_finite(), "non-finite at index {i}: {v}");
+        }
+    }
 }

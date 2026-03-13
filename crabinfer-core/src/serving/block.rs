@@ -27,10 +27,40 @@ impl BlockHash {
     /// The hash chains: each block's hash includes the previous block's hash,
     /// so the hash of block N encodes the entire prefix up to block N.
     pub fn from_tokens(tokens: &[u32], prev_hash: Option<BlockHash>) -> Self {
+        Self::from_tokens_salted(tokens, prev_hash, None)
+    }
+
+    /// Compute salt-aware block hash from token content using FNV-1a.
+    ///
+    /// When `salt` is `Some`, the salt bytes are mixed into the initial hash
+    /// state before processing tokens. This ensures that requests with
+    /// different salts (e.g., different tenants) cannot share cached KV blocks,
+    /// providing tenant isolation in multi-tenant deployments.
+    ///
+    /// When `salt` is `None`, this behaves identically to `from_tokens`
+    /// for backward compatibility.
+    pub fn from_tokens_salted(
+        tokens: &[u32],
+        prev_hash: Option<BlockHash>,
+        salt: Option<&str>,
+    ) -> Self {
         let mut h: u64 = match prev_hash {
             Some(BlockHash(prev)) => prev,
             None => 0xcbf29ce484222325, // FNV offset basis
         };
+
+        // Mix salt bytes into hash state before tokens (only for the first
+        // block in a chain, i.e., when prev_hash is None). When prev_hash is
+        // Some, the salt was already mixed into the chain's first block.
+        if prev_hash.is_none() {
+            if let Some(s) = salt {
+                for &byte in s.as_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+
         for &token in tokens {
             h ^= token as u64;
             h = h.wrapping_mul(0x100000001b3); // FNV prime
@@ -442,6 +472,42 @@ mod tests {
         map.remove(&hash, 1);
         assert_eq!(map.get(&hash), None);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_block_hash_salted_different_from_none() {
+        let tokens = vec![1u32, 2, 3, 4];
+        let unsalted = BlockHash::from_tokens_salted(&tokens, None, None);
+        let salted = BlockHash::from_tokens_salted(&tokens, None, Some("tenant-a"));
+        assert_ne!(unsalted, salted, "salt=Some should differ from salt=None");
+    }
+
+    #[test]
+    fn test_block_hash_salted_different_tenants() {
+        let tokens = vec![1u32, 2, 3, 4];
+        let a = BlockHash::from_tokens_salted(&tokens, None, Some("tenant-a"));
+        let b = BlockHash::from_tokens_salted(&tokens, None, Some("tenant-b"));
+        assert_ne!(a, b, "different salts should produce different hashes");
+    }
+
+    #[test]
+    fn test_block_hash_salted_none_backward_compat() {
+        let tokens = vec![1u32, 2, 3, 4];
+        let old = BlockHash::from_tokens(&tokens, None);
+        let new = BlockHash::from_tokens_salted(&tokens, None, None);
+        assert_eq!(old, new, "salt=None must match from_tokens for backward compat");
+    }
+
+    #[test]
+    fn test_block_hash_salted_chaining() {
+        let block1 = vec![1u32, 2, 3];
+        let block2 = vec![4u32, 5, 6];
+        let h1 = BlockHash::from_tokens_salted(&block1, None, Some("salt"));
+        let h2 = BlockHash::from_tokens_salted(&block2, Some(h1), Some("salt"));
+        // Chained hash should be deterministic
+        let h1b = BlockHash::from_tokens_salted(&block1, None, Some("salt"));
+        let h2b = BlockHash::from_tokens_salted(&block2, Some(h1b), Some("salt"));
+        assert_eq!(h2, h2b);
     }
 
     #[test]

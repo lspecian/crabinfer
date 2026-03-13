@@ -2,9 +2,14 @@
 //!
 //! Translates between sequence-level operations (allocate slots for N new tokens,
 //! free a sequence's blocks) and the block pool's physical block operations.
+//!
+//! Also provides FP8 E4M3 quantization/dequantization for KV cache compression.
+//! FP8 E4M3 uses 1 byte per element (4-bit exponent, 3-bit mantissa) with per-head
+//! scaling factors, giving 2x memory savings over FP16 at minimal accuracy cost.
 
 use super::block::{BlockHash, BlockId};
 use super::block_pool::{BlockPool, BlockPoolConfig};
+use candle_core::{DType, Device, Result, Tensor};
 
 /// Configuration for the KV cache manager.
 #[derive(Debug, Clone)]
@@ -303,10 +308,245 @@ impl KVCacheManager {
         self.pool.ref_count(block_id)
     }
 
+    /// Return the content hashes of all actively allocated blocks.
+    ///
+    /// Useful for cache-aware load balancing: a router can compare a request's
+    /// prefix hashes against each worker's active hashes to route to the
+    /// worker with the best prefix match.
+    pub fn active_block_hashes(&self) -> Vec<BlockHash> {
+        self.pool.active_block_hashes()
+    }
+
     /// Reset prefix cache (invalidate all cached blocks).
     pub fn reset_prefix_cache(&mut self) {
         self.pool.reset_prefix_cache();
     }
+}
+
+// ─── FP8 E4M3 KV Cache Quantization ─────────────────────────────────────────
+
+/// Maximum representable value in FP8 E4M3 format.
+/// E4M3: 4-bit exponent (bias=7), 3-bit mantissa, no inf (NaN reserved).
+/// Max = 2^(14-7) * (1 + 7/8) = 128 * 1.875 = 240.0
+const FP8_E4M3_MAX: f32 = 240.0;
+
+/// Convert an f32 value to FP8 E4M3 representation (as u8).
+///
+/// FP8 E4M3 format: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits.
+/// Special values: 0x7F = NaN, no infinity representation.
+/// Range: [-240, 240], min subnormal: 2^-9 = 0.001953125
+#[inline]
+fn f32_to_fp8_e4m3(val: f32) -> u8 {
+    if val.is_nan() {
+        return 0x7F; // NaN
+    }
+
+    let sign = if val < 0.0 { 1u8 } else { 0u8 };
+    let abs_val = val.abs();
+
+    if abs_val == 0.0 {
+        return sign << 7; // signed zero
+    }
+
+    // Clamp to FP8 E4M3 range
+    let abs_val = abs_val.min(FP8_E4M3_MAX);
+
+    // Minimum subnormal: 2^(-6) * (1/8) = 2^-9
+    let min_subnormal = 2.0f32.powi(-9);
+    if abs_val < min_subnormal {
+        return sign << 7; // flush to zero
+    }
+
+    let bits = abs_val.to_bits();
+    let f32_exp = ((bits >> 23) & 0xFF) as i32 - 127; // unbiased exponent
+    let f32_mant = bits & 0x7FFFFF; // 23-bit mantissa
+
+    // Check if subnormal in FP8 (exp < -6 after bias)
+    if f32_exp < -6 {
+        // Subnormal FP8: value = 2^(-6) * (mantissa / 8)
+        // mantissa bits represent 0.xxx in binary
+        let shift = (-6 - f32_exp) as u32;
+        // The implicit 1.mantissa in f32 becomes 0.001... in fp8 subnormal
+        let full_mant = (1u32 << 3) | ((f32_mant >> 20) & 0x7);
+        let mant = if shift < 4 {
+            (full_mant >> shift) & 0x7
+        } else {
+            0
+        };
+        if mant == 0 {
+            return sign << 7;
+        }
+        return (sign << 7) | (mant as u8);
+    }
+
+    // Normal FP8 value
+    let biased_exp = (f32_exp + 7) as u8;
+    if biased_exp >= 15 {
+        // Overflow: clamp to max value (no inf in E4M3)
+        return (sign << 7) | 0x7E; // max normal: exp=14, mant=7 -> 240
+    }
+
+    // Round mantissa from 23 bits to 3 bits (round to nearest even)
+    let mant = ((f32_mant >> 20) & 0x7) as u8;
+    let round_bit = (f32_mant >> 19) & 1;
+    let sticky = f32_mant & 0x7FFFF;
+
+    let mant = if round_bit == 1 && (sticky != 0 || (mant & 1) != 0) {
+        mant + 1
+    } else {
+        mant
+    };
+
+    // Handle mantissa overflow from rounding
+    if mant >= 8 {
+        let new_exp = biased_exp + 1;
+        if new_exp >= 15 {
+            return (sign << 7) | 0x7E; // clamp to max
+        }
+        return (sign << 7) | (new_exp << 3);
+    }
+
+    (sign << 7) | (biased_exp << 3) | mant
+}
+
+/// Convert an FP8 E4M3 value (as u8) back to f32.
+#[inline]
+fn fp8_e4m3_to_f32(val: u8) -> f32 {
+    let sign = (val >> 7) & 1;
+    let exp = (val >> 3) & 0xF;
+    let mant = val & 0x7;
+
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN; // 0x7F or 0xFF = NaN
+    }
+
+    let abs_val = if exp == 0 {
+        if mant == 0 {
+            0.0f32
+        } else {
+            // Subnormal: 2^(-6) * (mant / 8)
+            2.0f32.powi(-6) * (mant as f32 / 8.0)
+        }
+    } else {
+        // Normal: 2^(exp - 7) * (1 + mant/8)
+        2.0f32.powi(exp as i32 - 7) * (1.0 + mant as f32 / 8.0)
+    };
+
+    if sign == 1 {
+        -abs_val
+    } else {
+        abs_val
+    }
+}
+
+/// Quantize a KV tensor to FP8 E4M3 with per-head scaling factors.
+///
+/// Input: `[total_tokens, num_heads, head_size]` in F16 or F32
+/// Returns: `(fp8_data, scales)` where:
+///   - `fp8_data`: `[total_tokens, num_heads, head_size]` as U8 (FP8 E4M3 encoded)
+///   - `scales`: `[total_tokens, num_heads]` as F32 (one scale factor per head per token)
+///
+/// The scale maps the head's value range to the FP8 representable range.
+/// To dequantize: `value_f32 = fp8_to_f32(fp8_data) * scale`
+pub fn quantize_kv_to_fp8(kv: &Tensor) -> Result<(Tensor, Tensor)> {
+    let dims = kv.dims();
+    if dims.len() != 3 {
+        return Err(candle_core::Error::Msg(format!(
+            "quantize_kv_to_fp8: expected 3D tensor [tokens, heads, head_size], got {:?}",
+            dims
+        )));
+    }
+    let (num_tokens, num_heads, head_size) = (dims[0], dims[1], dims[2]);
+
+    // Convert to F32 for quantization
+    let kv_f32 = kv.to_dtype(DType::F32)?;
+    let kv_data: Vec<f32> = kv_f32.flatten_all()?.to_vec1()?;
+
+    let mut fp8_data = vec![0u8; num_tokens * num_heads * head_size];
+    let mut scales = vec![0.0f32; num_tokens * num_heads];
+
+    for t in 0..num_tokens {
+        for h in 0..num_heads {
+            let head_offset = (t * num_heads + h) * head_size;
+            let head_slice = &kv_data[head_offset..head_offset + head_size];
+
+            // Compute per-head absmax
+            let absmax = head_slice.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+
+            // Scale: maps absmax to FP8_E4M3_MAX
+            let scale = if absmax > 0.0 {
+                absmax / FP8_E4M3_MAX
+            } else {
+                1.0
+            };
+            let inv_scale = 1.0 / scale;
+
+            scales[t * num_heads + h] = scale;
+
+            // Quantize each element
+            for d in 0..head_size {
+                let scaled_val = head_slice[d] * inv_scale;
+                fp8_data[head_offset + d] = f32_to_fp8_e4m3(scaled_val);
+            }
+        }
+    }
+
+    let fp8_tensor = Tensor::from_vec(fp8_data, (num_tokens, num_heads, head_size), kv.device())?;
+    let scale_tensor = Tensor::from_vec(scales, (num_tokens, num_heads), kv.device())?;
+
+    Ok((fp8_tensor, scale_tensor))
+}
+
+/// Dequantize FP8 E4M3 KV data back to the target compute dtype.
+///
+/// Input:
+///   - `fp8_data`: `[total_tokens, num_heads, head_size]` as U8 (FP8 E4M3 encoded)
+///   - `scale`: `[total_tokens, num_heads]` as F32
+///   - `target_dtype`: the dtype to dequantize to (F16, BF16, or F32)
+///
+/// Returns: `[total_tokens, num_heads, head_size]` in `target_dtype`
+pub fn dequantize_fp8_kv(fp8_data: &Tensor, scale: &Tensor, target_dtype: DType) -> Result<Tensor> {
+    let dims = fp8_data.dims();
+    if dims.len() != 3 {
+        return Err(candle_core::Error::Msg(format!(
+            "dequantize_fp8_kv: expected 3D tensor [tokens, heads, head_size], got {:?}",
+            dims
+        )));
+    }
+    let (num_tokens, num_heads, head_size) = (dims[0], dims[1], dims[2]);
+
+    let fp8_bytes: Vec<u8> = fp8_data.flatten_all()?.to_vec1()?;
+    let scale_data: Vec<f32> = scale.flatten_all()?.to_vec1()?;
+
+    let mut output = vec![0.0f32; num_tokens * num_heads * head_size];
+
+    for t in 0..num_tokens {
+        for h in 0..num_heads {
+            let head_offset = (t * num_heads + h) * head_size;
+            let s = scale_data[t * num_heads + h];
+
+            for d in 0..head_size {
+                let fp8_val = fp8_bytes[head_offset + d];
+                output[head_offset + d] = fp8_e4m3_to_f32(fp8_val) * s;
+            }
+        }
+    }
+
+    let result = Tensor::from_vec(output, (num_tokens, num_heads, head_size), fp8_data.device())?;
+    result.to_dtype(target_dtype)
+}
+
+/// Compute the memory overhead ratio for FP8 scale storage.
+///
+/// For each block of `block_size` tokens with `num_kv_heads` heads,
+/// we store `block_size * num_kv_heads` f32 scale factors (4 bytes each)
+/// in addition to the FP8 data (1 byte per element).
+///
+/// Returns the effective bytes per element including scale overhead.
+pub fn fp8_effective_bytes_per_element(num_kv_heads: usize, head_size: usize, block_size: usize) -> f64 {
+    let data_bytes = num_kv_heads * head_size * block_size; // 1 byte each
+    let scale_bytes = num_kv_heads * block_size * 4; // f32 scales
+    (data_bytes + scale_bytes) as f64 / (num_kv_heads * head_size * block_size) as f64
 }
 
 #[cfg(test)]
@@ -565,6 +805,46 @@ mod tests {
     }
 
     #[test]
+    fn test_different_cache_salt_produces_different_hashes() {
+        // Two sequences with same tokens but different cache_salt should get different block hashes
+        let tokens = &[1u32, 2, 3, 4, 5];
+        let hash_a = BlockHash::from_tokens_salted(tokens, None, Some("tenant-a"));
+        let hash_b = BlockHash::from_tokens_salted(tokens, None, Some("tenant-b"));
+        let hash_none = BlockHash::from_tokens_salted(tokens, None, None);
+        let hash_old = BlockHash::from_tokens(tokens, None);
+
+        assert_ne!(hash_a, hash_b, "different salts must produce different hashes");
+        assert_ne!(hash_a, hash_none, "salted must differ from unsalted");
+        assert_eq!(hash_none, hash_old, "salt=None must match legacy from_tokens");
+    }
+
+    #[test]
+    fn test_salted_prefix_cache_isolation() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config);
+
+        // Sequence 1: tenant-a caches blocks
+        let mut seq1 = SequenceBlocks::new();
+        mgr.allocate_slots(&mut seq1, 32, None).unwrap();
+        let hash0_a = BlockHash::from_tokens_salted(&[1, 2, 3], None, Some("tenant-a"));
+        let hash1_a = BlockHash::from_tokens_salted(&[4, 5, 6], Some(hash0_a), Some("tenant-a"));
+        mgr.cache_block(seq1.block_ids[0], hash0_a, 16);
+        mgr.cache_block(seq1.block_ids[1], hash1_a, 16);
+        mgr.free(&mut seq1);
+
+        // Sequence 2: tenant-b looks up with different salt -- should miss
+        let hash0_b = BlockHash::from_tokens_salted(&[1, 2, 3], None, Some("tenant-b"));
+        let (hit_blocks, _) = mgr.get_computed_blocks(&[hash0_b]);
+        assert!(hit_blocks.is_empty(), "different salt must not find cached blocks");
+
+        // Sequence 3: tenant-a looks up with same salt -- should hit
+        let hash0_a2 = BlockHash::from_tokens_salted(&[1, 2, 3], None, Some("tenant-a"));
+        let (hit_blocks, num_tokens) = mgr.get_computed_blocks(&[hash0_a2]);
+        assert_eq!(hit_blocks.len(), 1, "same salt should find cached blocks");
+        assert_eq!(num_tokens, 16);
+    }
+
+    #[test]
     fn test_prefix_cache_hit_rate_through_manager() {
         let config = test_config();
         let mut mgr = KVCacheManager::new(&config);
@@ -591,5 +871,176 @@ mod tests {
         assert!(blocks.is_empty());
         assert_eq!(mgr.prefix_cache_misses(), 1);
         assert_eq!(mgr.prefix_cache_hit_rate(), 0.5);
+    }
+
+    // ── FP8 E4M3 quantization tests ──────────────────────────────────────
+
+    #[test]
+    fn test_fp8_e4m3_roundtrip_basic() {
+        // Test that basic values survive roundtrip through FP8
+        let test_cases: &[(f32, f32)] = &[
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (-1.0, -1.0),
+            (0.5, 0.5),
+            (2.0, 2.0),
+            (240.0, 240.0),  // max value
+            (-240.0, -240.0),
+        ];
+        for &(input, expected) in test_cases {
+            let fp8 = super::f32_to_fp8_e4m3(input);
+            let output = super::fp8_e4m3_to_f32(fp8);
+            assert!(
+                (output - expected).abs() < 0.01,
+                "roundtrip failed for {input}: got {output}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fp8_e4m3_nan() {
+        let fp8 = super::f32_to_fp8_e4m3(f32::NAN);
+        assert_eq!(fp8, 0x7F);
+        assert!(super::fp8_e4m3_to_f32(0x7F).is_nan());
+    }
+
+    #[test]
+    fn test_fp8_e4m3_clamps_overflow() {
+        // Values beyond 240 should clamp
+        let fp8 = super::f32_to_fp8_e4m3(500.0);
+        let result = super::fp8_e4m3_to_f32(fp8);
+        assert!((result - 240.0).abs() < 1.0, "expected ~240, got {result}");
+    }
+
+    #[test]
+    fn test_fp8_e4m3_small_values() {
+        // Very small values should either survive as subnormals or flush to zero
+        let tiny = 0.001;
+        let fp8 = super::f32_to_fp8_e4m3(tiny);
+        let result = super::fp8_e4m3_to_f32(fp8);
+        // Should be close-ish (FP8 subnormals have limited precision)
+        assert!(result.abs() < 0.01, "expected near zero, got {result}");
+    }
+
+    #[test]
+    fn test_quantize_dequantize_kv_roundtrip() {
+        let num_tokens = 4;
+        let num_heads = 8;
+        let head_size = 16;
+        let device = Device::Cpu;
+
+        // Create a random KV tensor with values in a reasonable range
+        let kv = Tensor::randn(
+            0f32,
+            1.0,
+            (num_tokens, num_heads, head_size),
+            &device,
+        )
+        .unwrap();
+
+        let (fp8_data, scales) = super::quantize_kv_to_fp8(&kv).unwrap();
+
+        // Check shapes
+        assert_eq!(fp8_data.dims(), &[num_tokens, num_heads, head_size]);
+        assert_eq!(fp8_data.dtype(), DType::U8);
+        assert_eq!(scales.dims(), &[num_tokens, num_heads]);
+        assert_eq!(scales.dtype(), DType::F32);
+
+        // Dequantize back to F32
+        let restored = super::dequantize_fp8_kv(&fp8_data, &scales, DType::F32).unwrap();
+        assert_eq!(restored.dims(), &[num_tokens, num_heads, head_size]);
+
+        // Check that values are close (FP8 has ~0.1% relative error for normal range)
+        let orig: Vec<f32> = kv.flatten_all().unwrap().to_vec1().unwrap();
+        let rest: Vec<f32> = restored.flatten_all().unwrap().to_vec1().unwrap();
+
+        let mut max_rel_err = 0.0f32;
+        for (o, r) in orig.iter().zip(rest.iter()) {
+            if o.abs() > 0.01 {
+                let rel_err = (o - r).abs() / o.abs();
+                max_rel_err = max_rel_err.max(rel_err);
+            }
+        }
+        // FP8 E4M3 has 3 mantissa bits = ~12.5% relative precision,
+        // but with per-head scaling it should be much better
+        assert!(
+            max_rel_err < 0.15,
+            "FP8 roundtrip max relative error too high: {max_rel_err}"
+        );
+    }
+
+    #[test]
+    fn test_quantize_dequantize_kv_to_f16() {
+        let device = Device::Cpu;
+        let kv = Tensor::randn(0f32, 1.0, (2, 4, 8), &device).unwrap();
+
+        let (fp8_data, scales) = super::quantize_kv_to_fp8(&kv).unwrap();
+        let restored = super::dequantize_fp8_kv(&fp8_data, &scales, DType::F16).unwrap();
+
+        assert_eq!(restored.dtype(), DType::F16);
+        assert_eq!(restored.dims(), &[2, 4, 8]);
+    }
+
+    #[test]
+    fn test_fp8_memory_savings_vs_fp16() {
+        // FP8 should use half the memory of FP16 for the data portion
+        let num_kv_heads = 8;
+        let head_size = 128;
+        let block_size = 16;
+
+        let fp16_bytes_per_block = 2 * num_kv_heads * head_size * block_size * 2; // 2 bytes (FP16) * 2 (K+V)
+        let fp8_bytes_per_block = 2 * num_kv_heads * head_size * block_size * 1; // 1 byte (FP8) * 2 (K+V)
+        let fp8_scale_overhead = 2 * num_kv_heads * block_size * 4; // f32 scales for K and V
+
+        let total_fp8 = fp8_bytes_per_block + fp8_scale_overhead;
+        let ratio = total_fp8 as f64 / fp16_bytes_per_block as f64;
+
+        // FP8 should be significantly smaller even with scale overhead
+        // For head_size=128: overhead = 4/128 = 3.125%, so ratio ~ 0.53
+        assert!(
+            ratio < 0.6,
+            "FP8 should use <60% of FP16 memory, got {:.1}%",
+            ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_fp8_effective_bytes_per_element() {
+        let eff = super::fp8_effective_bytes_per_element(8, 128, 16);
+        // 1 byte data + 4/128 bytes scale per element = 1.03125
+        let expected = 1.0 + 4.0 / 128.0;
+        assert!(
+            (eff - expected).abs() < 0.001,
+            "expected {expected}, got {eff}"
+        );
+    }
+
+    #[test]
+    fn test_fp8_block_size_calculation() {
+        // Verify that KVCacheConfig with FP8 dtype_bytes=1 gives correct memory
+        let config_fp16 = KVCacheConfig {
+            dtype_bytes: 2,
+            ..test_config()
+        };
+        let config_fp8 = KVCacheConfig {
+            dtype_bytes: 1,
+            ..test_config()
+        };
+
+        let mem_fp16 = config_fp16.total_memory_bytes();
+        let mem_fp8 = config_fp8.total_memory_bytes();
+
+        // FP8 data should be exactly half of FP16 (not counting scale overhead)
+        assert_eq!(mem_fp8 * 2, mem_fp16);
+    }
+
+    #[test]
+    fn test_fp8_blocks_for_memory_double_capacity() {
+        // With FP8 (1 byte) vs FP16 (2 bytes), we should get 2x the blocks
+        let memory = 1024 * 1024 * 1024; // 1 GB
+        let blocks_fp16 = KVCacheConfig::blocks_for_memory(memory, 16, 8, 128, 32, 2);
+        let blocks_fp8 = KVCacheConfig::blocks_for_memory(memory, 16, 8, 128, 32, 1);
+
+        assert_eq!(blocks_fp8, blocks_fp16 * 2);
     }
 }

@@ -13,19 +13,24 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
+
+use super::block::BlockHash;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendDevice;
 use tokenizers::Tokenizer;
 
+use super::arena::{TensorArena, TensorBufferPool};
+use super::guided::{self, GuidedState, IndexCache};
 use super::kernels::{KernelBackend, BLOCK_SIZE};
 use super::kv_cache::KVCacheConfig;
 use super::models::{ForwardContext, ModelRunner};
 use super::scheduler::{Scheduler, SchedulerConfig, SchedulerOutput};
 use super::sequence::{FinishReason, SamplingParams, SeqId};
 use super::speculative::{self, SpeculativeState};
+use super::tokenizer_cache::CachedTokenizer;
 
 // ─── Public types ────────────────────────────────────────────────────────
 
@@ -58,6 +63,9 @@ pub struct ServingEngineConfig {
     pub max_num_seqs: usize,
     /// Maximum tokens per scheduling step.
     pub max_num_batched_tokens: usize,
+    /// Tokens per KV cache block. Must be a power of 2 between 8 and 64.
+    /// Default: 16.
+    pub block_size: usize,
     /// Number of KV cache blocks to allocate.
     ///
     /// If `None`, the engine will automatically calculate the optimal number
@@ -92,6 +100,20 @@ pub struct ServingEngineConfig {
     /// When set, overrides the model's default (useful for models that support
     /// longer contexts via RoPE scaling).
     pub max_model_len: Option<usize>,
+    /// Enable LoRA adapter serving.
+    pub enable_lora: bool,
+    /// Maximum number of LoRA adapters to keep in GPU memory simultaneously.
+    /// Least-recently-used adapters are evicted when this limit is reached.
+    pub max_loras: usize,
+    /// Pre-registered LoRA adapter modules: `(name, path)` pairs.
+    /// These are loaded lazily on first request for the adapter.
+    pub lora_modules: Vec<(String, String)>,
+    /// Number of GPUs for tensor parallelism. Default: 1 (no TP).
+    /// When > 1, model weights are sharded across GPUs using NCCL.
+    pub tensor_parallel_size: usize,
+    /// Number of pipeline parallel stages. Default: 1 (disabled).
+    /// When > 1, model layers are partitioned across stages for pipeline parallelism.
+    pub pipeline_parallel_stages: usize,
 }
 
 impl Default for ServingEngineConfig {
@@ -99,6 +121,7 @@ impl Default for ServingEngineConfig {
         Self {
             max_num_seqs: 64,
             max_num_batched_tokens: 2048,
+            block_size: 16,
             num_kv_cache_blocks: None,
             enable_prefix_cache: true,
             gpu_memory_utilization: 0.90,
@@ -109,6 +132,11 @@ impl Default for ServingEngineConfig {
             quantization: super::quantization::QuantizationMethod::None,
             kv_cache_dtype: super::quantization::KVCacheDType::Auto,
             max_model_len: None,
+            enable_lora: false,
+            max_loras: 4,
+            lora_modules: Vec::new(),
+            tensor_parallel_size: 1,
+            pipeline_parallel_stages: 1,
         }
     }
 }
@@ -144,7 +172,7 @@ impl std::error::Error for EngineError {}
 /// by cloning or wrapping in `Arc`.
 pub struct EngineHandle {
     request_tx: std::sync::mpsc::Sender<EngineRequest>,
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<CachedTokenizer>,
     eos_token_id: u32,
     shutdown: Arc<AtomicBool>,
     /// Number of in-flight requests (for queue depth / load shedding).
@@ -159,6 +187,13 @@ pub struct EngineHandle {
     prefix_cache_hit_rate_bps: Arc<std::sync::atomic::AtomicU64>,
     /// Number of sequences waiting in the scheduler queue.
     num_waiting: Arc<std::sync::atomic::AtomicUsize>,
+    /// Snapshot of active block content hashes, updated by the engine loop
+    /// after each scheduling step. Used for cache-aware routing.
+    block_hash_snapshot: Arc<Mutex<Vec<BlockHash>>>,
+    /// Token embedding table from the model, used for mean-pooled embeddings.
+    /// Cloned from the model before it is moved into the engine thread.
+    /// Shape: `[vocab_size, hidden_size]`. `None` if the model does not expose one.
+    embed_table: Option<Tensor>,
 }
 
 impl Clone for EngineHandle {
@@ -174,6 +209,8 @@ impl Clone for EngineHandle {
             kv_blocks_total: self.kv_blocks_total.clone(),
             prefix_cache_hit_rate_bps: self.prefix_cache_hit_rate_bps.clone(),
             num_waiting: self.num_waiting.clone(),
+            block_hash_snapshot: self.block_hash_snapshot.clone(),
+            embed_table: self.embed_table.clone(),
         }
     }
 }
@@ -220,6 +257,10 @@ impl EngineHandle {
         config: ServingEngineConfig,
         speculative: Option<SpeculativeState>,
     ) -> CandleResult<Self> {
+        // Extract the embedding table before the model is moved into the
+        // engine thread. Tensor clone is O(1) via Arc<Storage>.
+        let embed_table = model.embedding_table().cloned();
+
         let mut model_config = model.config().clone();
 
         // Apply max_model_len override if specified
@@ -232,15 +273,22 @@ impl EngineHandle {
             model_config.max_seq_len = max_len;
         }
 
-        // KV cache dtype: resolve from config (Auto → F32, or user-specified F16/BF16).
+        // KV cache dtype: resolve from config (Auto → F32, or user-specified F16/BF16/FP8).
         let kv_dtype = config.kv_cache_dtype.resolve(DType::F32);
         let kv_dtype_bytes = kv_dtype.size_in_bytes();
+        let is_fp8_kv = config.kv_cache_dtype == super::quantization::KVCacheDType::Fp8E4M3;
         if kv_dtype != DType::F32 {
-            tracing::info!(
-                "KV cache dtype: {:?} ({kv_dtype_bytes} bytes/element, {:.0}% of F32)",
-                kv_dtype,
-                kv_dtype_bytes as f64 / 4.0 * 100.0,
-            );
+            if is_fp8_kv {
+                tracing::info!(
+                    "KV cache dtype: FP8 E4M3 (1 byte/element + per-head scales, 25% of F32 memory)",
+                );
+            } else {
+                tracing::info!(
+                    "KV cache dtype: {:?} ({kv_dtype_bytes} bytes/element, {:.0}% of F32)",
+                    kv_dtype,
+                    kv_dtype_bytes as f64 / 4.0 * 100.0,
+                );
+            }
         }
 
         // Determine number of KV cache blocks
@@ -276,6 +324,7 @@ impl EngineHandle {
             num_blocks,
             model_config.num_kv_heads,
             model_config.head_size,
+            config.block_size,
             kv_dtype,
             &device,
         )?;
@@ -283,13 +332,13 @@ impl EngineHandle {
         tracing::info!(
             "Allocated {} KV cache blocks ({} tokens capacity, {} layers)",
             num_blocks,
-            num_blocks * BLOCK_SIZE,
+            num_blocks * config.block_size,
             model_config.num_layers,
         );
 
         // Create scheduler
         let kv_cache_config = KVCacheConfig {
-            block_size: BLOCK_SIZE,
+            block_size: config.block_size,
             num_blocks,
             num_kv_heads: model_config.num_kv_heads,
             head_size: model_config.head_size,
@@ -313,6 +362,7 @@ impl EngineHandle {
         let kv_blocks_total = Arc::new(std::sync::atomic::AtomicUsize::new(num_blocks));
         let prefix_cache_hit_rate_bps = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let num_waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let block_hash_snapshot: Arc<Mutex<Vec<BlockHash>>> = Arc::new(Mutex::new(Vec::new()));
 
         if speculative.is_some() {
             tracing::info!("Speculative decoding enabled");
@@ -328,7 +378,7 @@ impl EngineHandle {
             max_seq_len_for_capture: 4096,
             warmup_batch_sizes: Vec::new(),
         };
-        let max_blocks_per_seq = (graph_config.max_seq_len_for_capture + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let max_blocks_per_seq = (graph_config.max_seq_len_for_capture + config.block_size - 1) / config.block_size;
         let mut cuda_graph_cache = super::cuda_graphs::CudaGraphCache::new(
             graph_config,
             device.clone(),
@@ -340,6 +390,36 @@ impl EngineHandle {
         if let Err(e) = cuda_graph_cache.prepare_warmup() {
             tracing::warn!("CUDA graph buffer allocation failed: {e}");
         }
+
+        // Initialize arena and buffer pool for zero-allocation batch building.
+        // Arena capacity: 5 arrays of u32 (input_ids, positions, slot_mapping,
+        // context_lens, block_table_flat) at max batch size, plus alignment padding.
+        let arena_capacity = config.max_num_batched_tokens * std::mem::size_of::<u32>() * 5
+            + config.max_num_seqs * max_blocks_per_seq * std::mem::size_of::<u32>()
+            + 4096; // padding for alignment
+        let arena = TensorArena::new(arena_capacity);
+
+        // Buffer pool: pre-allocate tensors for batch input shapes (2 copies for double-buffering)
+        let shape_batched = [config.max_num_batched_tokens];
+        let shape_seqs = [config.max_num_seqs];
+        let pool_specs: Vec<(&[usize], DType, usize)> = vec![
+            (&shape_batched, DType::U32, 2),  // input_ids, positions
+            (&shape_batched, DType::U32, 2),  // slot_mapping
+            (&shape_seqs, DType::U32, 2),     // context_lens
+        ];
+        let buffer_pool = TensorBufferPool::new(&pool_specs, &device)?;
+
+        // Build vocabulary for guided decoding (graceful degradation on failure)
+        let index_cache = match guided::build_vocabulary(&tokenizer, eos_token_id) {
+            Ok(vocab) => {
+                tracing::info!("Guided decoding vocabulary built ({} tokens)", vocab.len());
+                Some(IndexCache::new(vocab))
+            }
+            Err(e) => {
+                tracing::warn!("Guided decoding unavailable: vocabulary build failed: {e}");
+                None
+            }
+        };
 
         // Spawn engine loop in a dedicated thread
         let mut engine = ServingEngineInner {
@@ -357,6 +437,11 @@ impl EngineHandle {
             num_waiting: num_waiting.clone(),
             prefix_cache_hit_rate_bps: prefix_cache_hit_rate_bps.clone(),
             cuda_graph_cache,
+            arena,
+            buffer_pool,
+            guided_states: HashMap::new(),
+            index_cache,
+            block_hash_snapshot: block_hash_snapshot.clone(),
         };
 
         std::thread::Builder::new()
@@ -368,7 +453,7 @@ impl EngineHandle {
 
         Ok(Self {
             request_tx,
-            tokenizer: Arc::new(tokenizer),
+            tokenizer: Arc::new(CachedTokenizer::new(tokenizer, 2048)),
             eos_token_id,
             shutdown,
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -377,6 +462,8 @@ impl EngineHandle {
             kv_blocks_total,
             prefix_cache_hit_rate_bps,
             num_waiting,
+            block_hash_snapshot,
+            embed_table,
         })
     }
 
@@ -416,8 +503,13 @@ impl EngineHandle {
         self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// Get a reference to the shared tokenizer.
+    /// Get a reference to the underlying tokenizer (for direct access when needed).
     pub fn tokenizer(&self) -> &Tokenizer {
+        self.tokenizer.tokenizer()
+    }
+
+    /// Get a reference to the cached tokenizer wrapper.
+    pub fn cached_tokenizer(&self) -> &CachedTokenizer {
         &self.tokenizer
     }
 
@@ -426,13 +518,18 @@ impl EngineHandle {
         self.eos_token_id
     }
 
-    /// Encode a text string into token IDs.
+    /// Encode a text string into token IDs (cached).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, EngineError> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|_| EngineError::Shutdown)?;
-        Ok(encoding.get_ids().to_vec())
+        self.tokenizer
+            .encode(text)
+            .map_err(|_| EngineError::Shutdown)
+    }
+
+    /// Encode multiple strings in parallel (cached, uses Rayon thread pool).
+    pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>, EngineError> {
+        self.tokenizer
+            .encode_batch(texts)
+            .map_err(|_| EngineError::Shutdown)
     }
 
     /// Decode token IDs into a text string.
@@ -471,9 +568,129 @@ impl EngineHandle {
         self.num_waiting.load(Ordering::Relaxed)
     }
 
+    /// Return a snapshot of the active block content hashes.
+    ///
+    /// The engine loop updates this snapshot after each scheduling step.
+    /// External cache-aware load balancers can compare a request's prefix
+    /// hashes against each worker's active hashes to route to the worker
+    /// with the best prefix match.
+    pub fn block_hashes(&self) -> Vec<BlockHash> {
+        self.block_hash_snapshot.lock().unwrap().clone()
+    }
+
     /// Signal the engine loop to shut down gracefully.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Compute embeddings for the given texts.
+    ///
+    /// Tokenizes each input string and returns a fixed-dimension embedding vector
+    /// per input. When the model exposes an embedding table, this performs a
+    /// real embedding lookup (index_select) followed by mean-pooling across the
+    /// token dimension, producing `hidden_size`-dimensional vectors that carry
+    /// genuine semantic information from the model's learned representations.
+    ///
+    /// Falls back to a hash-based deterministic stub if no embedding table is
+    /// available (e.g. if the ModelRunner does not implement `embedding_table()`).
+    ///
+    /// Returns: one `Vec<f32>` per input text, plus token counts.
+    pub fn embed(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, Vec<u32>), EngineError> {
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let token_ids_batch = self.encode_batch(&text_refs)?;
+
+        let mut embeddings = Vec::with_capacity(texts.len());
+        let mut token_counts = Vec::with_capacity(texts.len());
+
+        for token_ids in &token_ids_batch {
+            token_counts.push(token_ids.len() as u32);
+
+            let emb = if let Some(ref table) = self.embed_table {
+                // Real embedding: look up token vectors from the model's
+                // learned embedding table and mean-pool across the sequence.
+                Self::embed_with_table(table, token_ids)
+            } else {
+                // Fallback: hash-based deterministic embedding.
+                Self::embed_hash_fallback(token_ids)
+            };
+            embeddings.push(emb);
+        }
+
+        Ok((embeddings, token_counts))
+    }
+
+    /// Produce an embedding by looking up token vectors in the model's
+    /// embedding table and mean-pooling across the sequence dimension.
+    /// Returns a Vec<f32> of length `hidden_size`.
+    fn embed_with_table(table: &Tensor, token_ids: &[u32]) -> Vec<f32> {
+        // Build a 1-D tensor of token IDs on CPU (embeddings don't need GPU).
+        let ids = match Tensor::new(token_ids, &candle_core::Device::Cpu) {
+            Ok(t) => t,
+            Err(_) => return Self::embed_hash_fallback(token_ids),
+        };
+
+        // Move embedding table to CPU if needed (tensor clone is cheap,
+        // and to_device is a no-op when already on CPU).
+        let cpu_table = match table.to_device(&candle_core::Device::Cpu) {
+            Ok(t) => t,
+            Err(_) => return Self::embed_hash_fallback(token_ids),
+        };
+
+        // index_select: [num_tokens] -> [num_tokens, hidden_size]
+        let selected = match cpu_table.index_select(&ids, 0) {
+            Ok(t) => t,
+            Err(_) => return Self::embed_hash_fallback(token_ids),
+        };
+
+        // Mean-pool across dim 0: [num_tokens, hidden_size] -> [hidden_size]
+        let pooled = match selected.mean(0) {
+            Ok(t) => t,
+            Err(_) => return Self::embed_hash_fallback(token_ids),
+        };
+
+        // Convert to f32 vec
+        let flat: Vec<f32> = match pooled.to_dtype(DType::F32).and_then(|t| t.to_vec1()) {
+            Ok(v) => v,
+            Err(_) => return Self::embed_hash_fallback(token_ids),
+        };
+
+        // L2 normalize
+        let norm: f32 = flat.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            flat.into_iter().map(|x| x / norm).collect()
+        } else {
+            flat
+        }
+    }
+
+    /// Hash-based deterministic fallback embedding (128-dim).
+    /// Uses FNV-style hashing of token IDs to produce a stable, input-dependent
+    /// vector that varies meaningfully with content (not just length).
+    fn embed_hash_fallback(token_ids: &[u32]) -> Vec<f32> {
+        let dim = 128;
+        let mut emb = vec![0.0f32; dim];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            // FNV-1a inspired mixing: spread each token across multiple dimensions
+            let mut h = 2166136261u32 ^ tid;
+            h = h.wrapping_mul(16777619);
+            h ^= i as u32;
+            h = h.wrapping_mul(16777619);
+            // Write to 4 dimensions per token for better coverage
+            for k in 0..4 {
+                let idx = (h.wrapping_add(k)) as usize % dim;
+                let sign = if (h >> (k + 1)) & 1 == 0 { 1.0 } else { -1.0 };
+                emb[idx] += sign;
+                h = h.wrapping_mul(16777619);
+            }
+        }
+        // L2 normalize
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for v in &mut emb {
+                *v /= norm;
+            }
+        }
+        emb
     }
 }
 
@@ -573,6 +790,17 @@ struct ServingEngineInner {
     prefix_cache_hit_rate_bps: Arc<std::sync::atomic::AtomicU64>,
     /// CUDA graph cache for decode step acceleration.
     cuda_graph_cache: super::cuda_graphs::CudaGraphCache,
+    /// Bump-pointer arena for CPU-side scratch memory during batch building.
+    arena: TensorArena,
+    /// Pre-allocated tensor pool for device-side tensor reuse.
+    buffer_pool: TensorBufferPool,
+    /// Per-sequence guided decoding state (DFA position tracking).
+    guided_states: HashMap<SeqId, GuidedState>,
+    /// Compiled Index cache for guided decoding (shared across sequences).
+    /// `None` if vocabulary construction failed at startup.
+    index_cache: Option<IndexCache>,
+    /// Shared snapshot of active block hashes (read by EngineHandle.block_hashes()).
+    block_hash_snapshot: Arc<Mutex<Vec<BlockHash>>>,
 }
 
 impl ServingEngineInner {
@@ -625,6 +853,10 @@ impl ServingEngineInner {
             let hit_rate_bps = (self.scheduler.prefix_cache_hit_rate() * 10000.0) as u64;
             self.prefix_cache_hit_rate_bps.store(hit_rate_bps, Ordering::Relaxed);
 
+            // Update block hash snapshot for cache-aware routing
+            let active_hashes = self.scheduler.active_block_hashes();
+            *self.block_hash_snapshot.lock().unwrap() = active_hashes;
+
             if output.is_empty() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
@@ -640,7 +872,14 @@ impl ServingEngineInner {
                 .scheduled
                 .iter()
                 .all(|s| !s.is_first_schedule);
-            let use_speculative = is_all_decode && self.speculative.is_some();
+            // Disable speculative decoding when any sequence has a guided
+            // constraint -- draft tokens would be generated without constraints,
+            // causing near-100% rejection rate.
+            let has_guided = output
+                .scheduled
+                .iter()
+                .any(|s| self.guided_states.contains_key(&s.seq_id));
+            let use_speculative = is_all_decode && self.speculative.is_some() && !has_guided;
 
             let step_result = if use_speculative {
                 self.run_speculative_step(&output)
@@ -670,6 +909,7 @@ impl ServingEngineInner {
                         });
                         // rs is dropped here → decrements in_flight counter
                     }
+                    self.guided_states.remove(&sched.seq_id);
                     if let Some(spec) = &mut self.speculative {
                         spec.remove_sequence(sched.seq_id);
                     }
@@ -689,6 +929,9 @@ impl ServingEngineInner {
 
     /// Add a single request to the scheduler.
     fn add_request(&mut self, req: EngineRequest) {
+        // Extract guided constraint before moving sampling_params into scheduler
+        let guided_constraint = req.sampling_params.guided_constraint.clone();
+
         let seq_id = self
             .scheduler
             .add_request(req.prompt_tokens, req.sampling_params);
@@ -696,6 +939,28 @@ impl ServingEngineInner {
             sender: req.token_sender,
             in_flight_counter: req.in_flight_counter,
         });
+
+        // Initialize guided decoding state if constraint is present
+        if let Some(constraint) = &guided_constraint {
+            if let Some(cache) = &self.index_cache {
+                match guided::create_guided_state(constraint, cache) {
+                    Ok(state) => {
+                        tracing::debug!("Sequence {seq_id}: guided decoding state initialized");
+                        self.guided_states.insert(seq_id, state);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Sequence {seq_id}: failed to create guided state: {e}; \
+                             proceeding without constraint"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Sequence {seq_id}: guided constraint requested but vocabulary unavailable"
+                );
+            }
+        }
 
         // Track sequence in speculative state if enabled
         if let Some(spec) = &mut self.speculative {
@@ -718,6 +983,7 @@ impl ServingEngineInner {
             tracing::debug!("Sequence {seq_id} cancelled (client disconnected)");
             self.scheduler.cancel_request(seq_id);
             self.token_senders.remove(&seq_id);
+            self.guided_states.remove(&seq_id);
         }
     }
 
@@ -726,6 +992,9 @@ impl ServingEngineInner {
         for &seq_id in &output.finished {
             self.token_senders.remove(&seq_id);
             self.scheduler.remove_finished(seq_id);
+
+            // Clean up guided decoding state
+            self.guided_states.remove(&seq_id);
 
             // Clean up draft blocks if speculative decoding is active
             if let Some(spec) = &mut self.speculative {
@@ -999,18 +1268,38 @@ impl ServingEngineInner {
     }
 
     /// Build batched input tensors from the scheduler output.
-    fn build_batch(&self, output: &SchedulerOutput) -> CandleResult<BatchInput> {
-        let mut all_input_ids: Vec<u32> = Vec::new();
-        let mut all_positions: Vec<u32> = Vec::new();
-        let mut all_slot_mapping: Vec<u32> = Vec::new();
-        let mut query_start_loc: Vec<usize> = vec![0];
-        let mut seq_lens: Vec<usize> = Vec::new();
-        let mut block_tables: Vec<Vec<u32>> = Vec::new();
-        let mut context_lens_vec: Vec<u32> = Vec::new();
+    ///
+    /// Uses the arena for CPU-side scratch memory (gathering token IDs,
+    /// positions, slot mappings) to avoid per-step Vec allocations.
+    fn build_batch(&mut self, output: &SchedulerOutput) -> CandleResult<BatchInput> {
+        // Reset arena at the start of each batch build
+        self.arena.reset();
+
+        // First pass: compute total tokens and sequence count for arena sizing
+        let total_tokens: usize = output.scheduled.iter().map(|s| s.num_tokens).sum();
+        let num_seqs = output.scheduled.len();
+
+        // Allocate a single contiguous slab for all u32 arrays from the arena.
+        // Layout: [input_ids: T] [positions: T] [slot_mapping: T] [context_lens: S]
+        // Single allocation avoids multiple &mut borrow conflicts.
+        let slab_len = total_tokens * 3 + num_seqs;
+        let slab = self.arena.allocate_slice::<u32>(slab_len)?;
+        let (arena_input_ids, rest) = slab.split_at_mut(total_tokens);
+        let (arena_positions, rest) = rest.split_at_mut(total_tokens);
+        let (arena_slot_mapping, arena_context_lens) = rest.split_at_mut(total_tokens);
+
+        // These small Vecs are hard to avoid (variable-length per-seq data)
+        let mut query_start_loc: Vec<usize> = Vec::with_capacity(num_seqs + 1);
+        query_start_loc.push(0);
+        let mut seq_lens: Vec<usize> = Vec::with_capacity(num_seqs);
+        let mut block_tables: Vec<Vec<u32>> = Vec::with_capacity(num_seqs);
         let mut max_context_len: usize = 0;
         let mut is_all_decode = true;
 
         let kv_cache = self.scheduler.kv_cache();
+
+        let mut token_offset = 0usize;
+        let mut seq_idx = 0usize;
 
         for sched in &output.scheduled {
             let seq = match self.scheduler.get_sequence(sched.seq_id) {
@@ -1025,16 +1314,22 @@ impl ServingEngineInner {
             let input_tokens = seq.get_input_tokens_owned(sched.num_tokens);
             let start_pos = seq.num_computed_tokens();
 
-            // Positions: [start_pos, start_pos+1, ..., start_pos+num_tokens-1]
-            let positions: Vec<u32> = (start_pos..start_pos + sched.num_tokens)
-                .map(|p| p as u32)
-                .collect();
+            // Copy input tokens into arena slice
+            arena_input_ids[token_offset..token_offset + sched.num_tokens]
+                .copy_from_slice(&input_tokens);
+
+            // Fill positions into arena slice
+            for i in 0..sched.num_tokens {
+                arena_positions[token_offset + i] = (start_pos + i) as u32;
+            }
 
             // Slot mapping: physical cache slot for each new token
             let slots = kv_cache.compute_slot_mapping(&seq.blocks, start_pos, sched.num_tokens);
-            let slots_u32: Vec<u32> = slots.iter().map(|&s| s as u32).collect();
+            for (i, &s) in slots.iter().enumerate() {
+                arena_slot_mapping[token_offset + i] = s as u32;
+            }
 
-            // Block table: logical block → physical block ID
+            // Block table: logical block -> physical block ID
             let table = kv_cache.block_table(&seq.blocks);
 
             // Context length = computed + new tokens
@@ -1046,32 +1341,49 @@ impl ServingEngineInner {
 
             max_context_len = max_context_len.max(ctx_len);
 
-            all_input_ids.extend_from_slice(&input_tokens);
-            all_positions.extend_from_slice(&positions);
-            all_slot_mapping.extend_from_slice(&slots_u32);
             query_start_loc.push(query_start_loc.last().unwrap() + sched.num_tokens);
             seq_lens.push(ctx_len);
-            context_lens_vec.push(ctx_len as u32);
+            arena_context_lens[seq_idx] = ctx_len as u32;
             block_tables.push(table);
+
+            token_offset += sched.num_tokens;
+            seq_idx += 1;
         }
 
         // Pad block tables to uniform width for the 2D tensor
         let max_blocks = block_tables.iter().map(|t| t.len()).max().unwrap_or(1);
-        let num_seqs = output.scheduled.len();
-        let mut flat_block_table: Vec<u32> = Vec::with_capacity(num_seqs * max_blocks);
+        // Use a Vec for the flat block table (size is data-dependent, can't pre-allocate in arena slab)
+        let flat_bt_len = num_seqs * max_blocks;
+        let mut flat_block_table = vec![0u32; flat_bt_len];
+        let mut bt_offset = 0;
         for table in &block_tables {
-            flat_block_table.extend_from_slice(table);
-            // Pad with zeros
-            flat_block_table.resize(flat_block_table.len() + max_blocks - table.len(), 0);
+            flat_block_table[bt_offset..bt_offset + table.len()]
+                .copy_from_slice(table);
+            bt_offset += max_blocks;
         }
 
-        // Create tensors on the model's device
-        let input_ids = Tensor::new(all_input_ids.as_slice(), &self.device)?;
-        let positions = Tensor::new(all_positions.as_slice(), &self.device)?;
-        let slot_mapping = Tensor::new(all_slot_mapping.as_slice(), &self.device)?;
-        let context_lens = Tensor::new(context_lens_vec.as_slice(), &self.device)?;
-        let block_table = Tensor::new(flat_block_table.as_slice(), &self.device)?
-            .reshape((num_seqs, max_blocks))?;
+        // Create tensors on the model's device from arena slices
+        let input_ids = Tensor::new(
+            &arena_input_ids[..token_offset],
+            &self.device,
+        )?;
+        let positions = Tensor::new(
+            &arena_positions[..token_offset],
+            &self.device,
+        )?;
+        let slot_mapping = Tensor::new(
+            &arena_slot_mapping[..token_offset],
+            &self.device,
+        )?;
+        let context_lens = Tensor::new(
+            &arena_context_lens[..seq_idx],
+            &self.device,
+        )?;
+        let block_table = Tensor::new(
+            &flat_block_table[..flat_bt_len],
+            &self.device,
+        )?
+        .reshape((num_seqs, max_blocks))?;
 
         Ok(BatchInput {
             input_ids,
@@ -1106,7 +1418,7 @@ impl ServingEngineInner {
             } else {
                 last_logits
             };
-            let logits_vec: Vec<f32> = last_logits.to_vec1()?;
+            let mut logits_vec: Vec<f32> = last_logits.to_vec1()?;
 
             // Get sampling params — skip sequence if it disappeared (e.g. cancelled)
             let params = match self.scheduler.get_sequence(sched.seq_id) {
@@ -1117,6 +1429,15 @@ impl ServingEngineInner {
                     continue;
                 }
             };
+
+            // Apply guided decoding mask if active for this sequence
+            if let Some(guided) = self.guided_states.get(&sched.seq_id) {
+                if let Some(allowed) = guided.allowed_tokens() {
+                    if !allowed.is_empty() {
+                        guided::apply_guided_mask(&mut logits_vec, &allowed);
+                    }
+                }
+            }
 
             // Sample token
             let token_id = sample_token(&logits_vec, &params);
@@ -1146,6 +1467,15 @@ impl ServingEngineInner {
             self.scheduler
                 .update_after_step(sched.seq_id, sched.num_tokens);
 
+            // Advance guided state after sampling and check for forced completion
+            let guided_complete = if let Some(guided) = self.guided_states.get_mut(&sched.seq_id) {
+                guided.advance(token_id);
+                // Force stop when DFA is in a final state with no more valid transitions
+                guided.is_complete() && !guided.has_valid_continuations()
+            } else {
+                false
+            };
+
             // Append token and check stop conditions
             let is_eos = token_id == self.eos_token_id;
             let seq = match self.scheduler.get_sequence_mut(sched.seq_id) {
@@ -1167,6 +1497,9 @@ impl ServingEngineInner {
                 } else {
                     FinishReason::Stop
                 })
+            } else if guided_complete {
+                // Guided decoding reached a terminal state -- force stop
+                Some(FinishReason::Stop)
             } else if reached_max {
                 Some(FinishReason::MaxTokens)
             } else {
@@ -1973,6 +2306,7 @@ fn allocate_kv_caches(
     num_blocks: usize,
     num_kv_heads: usize,
     head_size: usize,
+    block_size: usize,
     dtype: DType,
     device: &Device,
 ) -> CandleResult<Vec<(Tensor, Tensor)>> {
@@ -1981,12 +2315,12 @@ fn allocate_kv_caches(
 
     for _ in 0..num_layers {
         let key_cache = Tensor::zeros(
-            (num_blocks, num_kv_heads, head_size / x, BLOCK_SIZE, x),
+            (num_blocks, num_kv_heads, head_size / x, block_size, x),
             dtype,
             device,
         )?;
         let value_cache = Tensor::zeros(
-            (num_blocks, num_kv_heads, head_size, BLOCK_SIZE),
+            (num_blocks, num_kv_heads, head_size, block_size),
             dtype,
             device,
         )?;
@@ -2124,7 +2458,7 @@ mod tests {
 
     #[test]
     fn test_allocate_kv_caches_cpu() {
-        let caches = allocate_kv_caches(2, 4, 8, 128, DType::F32, &Device::Cpu).unwrap();
+        let caches = allocate_kv_caches(2, 4, 8, 128, BLOCK_SIZE, DType::F32, &Device::Cpu).unwrap();
         assert_eq!(caches.len(), 2);
 
         let x = 16 / DType::F32.size_in_bytes(); // x = 4
@@ -2135,7 +2469,7 @@ mod tests {
 
     #[test]
     fn test_allocate_kv_caches_shapes() {
-        let caches = allocate_kv_caches(1, 2, 4, 64, DType::F32, &Device::Cpu).unwrap();
+        let caches = allocate_kv_caches(1, 2, 4, 64, BLOCK_SIZE, DType::F32, &Device::Cpu).unwrap();
         let x = 16 / DType::F32.size_in_bytes(); // x = 4
         let (k, v) = &caches[0];
         assert_eq!(k.dims(), &[2, 4, 64 / x, BLOCK_SIZE, x]);
@@ -2169,7 +2503,7 @@ mod tests {
             is_all_decode: false,
         };
 
-        let kv_caches = allocate_kv_caches(1, 4, 8, 128, DType::F32, &device).unwrap();
+        let kv_caches = allocate_kv_caches(1, 4, 8, 128, BLOCK_SIZE, DType::F32, &device).unwrap();
         let backend = super::super::kernels::CpuBackend::new();
         let ctx = batch.forward_context(&kv_caches, &backend);
 
@@ -2205,7 +2539,7 @@ mod tests {
             is_all_decode: true,
         };
 
-        let kv_caches = allocate_kv_caches(1, 4, 8, 128, DType::F32, &device).unwrap();
+        let kv_caches = allocate_kv_caches(1, 4, 8, 128, BLOCK_SIZE, DType::F32, &device).unwrap();
         let backend = super::super::kernels::CpuBackend::new();
         let ctx = batch.forward_context(&kv_caches, &backend);
 
@@ -2285,6 +2619,12 @@ mod tests {
             }
             Tensor::new(logits.as_slice(), input_ids.device())?
                 .reshape((total_tokens, vocab_size))
+        }
+
+        fn clone_model(&self) -> Box<dyn ModelRunner> {
+            Box::new(MockModel {
+                config: self.config.clone(),
+            })
         }
 
         fn num_layers(&self) -> usize {
@@ -2406,6 +2746,7 @@ mod tests {
             adaptive: false,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let speculative = SpeculativeState::new(
@@ -2518,6 +2859,11 @@ mod tests {
                 Tensor::new(logits.as_slice(), input_ids.device())?
                     .reshape((total_tokens, vocab_size))
             }
+            fn clone_model(&self) -> Box<dyn ModelRunner> {
+                Box::new(DraftModel99 {
+                    config: self.config.clone(),
+                })
+            }
             fn num_layers(&self) -> usize {
                 self.config.num_layers
             }
@@ -2546,6 +2892,7 @@ mod tests {
             adaptive: false,
             min_draft_tokens: 1,
             max_draft_tokens: 8,
+            shared_kv_cache: false,
         };
 
         let speculative = SpeculativeState::new(

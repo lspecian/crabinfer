@@ -450,6 +450,17 @@ impl KernelBackend for CudaBackend {
         Ok((key_caches, value_caches))
     }
 
+    fn marlin_gemm(
+        &self,
+        input: &Tensor,
+        qweight_marlin: &Tensor,
+        scales: &Tensor,
+        qzeros: &Tensor,
+        group_size: usize,
+    ) -> Result<Tensor> {
+        self.marlin_gemm_impl(input, qweight_marlin, scales, qzeros, group_size)
+    }
+
     fn fused_silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         let total_elements = gate.elem_count();
         let output = Tensor::zeros(gate.shape(), gate.dtype(), gate.device())?;
@@ -734,6 +745,186 @@ impl KernelBackend for CudaBackend {
         }
 
         Ok((output, x_buf))
+    }
+
+    fn fused_layernorm_linear(
+        &self,
+        x: &Tensor,
+        norm_weight: &Tensor,
+        eps: f32,
+        linear_weight: &Tensor,
+    ) -> Result<Tensor> {
+        let dims = x.dims();
+        if dims.len() != 2 {
+            candle_core::bail!("fused_layernorm_linear: expected 2D input, got {:?}", dims);
+        }
+        let num_rows = dims[0];
+        let hidden_size = dims[1];
+
+        let lw_dims = linear_weight.dims();
+        if lw_dims.len() != 2 || lw_dims[1] != hidden_size {
+            candle_core::bail!(
+                "fused_layernorm_linear: linear_weight shape mismatch: {:?} vs hidden_size={}",
+                lw_dims,
+                hidden_size
+            );
+        }
+        let out_features = lw_dims[0];
+
+        // For large hidden_size or non-F16 weights, fall back to unfused path.
+        // The fused kernel targets the common case of moderate hidden_size.
+        if hidden_size > 256 * 4 || !matches!(x.dtype(), DType::F32 | DType::F16) {
+            let normed = candle_nn::ops::rms_norm(x, norm_weight, eps)?;
+            return normed.matmul(&linear_weight.t()?);
+        }
+
+        let output = Tensor::zeros(&[num_rows, out_features], x.dtype(), x.device())?;
+
+        let func_name = match x.dtype() {
+            DType::F32 => "fused_layernorm_linear_f32",
+            DType::F16 => "fused_layernorm_linear_f16",
+            d => candle_core::bail!("fused_layernorm_linear: unsupported dtype {d:?}"),
+        };
+
+        let func = self.get_func(func_name)?;
+
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_rows as u32, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+
+        // Norm weight must be F32 for the kernel
+        let weight_f32 = norm_weight.to_dtype(DType::F32)?;
+        // Linear weight must match x's dtype
+        let lw = linear_weight.to_dtype(x.dtype())?;
+
+        let (o_st, _) = output.storage_and_layout();
+        let (x_st, _) = x.storage_and_layout();
+        let (nw_st, _) = weight_f32.storage_and_layout();
+        let (lw_st, _) = lw.storage_and_layout();
+        let o_cuda = as_cuda(&o_st)?;
+        let x_cuda = as_cuda(&x_st)?;
+        let nw_cuda = as_cuda(&nw_st)?;
+        let lw_cuda = as_cuda(&lw_st)?;
+        let arg_hidden = hidden_size as i32;
+        let arg_out = out_features as i32;
+        let arg_eps = eps;
+
+        match x.dtype() {
+            DType::F32 => {
+                let mut builder = func.builder();
+                builder.arg(&o_cuda.as_cuda_slice::<f32>()?);
+                builder.arg(&x_cuda.as_cuda_slice::<f32>()?);
+                builder.arg(&nw_cuda.as_cuda_slice::<f32>()?);
+                builder.arg(&lw_cuda.as_cuda_slice::<f32>()?);
+                builder.arg(&arg_hidden);
+                builder.arg(&arg_out);
+                builder.arg(&arg_eps);
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f32 launch: {e}")))?;
+            }
+            DType::F16 => {
+                let mut builder = func.builder();
+                builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
+                builder.arg(&x_cuda.as_cuda_slice::<f16>()?);
+                builder.arg(&nw_cuda.as_cuda_slice::<f32>()?);
+                builder.arg(&lw_cuda.as_cuda_slice::<f16>()?);
+                builder.arg(&arg_hidden);
+                builder.arg(&arg_out);
+                builder.arg(&arg_eps);
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f16 launch: {e}")))?;
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(output)
+    }
+}
+
+// ─── Marlin fused dequant+GEMM via CUDA kernel ──────────────────────────────
+
+impl CudaBackend {
+    /// Fused INT4 dequant + GEMM using the Marlin-style CUDA kernel.
+    ///
+    /// Weights must be pre-reformatted into Marlin tile layout `[K/16, N/64, 128]`
+    /// via `GptqLinear::reformat_for_marlin()`.
+    fn marlin_gemm_impl(
+        &self,
+        input: &Tensor,
+        qweight_marlin: &Tensor,
+        scales: &Tensor,
+        qzeros: &Tensor,
+        group_size: usize,
+    ) -> Result<Tensor> {
+        let dims = input.dims();
+        let m = dims[0]; // batch size
+        let k = dims[1]; // in_features
+
+        // Infer N from qweight_marlin shape: [K/16, N/64, 128]
+        let qw_dims = qweight_marlin.dims();
+        let n = qw_dims[1] * 64; // out_features
+
+        let device = input.device().clone();
+
+        // Allocate output: [M, N] as F16
+        let output = Tensor::zeros((m, n), DType::F16, &device)?;
+
+        // Ensure input is F16
+        let input_f16 = if input.dtype() != DType::F16 {
+            input.to_dtype(DType::F16)?
+        } else {
+            input.contiguous()?
+        };
+
+        // Ensure scales are F16
+        let scales_f16 = if scales.dtype() != DType::F16 {
+            scales.to_dtype(DType::F16)?
+        } else {
+            scales.contiguous()?
+        };
+
+        let func = self.get_func("marlin_gemm_f16")?;
+
+        // Grid: (N/64, M, 1), Block: (256, 1, 1)
+        let cfg = LaunchConfig {
+            grid_dim: ((n / 64) as u32, m as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4, // float per thread for K-reduction
+        };
+
+        let (o_st, _) = output.storage_and_layout();
+        let (i_st, _) = input_f16.storage_and_layout();
+        let (qw_st, _) = qweight_marlin.storage_and_layout();
+        let (sc_st, _) = scales_f16.storage_and_layout();
+        let (qz_st, _) = qzeros.storage_and_layout();
+
+        let o_cuda = as_cuda(&o_st)?;
+        let i_cuda = as_cuda(&i_st)?;
+        let qw_cuda = as_cuda(&qw_st)?;
+        let sc_cuda = as_cuda(&sc_st)?;
+        let qz_cuda = as_cuda(&qz_st)?;
+
+        let mut builder = func.builder();
+        builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
+        builder.arg(&i_cuda.as_cuda_slice::<f16>()?);
+        builder.arg(&qw_cuda.as_cuda_slice::<u32>()?);
+        builder.arg(&sc_cuda.as_cuda_slice::<f16>()?);
+        builder.arg(&qz_cuda.as_cuda_slice::<u32>()?);
+        builder.arg(&(m as i32));
+        builder.arg(&(n as i32));
+        builder.arg(&(k as i32));
+        builder.arg(&(group_size as i32));
+
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| candle_core::Error::Msg(format!("marlin_gemm_f16 launch: {e}")))?;
+        }
+
+        Ok(output)
     }
 }
 

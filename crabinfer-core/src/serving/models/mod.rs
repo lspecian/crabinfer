@@ -11,7 +11,11 @@
 //! - Positions passed as a tensor, not a scalar offset
 
 pub mod attention;
+pub mod deepseek;
 pub mod llama;
+pub mod mistral;
+pub mod phi3;
+pub mod vision;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Result, Tensor};
@@ -91,6 +95,31 @@ pub trait ModelRunner: Send + Sync {
     /// # Returns
     /// Logits tensor `[total_tokens, vocab_size]`
     fn forward(&self, input_ids: &Tensor, ctx: &ForwardContext) -> Result<Tensor>;
+
+    /// Compute embeddings for the given input tokens.
+    ///
+    /// Default implementation returns an error — only embedding-capable models
+    /// override this. The returned tensor should be `[num_tokens, hidden_size]`.
+    fn embed(&self, _input_ids: &Tensor) -> Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "Model does not support embeddings".to_string(),
+        ))
+    }
+
+    /// Return the token embedding table, if available.
+    ///
+    /// Used by `EngineHandle::embed()` to produce mean-pooled embeddings
+    /// from the model's learned token vectors. Shape: `[vocab_size, hidden_size]`.
+    fn embedding_table(&self) -> Option<&Tensor> {
+        None
+    }
+
+    /// Create a clone of this model, sharing weight tensors via Arc.
+    ///
+    /// Candle tensors use `Arc<Storage>` internally, so cloning a tensor is
+    /// cheap (just an Arc bump). Each cloned model can be given to a separate
+    /// `EngineHandle` worker — they share weights but have independent KV caches.
+    fn clone_model(&self) -> Box<dyn ModelRunner>;
 
     fn num_layers(&self) -> usize;
     fn num_kv_heads(&self) -> usize;
@@ -193,6 +222,7 @@ pub fn supported_architectures() -> Vec<&'static str> {
 ///
 /// Dequantizes the GGUF weight at construction time and applies
 /// `candle_nn::ops::rms_norm` during forward.
+#[derive(Clone)]
 pub struct RmsNorm {
     pub(crate) weight: Tensor,
     pub(crate) eps: f32,
@@ -219,6 +249,30 @@ impl RmsNorm {
         backend.fused_rmsnorm(x, &self.weight, self.eps)
     }
 
+    /// Fused RMSNorm + linear projection.
+    ///
+    /// On CUDA, this runs in a single kernel. On CPU/Metal, falls back to
+    /// sequential norm + matmul via the default trait implementation.
+    pub fn forward_linear_fused(
+        &self,
+        x: &Tensor,
+        linear: &MaybeQuantizedLinear,
+        backend: &dyn KernelBackend,
+    ) -> Result<Tensor> {
+        // Only use fused path for dense (non-quantized) linear layers
+        // because the fused kernel expects a dense weight matrix.
+        match linear.weight_tensor() {
+            Some(weight) => {
+                backend.fused_layernorm_linear(x, &self.weight, self.eps, weight)
+            }
+            None => {
+                // Quantized or GGUF linear: use unfused path
+                let normed = backend.fused_rmsnorm(x, &self.weight, self.eps)?;
+                linear.forward(&normed)
+            }
+        }
+    }
+
     /// Fused residual add + RMSNorm.
     ///
     /// Computes `x_out = x + residual`, then normalizes in one kernel pass on CUDA.
@@ -236,10 +290,11 @@ impl RmsNorm {
 /// SwiGLU MLP: `output = down(silu(gate(x)) * up(x))`
 ///
 /// Used by Llama, Qwen2, Phi3, and Gemma architectures.
+#[derive(Clone)]
 pub struct SwiGluMlp {
-    gate: MaybeQuantizedLinear,
-    down: MaybeQuantizedLinear,
-    up: MaybeQuantizedLinear,
+    pub(crate) gate: MaybeQuantizedLinear,
+    pub(crate) down: MaybeQuantizedLinear,
+    pub(crate) up: MaybeQuantizedLinear,
 }
 
 impl SwiGluMlp {
@@ -299,6 +354,89 @@ mod tests {
         for v in data {
             assert!((v - 1.0).abs() < 1e-4, "expected ~1.0, got {v}");
         }
+    }
+
+    #[test]
+    fn test_rmsnorm_forward_linear_fused_matches_unfused() {
+        // Verify that forward_linear_fused produces the same output as
+        // separate rmsnorm + linear.forward within tolerance.
+        let dev = &Device::Cpu;
+        let hidden_size = 64;
+        let out_features = 32;
+
+        let weight = Tensor::randn(0f32, 1.0, hidden_size, dev).unwrap();
+        let norm = RmsNorm {
+            weight,
+            eps: 1e-5,
+        };
+
+        let x = Tensor::randn(0f32, 1.0, (4, hidden_size), dev).unwrap();
+
+        // Create a dense MaybeQuantizedLinear
+        let linear_weight =
+            Tensor::randn(0f32, 1.0, (out_features, hidden_size), dev).unwrap();
+        let qmm = candle_core::quantized::QMatMul::Tensor(linear_weight);
+        let linear = MaybeQuantizedLinear::QMatMul(qmm);
+
+        let backend = crate::serving::kernels::cpu_backend::CpuBackend::new();
+
+        // Fused path
+        let fused = norm.forward_linear_fused(&x, &linear, &backend).unwrap();
+
+        // Unfused reference
+        let normed = norm.forward(&x).unwrap();
+        let unfused = linear.forward(&normed).unwrap();
+
+        let diff = (&fused - &unfused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max_diff < 1e-3,
+            "fused vs unfused max_diff={max_diff}"
+        );
+        assert_eq!(fused.dims(), &[4, out_features]);
+    }
+
+    #[test]
+    fn test_rmsnorm_forward_linear_fused_quantized_fallback() {
+        // Verify that forward_linear_fused falls back gracefully for
+        // quantized (QTensor) linear layers.
+        let dev = &Device::Cpu;
+        let hidden_size = 64;
+
+        let weight = Tensor::ones(hidden_size, DType::F32, dev).unwrap();
+        let norm = RmsNorm {
+            weight,
+            eps: 1e-5,
+        };
+
+        let x = Tensor::randn(0f32, 1.0, (2, hidden_size), dev).unwrap();
+
+        // Use a QMatMul with a quantized tensor to trigger fallback
+        let linear_weight =
+            Tensor::randn(0f32, 1.0, (32, hidden_size), dev).unwrap();
+        let qtensor = candle_core::quantized::QTensor::quantize(
+            &linear_weight,
+            candle_core::quantized::GgmlDType::Q4_0,
+        )
+        .unwrap();
+        let qmm = candle_core::quantized::QMatMul::from_qtensor(qtensor).unwrap();
+        let linear = MaybeQuantizedLinear::QMatMul(qmm);
+
+        let backend = crate::serving::kernels::cpu_backend::CpuBackend::new();
+
+        // Should still work (unfused fallback)
+        let result = norm
+            .forward_linear_fused(&x, &linear, &backend)
+            .unwrap();
+        assert_eq!(result.dims()[0], 2);
+        // Output features from Q4_0 quantized
+        assert!(result.dims()[1] > 0);
     }
 
     #[test]

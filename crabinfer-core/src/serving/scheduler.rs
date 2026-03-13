@@ -246,6 +246,14 @@ impl Scheduler {
         self.kv_cache.prefix_cache_hit_rate()
     }
 
+    /// Return the content hashes of all actively allocated KV cache blocks.
+    ///
+    /// Used for cache-aware routing: external load balancers can compare
+    /// a request's prefix hashes against each worker's active hashes.
+    pub fn active_block_hashes(&self) -> Vec<super::block::BlockHash> {
+        self.kv_cache.active_block_hashes()
+    }
+
     /// Current KV cache usage ratio (0.0 = empty, 1.0 = full).
     pub fn kv_cache_usage_ratio(&self) -> f64 {
         let total = self.kv_cache.num_total_blocks();

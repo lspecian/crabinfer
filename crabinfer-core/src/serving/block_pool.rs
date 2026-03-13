@@ -210,6 +210,20 @@ impl BlockPool {
         self.prefix_cache_hits as f64 / total as f64
     }
 
+    /// Return the content hashes of all actively allocated blocks.
+    ///
+    /// Iterates all blocks and collects the `block_hash` for blocks where
+    /// `ref_count > 0` and `block_hash` is `Some`. This gives the set of
+    /// content hashes currently active in this worker's cache, useful for
+    /// cache-aware load balancing.
+    pub fn active_block_hashes(&self) -> Vec<BlockHash> {
+        self.free_queue
+            .iter_all()
+            .filter(|b| b.ref_count > 0)
+            .filter_map(|b| b.block_hash)
+            .collect()
+    }
+
     /// Clear all prefix cache entries without freeing blocks.
     ///
     /// Used when model weights change (e.g., RLHF) and all cached KV values
@@ -572,6 +586,62 @@ mod tests {
         assert!(hit.is_empty());
         assert_eq!(pool.prefix_cache_misses(), 1);
         assert_eq!(pool.prefix_cache_hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_active_block_hashes_returns_allocated_only() {
+        let mut pool = BlockPool::new(test_config(4));
+
+        // Allocate 2 blocks and cache hashes on them
+        let blocks = pool.allocate(2).unwrap();
+        let hash0 = BlockHash::from_tokens(&[1, 2, 3], None);
+        let hash1 = BlockHash::from_tokens(&[4, 5, 6], Some(hash0));
+        pool.set_block_tokens(blocks[0], 16);
+        pool.set_block_tokens(blocks[1], 16);
+        pool.cache_block(blocks[0], hash0);
+        pool.cache_block(blocks[1], hash1);
+
+        // Both blocks are allocated (ref_count > 0) with hashes
+        let active = pool.active_block_hashes();
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&hash0));
+        assert!(active.contains(&hash1));
+    }
+
+    #[test]
+    fn test_active_block_hashes_empty_after_free() {
+        let mut pool = BlockPool::new(test_config(4));
+
+        let blocks = pool.allocate(2).unwrap();
+        let hash0 = BlockHash::from_tokens(&[1, 2, 3], None);
+        let hash1 = BlockHash::from_tokens(&[4, 5, 6], Some(hash0));
+        pool.set_block_tokens(blocks[0], 16);
+        pool.set_block_tokens(blocks[1], 16);
+        pool.cache_block(blocks[0], hash0);
+        pool.cache_block(blocks[1], hash1);
+
+        // Free all -- ref_count drops to 0
+        pool.free(&blocks);
+
+        // No active blocks
+        let active = pool.active_block_hashes();
+        assert!(active.is_empty(), "active_block_hashes should be empty after freeing all sequences");
+    }
+
+    #[test]
+    fn test_active_block_hashes_excludes_unhashed() {
+        let mut pool = BlockPool::new(test_config(4));
+
+        // Allocate 2 blocks but only hash one
+        let blocks = pool.allocate(2).unwrap();
+        let hash0 = BlockHash::from_tokens(&[1, 2, 3], None);
+        pool.set_block_tokens(blocks[0], 16);
+        pool.cache_block(blocks[0], hash0);
+        // blocks[1] has no hash
+
+        let active = pool.active_block_hashes();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains(&hash0));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 pub mod anthropic;
+pub mod embeddings;
 pub mod health;
 pub mod openai;
+pub mod tokenize;
 
 use crate::state::AppState;
 use axum::extract::DefaultBodyLimit;
@@ -21,6 +23,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // OpenAI-compatible
         .route("/v1/models", get(openai::list_models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/embeddings", post(embeddings::create_embeddings))
+        // Token counting utilities
+        .route("/v1/tokenize", post(tokenize::tokenize))
+        .route("/v1/detokenize", post(tokenize::detokenize))
         // Anthropic-compatible
         .route("/v1/messages", post(anthropic::messages))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))

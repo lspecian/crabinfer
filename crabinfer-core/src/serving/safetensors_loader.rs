@@ -10,10 +10,12 @@
 //! let model = load_model_from_safetensors("/path/to/model/", &device, quantization)?;
 //! ```
 //!
-//! Supports Llama-family architectures (Llama, Qwen2/3, Mistral, Yi, Gemma).
+//! Supports Llama-family architectures (Llama, Mistral, Yi, Gemma) and explicit
+//! Qwen2/2.5 and Qwen3/3.5 support with QKV biases and QK normalization.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
@@ -21,6 +23,7 @@ use candle_nn::Module;
 use super::models::{ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
 use super::models::attention::{precompute_rope, PagedAttentionLayer};
 use super::models::ForwardContext;
+use super::kernels::backend::KernelBackend;
 use super::quantization::{MaybeQuantizedLinear, QuantizationMethod};
 
 // ─── HuggingFace config.json ─────────────────────────────────────────────
@@ -184,7 +187,85 @@ pub(crate) fn detect_quant_config(
     Ok(None)
 }
 
+/// Architecture detection from config.json.
+///
+/// Reads the `architectures` and `model_type` fields to determine which model
+/// implementation to use.
+#[derive(Debug, serde::Deserialize)]
+struct HfArchitectureProbe {
+    #[serde(default)]
+    architectures: Vec<String>,
+    #[serde(default)]
+    model_type: Option<String>,
+}
+
+/// Detected model architecture family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelArchitecture {
+    Llama,
+    Phi3,
+    Mistral,
+    DeepSeekV2,
+    /// Qwen2 and Qwen2.5 — Llama-compatible with QKV biases and optional sliding window.
+    Qwen2,
+    /// Qwen3 and Qwen3.5 — Llama-compatible with QKV biases, QK normalization, and optional sliding window.
+    Qwen3,
+}
+
+impl ModelArchitecture {
+    /// Detect architecture from config.json fields.
+    pub fn detect(architectures: &[String], model_type: Option<&str>) -> Self {
+        // Check architectures array first (most reliable)
+        for arch in architectures {
+            let arch_lower = arch.to_lowercase();
+            // Qwen3/3.5 must be checked before Qwen2 (since "qwen3" doesn't contain "qwen2")
+            if arch_lower.contains("qwen3") {
+                return Self::Qwen3;
+            }
+            if arch_lower.contains("qwen2") {
+                return Self::Qwen2;
+            }
+            if arch_lower.contains("phi3") || arch_lower.contains("phifor") {
+                return Self::Phi3;
+            }
+            if arch_lower.contains("deepseekv2") || arch_lower.contains("deepseekv3") {
+                return Self::DeepSeekV2;
+            }
+            if arch_lower.contains("mistral") {
+                return Self::Mistral;
+            }
+        }
+
+        // Fall back to model_type
+        if let Some(mt) = model_type {
+            let mt_lower = mt.to_lowercase();
+            // Qwen3/3.5 before Qwen2
+            if mt_lower == "qwen3" || mt_lower == "qwen3_5" || mt_lower == "qwen3.5" {
+                return Self::Qwen3;
+            }
+            if mt_lower == "qwen2" || mt_lower == "qwen2_5" || mt_lower == "qwen2.5" {
+                return Self::Qwen2;
+            }
+            if mt_lower.contains("phi3") || mt_lower == "phi" {
+                return Self::Phi3;
+            }
+            if mt_lower.contains("deepseek") {
+                return Self::DeepSeekV2;
+            }
+            if mt_lower.contains("mistral") {
+                return Self::Mistral;
+            }
+        }
+
+        // Default to Llama (handles Llama, Yi, Gemma, CodeLlama, etc.)
+        Self::Llama
+    }
+}
+
 /// Minimal HuggingFace `config.json` for Llama-family models.
+///
+/// Also supports Qwen2/3-specific fields: `sliding_window`, `use_sliding_window`,
+/// and `qk_norm` for QK normalization (Qwen3).
 #[derive(Debug, serde::Deserialize)]
 struct HfConfig {
     hidden_size: usize,
@@ -200,10 +281,20 @@ struct HfConfig {
     rope_theta: f64,
     #[serde(default)]
     max_position_embeddings: Option<usize>,
+    /// Explicit head dimension (Qwen3 uses this when head_dim != hidden_size / num_heads).
     #[serde(default)]
     head_dim: Option<usize>,
     #[serde(default)]
     model_type: Option<String>,
+    /// Sliding window size (used by some Qwen2/3 and Mistral configs).
+    #[serde(default)]
+    sliding_window: Option<usize>,
+    /// Whether sliding window attention is enabled (Qwen2.5, Qwen3).
+    #[serde(default)]
+    use_sliding_window: Option<bool>,
+    /// Whether QK normalization is used (Qwen3 = true, applies per-head RMSNorm to Q and K).
+    #[serde(default)]
+    qk_norm: Option<bool>,
 }
 
 fn default_rms_norm_eps() -> f64 {
@@ -254,6 +345,7 @@ impl HfConfig {
 
 // ─── Safetensors Llama model ──────────────────────────────────────────────
 
+#[derive(Clone)]
 struct SafetensorsLlamaLayer {
     attn_norm: RmsNorm,
     attn_q: MaybeQuantizedLinear,
@@ -311,6 +403,25 @@ impl ModelRunner for SafetensorsLlamaModel {
         self.lm_head.forward(&hidden_states)
     }
 
+    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let embeddings = self.embed_table.index_select(input_ids, 0)?;
+        embeddings.mean(0)
+    }
+
+    fn embedding_table(&self) -> Option<&Tensor> {
+        Some(&self.embed_table)
+    }
+
+    fn clone_model(&self) -> Box<dyn ModelRunner> {
+        Box::new(SafetensorsLlamaModel {
+            embed_table: self.embed_table.clone(),
+            layers: self.layers.clone(),
+            norm: self.norm.clone(),
+            lm_head: self.lm_head.clone(),
+            config: self.config.clone(),
+        })
+    }
+
     fn num_layers(&self) -> usize {
         self.config.num_layers
     }
@@ -328,10 +439,267 @@ impl ModelRunner for SafetensorsLlamaModel {
     }
 }
 
+impl SafetensorsLlamaModel {
+    /// Activate Marlin fused kernel for all GPTQ/AWQ layers.
+    ///
+    /// Iterates all quantized linear layers, sets their backend reference,
+    /// and calls `reformat_for_marlin()` to convert weights to Marlin tile layout.
+    ///
+    /// Returns the number of layers successfully reformatted.
+    fn activate_marlin(&mut self, backend: &Arc<dyn KernelBackend>) -> Result<usize> {
+        let mut marlin_count = 0;
+
+        // Helper closure to process a single MaybeQuantizedLinear
+        let mut process_linear = |linear: &mut MaybeQuantizedLinear| -> Result<()> {
+            match linear {
+                MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                    gptq.backend = Some(Arc::clone(backend));
+                    if gptq.reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                MaybeQuantizedLinear::Awq(ref mut awq) => {
+                    awq.inner_mut().backend = Some(Arc::clone(backend));
+                    if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+
+        for layer in &mut self.layers {
+            process_linear(&mut layer.attn_q)?;
+            process_linear(&mut layer.attn_k)?;
+            process_linear(&mut layer.attn_v)?;
+            process_linear(&mut layer.attn_output)?;
+            // MLP projections are inside SwiGluMlp — access via the MaybeQuantizedLinear fields
+            process_linear(&mut layer.mlp.gate)?;
+            process_linear(&mut layer.mlp.down)?;
+            process_linear(&mut layer.mlp.up)?;
+        }
+
+        // Also check lm_head (typically not quantized, but be thorough)
+        let lm = &mut self.lm_head;
+        match lm {
+            MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                gptq.backend = Some(Arc::clone(backend));
+                if gptq.reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            MaybeQuantizedLinear::Awq(ref mut awq) => {
+                awq.inner_mut().backend = Some(Arc::clone(backend));
+                if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(marlin_count)
+    }
+}
+
+// ─── Safetensors Qwen model (Qwen2/2.5/3/3.5) ──────────────────────────
+
+/// Single transformer layer for Qwen2/3 architectures.
+///
+/// Extends the Llama layer with:
+/// - QKV biases (required by Qwen2 and Qwen3)
+/// - Optional QK normalization (Qwen3 applies per-head RMSNorm to Q and K)
+#[derive(Clone)]
+struct SafetensorsQwenLayer {
+    attn_norm: RmsNorm,
+    attn_q: MaybeQuantizedLinear,
+    attn_k: MaybeQuantizedLinear,
+    attn_v: MaybeQuantizedLinear,
+    attn_output: MaybeQuantizedLinear,
+    /// QKV biases (Qwen2 and Qwen3 use biases on Q, K, V projections).
+    attn_q_bias: Option<Tensor>,
+    attn_k_bias: Option<Tensor>,
+    attn_v_bias: Option<Tensor>,
+    /// QK normalization (Qwen3: per-head RMSNorm on Q and K).
+    attn_q_norm: Option<RmsNorm>,
+    attn_k_norm: Option<RmsNorm>,
+    ffn_norm: RmsNorm,
+    mlp: SwiGluMlp,
+    attention: PagedAttentionLayer,
+}
+
+impl SafetensorsQwenLayer {
+    fn forward(&self, x: &Tensor, ctx: &ForwardContext, layer_idx: usize) -> Result<Tensor> {
+        // Pre-norm attention (fused RMSNorm on CUDA)
+        let residual = x;
+        let x = self.attn_norm.forward_fused(x, ctx.backend)?;
+
+        // QKV projections + biases
+        let mut q = self.attn_q.forward(&x)?;
+        let mut k = self.attn_k.forward(&x)?;
+        let mut v = self.attn_v.forward(&x)?;
+        if let Some(ref bias) = self.attn_q_bias {
+            q = q.broadcast_add(bias)?;
+        }
+        if let Some(ref bias) = self.attn_k_bias {
+            k = k.broadcast_add(bias)?;
+        }
+        if let Some(ref bias) = self.attn_v_bias {
+            v = v.broadcast_add(bias)?;
+        }
+
+        // Optional QK normalization (Qwen3): apply RMSNorm per-head to Q and K
+        if let (Some(ref q_norm), Some(ref k_norm)) = (&self.attn_q_norm, &self.attn_k_norm) {
+            let total_tokens = q.dims()[0];
+            let num_q_heads = self.attention.num_heads;
+            let num_kv_heads = self.attention.num_kv_heads;
+            let head_size = self.attention.head_size;
+            // Reshape to [total_tokens * num_heads, head_size], apply norm, reshape back
+            q = q.reshape((total_tokens * num_q_heads, head_size))?;
+            q = q_norm.forward(&q)?;
+            q = q.reshape((total_tokens, num_q_heads * head_size))?;
+            k = k.reshape((total_tokens * num_kv_heads, head_size))?;
+            k = k_norm.forward(&k)?;
+            k = k.reshape((total_tokens, num_kv_heads * head_size))?;
+        }
+
+        // Paged attention (includes RoPE + cache write + attention dispatch)
+        let attn_out = self.attention.forward(&q, &k, &v, ctx, layer_idx)?;
+
+        // Output projection
+        let attn_proj = self.attn_output.forward(&attn_out)?;
+
+        // Fused residual add + RMSNorm for MLP (eliminates intermediate tensor on CUDA)
+        let (x, residual) = self.ffn_norm.forward_add_fused(&attn_proj, residual, ctx.backend)?;
+
+        // MLP (fused SiLU+mul on CUDA) + residual
+        let x = self.mlp.forward_fused(&x, ctx.backend)?;
+        x + &residual
+    }
+}
+
+/// Qwen2/3 model with paged attention support.
+///
+/// Reuses the Llama transformer architecture with additional support for:
+/// - QKV biases (Qwen2 and Qwen3)
+/// - QK normalization / per-head RMSNorm (Qwen3)
+/// - Sliding window attention (some Qwen2.5/3 configs)
+/// - Explicit `head_dim` (Qwen3 may differ from `hidden_size / num_heads`)
+pub struct SafetensorsQwenModel {
+    embed_table: Tensor,
+    layers: Vec<SafetensorsQwenLayer>,
+    norm: RmsNorm,
+    lm_head: MaybeQuantizedLinear,
+    config: ModelConfig,
+}
+
+impl ModelRunner for SafetensorsQwenModel {
+    fn forward(&self, input_ids: &Tensor, ctx: &ForwardContext) -> Result<Tensor> {
+        let mut hidden_states = self.embed_table.index_select(input_ids, 0)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.forward(&hidden_states, ctx, layer_idx)?;
+        }
+
+        let hidden_states = self.norm.forward_fused(&hidden_states, ctx.backend)?;
+        self.lm_head.forward(&hidden_states)
+    }
+
+    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let embeddings = self.embed_table.index_select(input_ids, 0)?;
+        embeddings.mean(0)
+    }
+
+    fn embedding_table(&self) -> Option<&Tensor> {
+        Some(&self.embed_table)
+    }
+
+    fn clone_model(&self) -> Box<dyn ModelRunner> {
+        Box::new(SafetensorsQwenModel {
+            embed_table: self.embed_table.clone(),
+            layers: self.layers.clone(),
+            norm: self.norm.clone(),
+            lm_head: self.lm_head.clone(),
+            config: self.config.clone(),
+        })
+    }
+
+    fn num_layers(&self) -> usize {
+        self.config.num_layers
+    }
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_kv_heads
+    }
+    fn head_size(&self) -> usize {
+        self.config.head_size
+    }
+    fn num_heads(&self) -> usize {
+        self.config.num_heads
+    }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+}
+
+impl SafetensorsQwenModel {
+    /// Activate Marlin fused kernel for all GPTQ/AWQ layers.
+    fn activate_marlin(&mut self, backend: &Arc<dyn KernelBackend>) -> Result<usize> {
+        let mut marlin_count = 0;
+
+        let mut process_linear = |linear: &mut MaybeQuantizedLinear| -> Result<()> {
+            match linear {
+                MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                    gptq.backend = Some(Arc::clone(backend));
+                    if gptq.reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                MaybeQuantizedLinear::Awq(ref mut awq) => {
+                    awq.inner_mut().backend = Some(Arc::clone(backend));
+                    if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+
+        for layer in &mut self.layers {
+            process_linear(&mut layer.attn_q)?;
+            process_linear(&mut layer.attn_k)?;
+            process_linear(&mut layer.attn_v)?;
+            process_linear(&mut layer.attn_output)?;
+            process_linear(&mut layer.mlp.gate)?;
+            process_linear(&mut layer.mlp.down)?;
+            process_linear(&mut layer.mlp.up)?;
+        }
+
+        let lm = &mut self.lm_head;
+        match lm {
+            MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                gptq.backend = Some(Arc::clone(backend));
+                if gptq.reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            MaybeQuantizedLinear::Awq(ref mut awq) => {
+                awq.inner_mut().backend = Some(Arc::clone(backend));
+                if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(marlin_count)
+    }
+}
+
 // ─── Loading ─────────────────────────────────────────────────────────────
 
 /// Load a tensor from the weight map, converting to the target dtype.
-fn load_tensor(
+pub fn load_tensor(
     weights: &HashMap<String, Tensor>,
     name: &str,
     device: &Device,
@@ -344,7 +712,7 @@ fn load_tensor(
 }
 
 /// Load a weight as a MaybeQuantizedLinear.
-fn load_linear(
+pub fn load_linear(
     weights: &HashMap<String, Tensor>,
     name: &str,
     device: &Device,
@@ -445,11 +813,24 @@ fn load_awq_linear(
 /// - `config.json` — HuggingFace model config
 /// - `*.safetensors` — model weight files (one or more shards)
 ///
+/// If a kernel backend is provided and the device is CUDA, Marlin fused kernels
+/// will be activated for all GPTQ/AWQ layers (reformatting weights to tile layout).
+///
 /// Returns a boxed `ModelRunner` for use with the serving engine.
 pub fn load_model_from_safetensors(
     model_dir: &Path,
     device: &Device,
     quantization: QuantizationMethod,
+) -> Result<Box<dyn ModelRunner>> {
+    load_model_from_safetensors_with_backend(model_dir, device, quantization, None)
+}
+
+/// Load a model from safetensors with an optional kernel backend for Marlin activation.
+pub fn load_model_from_safetensors_with_backend(
+    model_dir: &Path,
+    device: &Device,
+    quantization: QuantizationMethod,
+    kernel_backend: Option<Arc<dyn KernelBackend>>,
 ) -> Result<Box<dyn ModelRunner>> {
     // ── Read config.json ──
     let config_path = model_dir.join("config.json");
@@ -536,6 +917,250 @@ pub fn load_model_from_safetensors(
     }
 
     tracing::info!("Loaded {} tensors from safetensors", weights.len());
+
+    // ── Detect model architecture ──
+    let arch_probe: HfArchitectureProbe = serde_json::from_str(&config_text).map_err(|e| {
+        candle_core::Error::Msg(format!("Failed to parse config.json architectures: {e}"))
+    })?;
+    let architecture = ModelArchitecture::detect(
+        &arch_probe.architectures,
+        arch_probe.model_type.as_deref(),
+    );
+    tracing::info!("Detected model architecture: {:?}", architecture);
+
+    // ── Dispatch to architecture-specific loader ──
+    match architecture {
+        ModelArchitecture::Phi3 => {
+            let phi3_config: super::models::phi3::Phi3Config =
+                serde_json::from_str(&config_text).map_err(|e| {
+                    candle_core::Error::Msg(format!("Failed to parse Phi-3 config: {e}"))
+                })?;
+            let model = super::models::phi3::SafetensorsPhi3Model::from_safetensors(
+                &phi3_config,
+                &weights,
+                device,
+                effective_quantization,
+            )?;
+            return Ok(Box::new(model));
+        }
+        ModelArchitecture::Mistral => {
+            let mistral_config: super::models::mistral::MistralConfig =
+                serde_json::from_str(&config_text).map_err(|e| {
+                    candle_core::Error::Msg(format!("Failed to parse Mistral config: {e}"))
+                })?;
+            let model = super::models::mistral::SafetensorsMistralModel::from_safetensors(
+                &mistral_config,
+                &weights,
+                device,
+                effective_quantization,
+            )?;
+            return Ok(Box::new(model));
+        }
+        ModelArchitecture::DeepSeekV2 => {
+            let ds_config: super::models::deepseek::DeepSeekConfig =
+                serde_json::from_str(&config_text).map_err(|e| {
+                    candle_core::Error::Msg(format!("Failed to parse DeepSeek config: {e}"))
+                })?;
+            let model = super::models::deepseek::SafetensorsDeepSeekModel::from_safetensors(
+                &ds_config,
+                &weights,
+                device,
+                effective_quantization,
+            )?;
+            return Ok(Box::new(model));
+        }
+        ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 => {
+            let is_qwen3 = architecture == ModelArchitecture::Qwen3;
+            let variant_name = if is_qwen3 { "Qwen3" } else { "Qwen2" };
+            let has_qk_norm = is_qwen3 || hf_config.qk_norm.unwrap_or(false);
+
+            tracing::info!(
+                "Loading {} model (biases=true, qk_norm={}, sliding_window={:?})",
+                variant_name,
+                has_qk_norm,
+                hf_config.sliding_window,
+            );
+
+            let num_heads = hf_config.num_attention_heads;
+            let num_kv_heads = hf_config.num_kv_heads();
+            let head_size = hf_config.head_size();
+            let hidden_size = hf_config.hidden_size;
+            let rope_dim = hf_config.rope_dim();
+            let max_seq_len = hf_config.max_seq_len();
+            let rms_norm_eps = hf_config.rms_norm_eps;
+            let rope_theta = hf_config.rope_theta as f32;
+
+            let model_config = ModelConfig {
+                hidden_size,
+                intermediate_size: hf_config.intermediate_size,
+                num_heads,
+                num_kv_heads,
+                num_layers: hf_config.num_hidden_layers,
+                head_size,
+                vocab_size: hf_config.vocab_size,
+                rms_norm_eps,
+                rope_theta,
+                rope_dim,
+                max_seq_len,
+            };
+
+            // Load embeddings
+            let embed_table = load_tensor(&weights, "model.embed_tokens.weight", device)?;
+
+            // Load output projection
+            let lm_head = if weights.contains_key("lm_head.weight") {
+                load_linear(&weights, "lm_head.weight", device, QuantizationMethod::None)?
+            } else {
+                let qmm = candle_core::quantized::QMatMul::Tensor(embed_table.clone());
+                MaybeQuantizedLinear::from_qmatmul(qmm, QuantizationMethod::None, device)?
+            };
+
+            // Final norm
+            let norm_weight = load_tensor(&weights, "model.norm.weight", device)?;
+            let norm = RmsNorm { weight: norm_weight, eps: rms_norm_eps as f32 };
+
+            // Precompute shared RoPE tables
+            let (rope_cos, rope_sin) = precompute_rope(rope_dim, rope_theta, max_seq_len, device)?;
+
+            // Build linear layer loader
+            let load_proj = |weights: &HashMap<String, Tensor>, prefix: &str| -> Result<MaybeQuantizedLinear> {
+                match effective_quantization {
+                    QuantizationMethod::Gptq => load_gptq_linear(weights, prefix, quant_group_size, device),
+                    QuantizationMethod::Awq => load_awq_linear(weights, prefix, quant_group_size, device),
+                    other => load_linear(weights, &format!("{prefix}.weight"), device, other),
+                }
+            };
+
+            // Load transformer layers
+            let mut layers = Vec::with_capacity(hf_config.num_hidden_layers);
+            for i in 0..hf_config.num_hidden_layers {
+                let prefix = format!("model.layers.{i}");
+
+                let attn_norm_weight = load_tensor(
+                    &weights,
+                    &format!("{prefix}.input_layernorm.weight"),
+                    device,
+                )?;
+                let attn_norm = RmsNorm {
+                    weight: attn_norm_weight,
+                    eps: rms_norm_eps as f32,
+                };
+
+                let attn_q = load_proj(&weights, &format!("{prefix}.self_attn.q_proj"))?;
+                let attn_k = load_proj(&weights, &format!("{prefix}.self_attn.k_proj"))?;
+                let attn_v = load_proj(&weights, &format!("{prefix}.self_attn.v_proj"))?;
+                let attn_output = load_proj(&weights, &format!("{prefix}.self_attn.o_proj"))?;
+
+                // QKV biases (Qwen2 and Qwen3 both use them)
+                let attn_q_bias = weights
+                    .get(&format!("{prefix}.self_attn.q_proj.bias"))
+                    .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
+                    .transpose()?;
+                let attn_k_bias = weights
+                    .get(&format!("{prefix}.self_attn.k_proj.bias"))
+                    .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
+                    .transpose()?;
+                let attn_v_bias = weights
+                    .get(&format!("{prefix}.self_attn.v_proj.bias"))
+                    .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
+                    .transpose()?;
+
+                // QK normalization (Qwen3 only)
+                let (attn_q_norm, attn_k_norm) = if has_qk_norm {
+                    let q_norm_w = weights
+                        .get(&format!("{prefix}.self_attn.q_norm.weight"))
+                        .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
+                        .transpose()?;
+                    let k_norm_w = weights
+                        .get(&format!("{prefix}.self_attn.k_norm.weight"))
+                        .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
+                        .transpose()?;
+                    (
+                        q_norm_w.map(|w| RmsNorm { weight: w, eps: rms_norm_eps as f32 }),
+                        k_norm_w.map(|w| RmsNorm { weight: w, eps: rms_norm_eps as f32 }),
+                    )
+                } else {
+                    (None, None)
+                };
+
+                let ffn_norm_weight = load_tensor(
+                    &weights,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    device,
+                )?;
+                let ffn_norm = RmsNorm {
+                    weight: ffn_norm_weight,
+                    eps: rms_norm_eps as f32,
+                };
+
+                let gate = load_proj(&weights, &format!("{prefix}.mlp.gate_proj"))?;
+                let down = load_proj(&weights, &format!("{prefix}.mlp.down_proj"))?;
+                let up = load_proj(&weights, &format!("{prefix}.mlp.up_proj"))?;
+                let mlp = SwiGluMlp::new(gate, down, up);
+
+                let attention = PagedAttentionLayer::with_rope(
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                    rope_cos.clone(),
+                    rope_sin.clone(),
+                );
+
+                layers.push(SafetensorsQwenLayer {
+                    attn_norm,
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_bias,
+                    attn_k_bias,
+                    attn_v_bias,
+                    attn_q_norm,
+                    attn_k_norm,
+                    ffn_norm,
+                    mlp,
+                    attention,
+                });
+            }
+
+            let has_biases = layers.first().map_or(false, |l| l.attn_q_bias.is_some());
+            let has_norms = layers.first().map_or(false, |l| l.attn_q_norm.is_some());
+            tracing::info!(
+                "{} model loaded: hidden={} heads={} kv_heads={} head_size={} layers={} vocab={} qkv_bias={} qk_norm={} quantization={}",
+                variant_name,
+                model_config.hidden_size, model_config.num_heads, model_config.num_kv_heads,
+                model_config.head_size, model_config.num_layers, model_config.vocab_size,
+                has_biases, has_norms, effective_quantization,
+            );
+
+            let mut model = SafetensorsQwenModel {
+                embed_table,
+                layers,
+                norm,
+                lm_head,
+                config: model_config,
+            };
+
+            // Activate Marlin fused kernels for GPTQ/AWQ layers on CUDA
+            if device.is_cuda() {
+                if let Some(ref backend) = kernel_backend {
+                    let marlin_count = model.activate_marlin(backend)?;
+                    if marlin_count > 0 {
+                        tracing::info!(
+                            "Activated Marlin fused kernel for {marlin_count} quantized layers"
+                        );
+                    }
+                }
+            }
+
+            return Ok(Box::new(model));
+        }
+        ModelArchitecture::Llama => {
+            // Fall through to existing Llama loader below
+        }
+    }
+
+    // ── Llama architecture (default path) ──
 
     // ── Build model config ──
     let num_heads = hf_config.num_attention_heads;
@@ -654,13 +1279,27 @@ pub fn load_model_from_safetensors(
         effective_quantization,
     );
 
-    Ok(Box::new(SafetensorsLlamaModel {
+    let mut model = SafetensorsLlamaModel {
         embed_table,
         layers,
         norm,
         lm_head,
         config: model_config,
-    }))
+    };
+
+    // Activate Marlin fused kernels for GPTQ/AWQ layers on CUDA
+    if device.is_cuda() {
+        if let Some(ref backend) = kernel_backend {
+            let marlin_count = model.activate_marlin(backend)?;
+            if marlin_count > 0 {
+                tracing::info!(
+                    "Activated Marlin fused kernel for {marlin_count} quantized layers"
+                );
+            }
+        }
+    }
+
+    Ok(Box::new(model))
 }
 
 /// Check if a path is a directory containing safetensors files.
@@ -913,5 +1552,201 @@ mod tests {
         let result = load_model_from_safetensors(&tmp, &Device::Cpu, QuantizationMethod::None);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Architecture detection tests ──────────────────────────────────────
+
+    #[test]
+    fn test_detect_architecture_llama() {
+        let arch = ModelArchitecture::detect(
+            &["LlamaForCausalLM".to_string()],
+            Some("llama"),
+        );
+        assert_eq!(arch, ModelArchitecture::Llama);
+    }
+
+    #[test]
+    fn test_detect_architecture_phi3() {
+        let arch = ModelArchitecture::detect(
+            &["Phi3ForCausalLM".to_string()],
+            Some("phi3"),
+        );
+        assert_eq!(arch, ModelArchitecture::Phi3);
+    }
+
+    #[test]
+    fn test_detect_architecture_phi_legacy() {
+        let arch = ModelArchitecture::detect(
+            &["PhiForCausalLM".to_string()],
+            Some("phi"),
+        );
+        assert_eq!(arch, ModelArchitecture::Phi3);
+    }
+
+    #[test]
+    fn test_detect_architecture_mistral() {
+        let arch = ModelArchitecture::detect(
+            &["MistralForCausalLM".to_string()],
+            Some("mistral"),
+        );
+        assert_eq!(arch, ModelArchitecture::Mistral);
+    }
+
+    #[test]
+    fn test_detect_architecture_deepseek_v2() {
+        let arch = ModelArchitecture::detect(
+            &["DeepseekV2ForCausalLM".to_string()],
+            Some("deepseek_v2"),
+        );
+        assert_eq!(arch, ModelArchitecture::DeepSeekV2);
+    }
+
+    #[test]
+    fn test_detect_architecture_deepseek_v3() {
+        let arch = ModelArchitecture::detect(
+            &["DeepseekV3ForCausalLM".to_string()],
+            Some("deepseek_v3"),
+        );
+        assert_eq!(arch, ModelArchitecture::DeepSeekV2);
+    }
+
+    #[test]
+    fn test_detect_architecture_default_to_llama() {
+        // Unknown architectures default to Llama (handles Yi, Gemma, etc.)
+        let arch = ModelArchitecture::detect(
+            &["YiForCausalLM".to_string()],
+            Some("yi"),
+        );
+        assert_eq!(arch, ModelArchitecture::Llama);
+    }
+
+    #[test]
+    fn test_detect_architecture_empty() {
+        let arch = ModelArchitecture::detect(&[], None);
+        assert_eq!(arch, ModelArchitecture::Llama);
+    }
+
+    #[test]
+    fn test_detect_architecture_model_type_fallback() {
+        // When architectures list is empty, use model_type
+        let arch = ModelArchitecture::detect(&[], Some("mistral"));
+        assert_eq!(arch, ModelArchitecture::Mistral);
+    }
+
+    #[test]
+    fn test_detect_architecture_model_type_deepseek() {
+        let arch = ModelArchitecture::detect(&[], Some("deepseek_v2"));
+        assert_eq!(arch, ModelArchitecture::DeepSeekV2);
+    }
+
+    // ── Qwen architecture detection tests ────────────────────────────────
+
+    #[test]
+    fn test_detect_architecture_qwen2() {
+        let arch = ModelArchitecture::detect(
+            &["Qwen2ForCausalLM".to_string()],
+            Some("qwen2"),
+        );
+        assert_eq!(arch, ModelArchitecture::Qwen2);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen2_5() {
+        let arch = ModelArchitecture::detect(
+            &["Qwen2_5ForCausalLM".to_string()],
+            Some("qwen2_5"),
+        );
+        assert_eq!(arch, ModelArchitecture::Qwen2);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen3() {
+        let arch = ModelArchitecture::detect(
+            &["Qwen3ForCausalLM".to_string()],
+            Some("qwen3"),
+        );
+        assert_eq!(arch, ModelArchitecture::Qwen3);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen3_5() {
+        let arch = ModelArchitecture::detect(
+            &["Qwen3_5ForCausalLM".to_string()],
+            Some("qwen3_5"),
+        );
+        assert_eq!(arch, ModelArchitecture::Qwen3);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen3_model_type() {
+        // Detect Qwen3 from model_type alone (no architectures array)
+        let arch = ModelArchitecture::detect(&[], Some("qwen3"));
+        assert_eq!(arch, ModelArchitecture::Qwen3);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen2_model_type() {
+        // Detect Qwen2 from model_type alone
+        let arch = ModelArchitecture::detect(&[], Some("qwen2"));
+        assert_eq!(arch, ModelArchitecture::Qwen2);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen2_5_model_type() {
+        // Detect Qwen2.5 from model_type alone
+        let arch = ModelArchitecture::detect(&[], Some("qwen2_5"));
+        assert_eq!(arch, ModelArchitecture::Qwen2);
+    }
+
+    #[test]
+    fn test_detect_architecture_qwen3_5_model_type() {
+        // Detect Qwen3.5 from model_type alone
+        let arch = ModelArchitecture::detect(&[], Some("qwen3_5"));
+        assert_eq!(arch, ModelArchitecture::Qwen3);
+    }
+
+    // ── Qwen HfConfig parsing tests ─────────────────────────────────────
+
+    #[test]
+    fn test_hf_config_qwen2_fields() {
+        let json = r#"{
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "vocab_size": 151936,
+            "head_dim": 128,
+            "sliding_window": 32768,
+            "use_sliding_window": true,
+            "model_type": "qwen2"
+        }"#;
+        let config: HfConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.head_size(), 128);
+        assert_eq!(config.sliding_window, Some(32768));
+        assert_eq!(config.use_sliding_window, Some(true));
+        assert_eq!(config.qk_norm, None);
+    }
+
+    #[test]
+    fn test_hf_config_qwen3_fields() {
+        let json = r#"{
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 36,
+            "vocab_size": 151936,
+            "head_dim": 128,
+            "qk_norm": true,
+            "sliding_window": 32768,
+            "use_sliding_window": false,
+            "model_type": "qwen3"
+        }"#;
+        let config: HfConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.head_size(), 128);
+        assert_eq!(config.qk_norm, Some(true));
+        assert_eq!(config.sliding_window, Some(32768));
+        assert_eq!(config.use_sliding_window, Some(false));
     }
 }

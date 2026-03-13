@@ -1,5 +1,5 @@
 use crabinfer_core::engine::CrabInferEngine;
-use crabinfer_core::serving::engine_loop::EngineHandle;
+use crabinfer_core::serving::worker_pool::WorkerPool;
 use crabinfer_core::ModelInfo;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,7 +12,9 @@ pub struct AppState {
     /// Serializes legacy inference requests.
     pub inference_lock: Mutex<()>,
     /// New PagedAttention serving engine (when enabled, routes prefer this).
-    pub serving_engine: Option<EngineHandle>,
+    /// Wraps one or more EngineHandle workers behind a WorkerPool for
+    /// round-robin request distribution.
+    pub serving_engine: Option<WorkerPool>,
     /// Cached model info (set after engine loads)
     pub model_info: ModelInfo,
     /// Model identifier for API responses

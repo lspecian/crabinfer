@@ -61,7 +61,12 @@ Plans:
   1. A `response_format: {type: "json_schema", json_schema: {...}}` request produces output that validates against the schema — every token is constrained, not just post-processed
   2. A regex pattern submitted via the API compiles to a DFA and every generated token is a valid continuation of the DFA state
   3. Constrained generation adds less than 5% latency overhead compared to the same model running unconstrained on identical prompts
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+- [ ] 03-00-PLAN.md — Wave 0: outlines-core dependency and failing test stubs for all 4 GDEC behaviors
+- [ ] 03-01-PLAN.md — Core guided decoding module (GuidedState, IndexCache, apply_guided_mask) and engine loop integration
+- [ ] 03-02-PLAN.md — Server-side ResponseFormat to GuidedConstraint wiring in OpenAI routes
 
 ### Phase 4: Production Infrastructure
 **Goal**: The server runs across multiple workers with shared weights, reads config from TOML, safely isolates cache across tenants, and serves embedding vectors via the standard OpenAI endpoint
@@ -72,7 +77,13 @@ Plans:
   2. A `crabinfer.toml` file configures the server without any CLI flags; CLI flags override TOML values when both are present
   3. Cache salting is active by default — requests from different tenants (different salt values) cannot share cached KV blocks
   4. `POST /v1/embeddings` returns vectors in OpenAI format for both single and batched inputs, using a loaded embedding model (nomic-embed or gte-small)
-**Plans**: TBD
+**Plans:** 4 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — TOML config file support with CLI/env/TOML precedence
+- [ ] 04-02-PLAN.md — Prefix cache salting for tenant isolation and cache-aware routing API
+- [ ] 04-03-PLAN.md — OpenAI-compatible /v1/embeddings endpoint with batch support
+- [ ] 04-04-PLAN.md — Multi-worker serving with shared weights and round-robin routing
 
 ## Progress
 
@@ -83,5 +94,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Model Loading and Quantization | 3/4 | In Progress|  |
 | 2. Performance Optimization | 0/4 | Planned | - |
-| 3. Guided Decoding | 0/TBD | Not started | - |
-| 4. Production Infrastructure | 0/TBD | Not started | - |
+| 3. Guided Decoding | 0/3 | Planned | - |
+| 4. Production Infrastructure | 0/4 | Planned | - |

@@ -635,6 +635,472 @@ extern "C" __global__ void fused_add_rmsnorm_f16(
     fused_add_rmsnorm_kernel<__half>(output, x, residual, weight, hidden_size, eps);
 }
 
+// ─── Marlin-style fused dequant+GEMM kernel ──────────────────────────────
+//
+// Simplified Marlin-style fused dequant+GEMM kernel for sm_86 (Ampere).
+//
+// Each thread block handles a [1, 64] output tile (one batch row, 64 output columns).
+// Weights are pre-reformatted into [K/16, N/64, 128] tile layout where each 128-u32
+// block encodes a 16x64 sub-tile of INT4 weights.
+//
+// The kernel loads weight tiles, dequantizes INT4 to FP16, and accumulates
+// via FP16 FMA (not full Tensor Core MMA — that's a Phase 2 optimization).
+//
+// This is simpler than the full Marlin kernel but still fused: no intermediate
+// dequantized weight tensor is materialized in global memory.
+//
+// Grid:  (N/64, M, 1)  where M = batch size, N = out_features
+// Block: (256, 1, 1) — 8 warps per block
+
+extern "C" __global__ void marlin_gemm_f16(
+    __half* __restrict__ output,            // [M, N]
+    const __half* __restrict__ input,       // [M, K]
+    const unsigned int* __restrict__ qw,    // [K/16, N/64, 128] Marlin tile layout
+    const __half* __restrict__ scales,      // [K/group_size, N]
+    const unsigned int* __restrict__ qzeros, // [K/group_size, N/8]
+    int M, int N, int K, int group_size
+) {
+    // Which 64-column tile and which batch row
+    const int tile_col = blockIdx.x;   // 0..N/64-1
+    const int row = blockIdx.y;        // 0..M-1
+    const int tid = threadIdx.x;       // 0..255
+
+    // Each thread accumulates 64/256 = partial set of output columns
+    // But with 256 threads and 64 columns, we assign threads to columns
+    // and have them iterate over K dimension.
+    // Assign: each of 64 columns gets 4 threads (256/64 = 4 threads per column).
+    // Those 4 threads split the K-reduction and then reduce.
+    const int col_in_tile = tid % 64;        // which column within the 64-col tile
+    const int k_worker = tid / 64;           // 0..3 — which K-reduction worker
+    const int num_k_workers = 4;
+
+    const int out_col = tile_col * 64 + col_in_tile;
+    if (out_col >= N) return;
+
+    float acc = 0.0f;
+
+    // Number of K-tiles
+    const int num_k_tiles = K / 16;
+
+    // Each K-worker handles a subset of K-tiles
+    for (int kt = k_worker; kt < num_k_tiles; kt += num_k_workers) {
+        const int k_base = kt * 16;  // starting input feature index
+
+        // qw index: [kt, tile_col, 128]
+        // 128 u32 values encode 16x64 = 1024 INT4 values
+        // Layout within the 128-u32 tile:
+        //   For row r (0..15) and col c (0..63) within the tile:
+        //     linear_idx = r * 64 + c  (0..1023)
+        //     u32_idx = linear_idx / 8
+        //     bit_pos = linear_idx % 8
+        //     value = (qw[u32_idx] >> (bit_pos * 4)) & 0xF
+        const int tile_offset = (kt * (N / 64) + tile_col) * 128;
+
+        for (int r = 0; r < 16; r++) {
+            const int k_idx = k_base + r;
+
+            // Extract INT4 weight from tile
+            const int linear_idx = r * 64 + col_in_tile;
+            const int u32_idx = linear_idx / 8;
+            const int bit_pos = linear_idx % 8;
+            const unsigned int packed = qw[tile_offset + u32_idx];
+            const int w_int4 = (packed >> (bit_pos * 4)) & 0xF;
+
+            // Get scale and zero for this group
+            const int group_idx = k_idx / group_size;
+            const __half scale_val = scales[group_idx * N + out_col];
+            const int zero_pack_col = out_col / 8;
+            const int zero_bit = out_col % 8;
+            const unsigned int zero_packed = qzeros[group_idx * (N / 8) + zero_pack_col];
+            const int zero = (zero_packed >> (zero_bit * 4)) & 0xF;
+
+            // Dequantize and FMA
+            const float w_float = (float)(w_int4 - zero) * __half2float(scale_val);
+            const float in_val = __half2float(input[row * K + k_idx]);
+            acc += w_float * in_val;
+        }
+    }
+
+    // Reduce across K-workers using shared memory
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    // Each column has workers at tid = col_in_tile + {0,1,2,3}*64
+    // Reduce: worker 0 accumulates from workers 1,2,3
+    if (k_worker == 0) {
+        float total = smem[col_in_tile];
+        for (int w = 1; w < num_k_workers; w++) {
+            total += smem[col_in_tile + w * 64];
+        }
+        output[row * N + out_col] = __float2half(total);
+    }
+}
+
+// ─── Fused LayerNorm + Linear Kernel ────────────────────────────────────
+//
+// Computes: output = rmsnorm(x, norm_weight, eps) @ linear_weight^T
+// in a single kernel pass, eliminating the intermediate normalized tensor.
+//
+// Each block processes one row of x:
+//   1. Compute RMS norm (sum of squares reduction in shared memory)
+//   2. For each output column, compute dot product of normalized row with
+//      the corresponding column of linear_weight
+//
+// Grid: (num_rows, 1, 1)
+// Block: (256, 1, 1)
+//
+// This kernel targets the common case of F16 activations and F16 weights.
+// For hidden_size > 256*4 (1024), fall back to unfused path on the host side.
+
+template <typename scalar_t>
+__global__ void fused_layernorm_linear_kernel(
+    scalar_t* __restrict__ output,            // [num_rows, out_features]
+    const scalar_t* __restrict__ input,       // [num_rows, hidden_size]
+    const float* __restrict__ norm_weight,    // [hidden_size]
+    const scalar_t* __restrict__ linear_weight, // [out_features, hidden_size]
+    int hidden_size,
+    int out_features,
+    float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int in_base = row * hidden_size;
+
+    // Phase 1: Compute RMS norm — sum of squares reduction
+    float partial_ss = 0.0f;
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float v = (float)input[in_base + i];
+        partial_ss += v * v;
+    }
+
+    extern __shared__ float shmem[];
+    shmem[tid] = partial_ss;
+    __syncthreads();
+
+    // Tree reduction for sum of squares
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float inv_rms = rsqrtf(shmem[0] / (float)hidden_size + eps);
+
+    // Phase 2: For each output column, compute dot(normalized_row, linear_weight_col)
+    // Each thread handles a subset of output columns
+    const int out_base = row * out_features;
+    for (int oc = tid; oc < out_features; oc += blockDim.x) {
+        float dot = 0.0f;
+        const int w_base = oc * hidden_size;
+        for (int i = 0; i < hidden_size; i++) {
+            float x_normed = (float)input[in_base + i] * inv_rms * norm_weight[i];
+            dot += x_normed * (float)linear_weight[w_base + i];
+        }
+        output[out_base + oc] = (scalar_t)dot;
+    }
+}
+
+extern "C" __global__ void fused_layernorm_linear_f32(
+    float* output, const float* input, const float* norm_weight,
+    const float* linear_weight, int hidden_size, int out_features, float eps
+) {
+    fused_layernorm_linear_kernel<float>(
+        output, input, norm_weight, linear_weight,
+        hidden_size, out_features, eps
+    );
+}
+
+extern "C" __global__ void fused_layernorm_linear_f16(
+    __half* output, const __half* input, const float* norm_weight,
+    const __half* linear_weight, int hidden_size, int out_features, float eps
+) {
+    fused_layernorm_linear_kernel<__half>(
+        output, input, norm_weight, linear_weight,
+        hidden_size, out_features, eps
+    );
+}
+
+// ─── FP8 E4M3 KV Cache Quantize/Dequantize ──────────────────────────────
+//
+// FP8 E4M3 format: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits.
+// Max representable value: 240.0, no infinity.
+//
+// These kernels convert between FP16 (compute dtype) and FP8 E4M3 (storage dtype)
+// with per-head scaling factors. Each head's values are scaled independently to
+// maximize precision within the FP8 range.
+//
+// Quantize: runs after attention K/V computation, before writing to cache.
+// Dequantize: runs after reading from cache, before attention computation.
+
+#define FP8_E4M3_MAX 240.0f
+
+// Convert f32 to FP8 E4M3 (as unsigned char)
+__device__ __forceinline__ unsigned char f32_to_fp8_e4m3(float val) {
+    if (val != val) return 0x7F;  // NaN check
+
+    unsigned char sign = (val < 0.0f) ? 1 : 0;
+    float abs_val = fabsf(val);
+
+    if (abs_val == 0.0f) return sign << 7;
+
+    // Clamp to max FP8 range
+    if (abs_val > FP8_E4M3_MAX) abs_val = FP8_E4M3_MAX;
+
+    // Flush tiny values to zero
+    if (abs_val < 1.953125e-3f) return sign << 7;  // 2^-9
+
+    // Extract f32 components
+    unsigned int bits = __float_as_uint(abs_val);
+    int f32_exp = ((bits >> 23) & 0xFF) - 127;
+    unsigned int f32_mant = bits & 0x7FFFFF;
+
+    // Subnormal in FP8
+    if (f32_exp < -6) {
+        int shift = -6 - f32_exp;
+        unsigned int full_mant = (1u << 3) | ((f32_mant >> 20) & 0x7);
+        unsigned char mant = (shift < 4) ? ((full_mant >> shift) & 0x7) : 0;
+        if (mant == 0) return sign << 7;
+        return (sign << 7) | mant;
+    }
+
+    // Normal
+    unsigned char biased_exp = (unsigned char)(f32_exp + 7);
+    if (biased_exp >= 15) return (sign << 7) | 0x7E;  // max normal = 240
+
+    unsigned char mant = (unsigned char)((f32_mant >> 20) & 0x7);
+    unsigned int round_bit = (f32_mant >> 19) & 1;
+    unsigned int sticky = f32_mant & 0x7FFFF;
+
+    if (round_bit == 1 && (sticky != 0 || (mant & 1) != 0)) {
+        mant++;
+    }
+    if (mant >= 8) {
+        biased_exp++;
+        mant = 0;
+        if (biased_exp >= 15) return (sign << 7) | 0x7E;
+    }
+
+    return (sign << 7) | (biased_exp << 3) | mant;
+}
+
+// Convert FP8 E4M3 (as unsigned char) back to f32
+__device__ __forceinline__ float fp8_e4m3_to_f32(unsigned char val) {
+    unsigned char sign = (val >> 7) & 1;
+    unsigned char exp = (val >> 3) & 0xF;
+    unsigned char mant = val & 0x7;
+
+    if (exp == 0xF && mant == 0x7) return __uint_as_float(0x7FC00000u);  // NaN
+
+    float abs_val;
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        abs_val = exp2f(-6.0f) * ((float)mant / 8.0f);  // subnormal
+    } else {
+        abs_val = exp2f((float)exp - 7.0f) * (1.0f + (float)mant / 8.0f);
+    }
+
+    return sign ? -abs_val : abs_val;
+}
+
+// Quantize KV to FP8 E4M3 for cache storage (runs after attention compute).
+//
+// Input:  [num_tokens, num_heads, head_dim] as __half
+// Output: [num_tokens, num_heads, head_dim] as unsigned char (FP8 E4M3)
+// Scales: [num_tokens, num_heads] as float (per-head scale factors)
+//
+// Grid:  (num_tokens, num_heads, 1)
+// Block: (min(head_dim, 256), 1, 1)
+//
+// Phase 1: Compute per-head absmax via shared memory reduction
+// Phase 2: Scale and quantize each element
+extern "C" __global__ void kv_cache_quantize_fp8(
+    unsigned char* __restrict__ output,
+    float* __restrict__ scales_out,
+    const __half* __restrict__ input,
+    int num_tokens,
+    int num_heads,
+    int head_dim
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (token_idx >= num_tokens || head_idx >= num_heads) return;
+
+    const int head_offset = (token_idx * num_heads + head_idx) * head_dim;
+
+    // Phase 1: Find per-head absmax
+    extern __shared__ float shmem[];
+    float local_max = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float v = fabsf(__half2float(input[head_offset + d]));
+        if (v > local_max) local_max = v;
+    }
+    shmem[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (shmem[tid + stride] > shmem[tid])
+                shmem[tid] = shmem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float absmax = shmem[0];
+    float scale = (absmax > 0.0f) ? (absmax / FP8_E4M3_MAX) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    // Thread 0 writes the scale
+    if (tid == 0) {
+        scales_out[token_idx * num_heads + head_idx] = scale;
+    }
+
+    // Phase 2: Quantize
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float v = __half2float(input[head_offset + d]) * inv_scale;
+        output[head_offset + d] = f32_to_fp8_e4m3(v);
+    }
+}
+
+// Dequantize FP8 E4M3 KV from cache (runs before attention).
+//
+// Input:  [num_tokens, num_heads, head_dim] as unsigned char (FP8 E4M3)
+// Scales: [num_tokens, num_heads] as float
+// Output: [num_tokens, num_heads, head_dim] as __half
+//
+// Grid:  (num_tokens, num_heads, 1)
+// Block: (min(head_dim, 256), 1, 1)
+extern "C" __global__ void kv_cache_dequantize_fp8(
+    __half* __restrict__ output,
+    const unsigned char* __restrict__ input,
+    const float* __restrict__ scales,
+    int num_tokens,
+    int num_heads,
+    int head_dim
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (token_idx >= num_tokens || head_idx >= num_heads) return;
+
+    const int head_offset = (token_idx * num_heads + head_idx) * head_dim;
+    const float scale = scales[token_idx * num_heads + head_idx];
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float v = fp8_e4m3_to_f32(input[head_offset + d]) * scale;
+        output[head_offset + d] = __float2half(v);
+    }
+}
+
+// ─── FP8 E4M3 Dequantization Kernel ──────────────────────────────────
+//
+// Dequantizes FP8 E4M3 weights (stored as u8) to half-precision (F16) output.
+//
+// FP8 E4M3 format: sign(1) + exponent(4) + mantissa(3), bias=7
+//   - NaN: exp=15, man=7 (0x7F / 0xFF)
+//   - Max: 448.0 (exp=15, man=6)
+//   - Subnormals: exp=0, man!=0 -> value = man * 2^(-9)
+//   - Normals: value = 2^(exp-7) * (1 + man/8)
+//
+// Each thread dequantizes one element:
+//   output[idx] = fp8_to_half(input[idx]) * scale
+//
+// Scale is either per-tensor (per_channel=0, scale[0]) or
+// per-channel (per_channel=1, scale[row]).
+//
+// Grid: 1D over total elements.
+
+__device__ __half fp8_e4m3_to_half(unsigned char bits) {
+    unsigned char sign_bit = (bits >> 7) & 1;
+    unsigned char exp_bits = (bits >> 3) & 0xF;
+    unsigned char man_bits = bits & 0x7;
+
+    // NaN
+    if (exp_bits == 15 && man_bits == 7) {
+        return __float2half(0.0f / 0.0f);
+    }
+
+    float sign_f = sign_bit ? -1.0f : 1.0f;
+
+    if (exp_bits == 0) {
+        if (man_bits == 0) {
+            return __float2half(0.0f);
+        }
+        // Subnormal: value = man * 2^(-9)
+        float val = sign_f * (float)man_bits * (1.0f / 512.0f);
+        return __float2half(val);
+    }
+
+    // Normal: value = 2^(exp-7) * (1 + man/8)
+    int exp_unbiased = (int)exp_bits - 7;
+    float significand = 1.0f + (float)man_bits / 8.0f;
+    float val = sign_f * ldexpf(significand, exp_unbiased);
+    return __float2half(val);
+}
+
+extern "C" __global__ void fp8_e4m3_dequant_f16(
+    __half* __restrict__ output,
+    const unsigned char* __restrict__ input,
+    const __half* __restrict__ scale,
+    int rows,
+    int cols,
+    int per_channel
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * cols;
+    if (idx >= total) return;
+
+    const int row = idx / cols;
+    const __half s = per_channel ? scale[row] : scale[0];
+
+    __half dequant = fp8_e4m3_to_half(input[idx]);
+    output[idx] = __hmul(dequant, s);
+}
+
+// F32 variant of FP8 E4M3 dequantization
+extern "C" __global__ void fp8_e4m3_dequant_f32(
+    float* __restrict__ output,
+    const unsigned char* __restrict__ input,
+    const float* __restrict__ scale,
+    int rows,
+    int cols,
+    int per_channel
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * cols;
+    if (idx >= total) return;
+
+    const int row = idx / cols;
+    const float s = per_channel ? scale[row] : scale[0];
+
+    // Inline FP8 E4M3 to float conversion
+    unsigned char bits = input[idx];
+    unsigned char sign_bit = (bits >> 7) & 1;
+    unsigned char exp_bits = (bits >> 3) & 0xF;
+    unsigned char man_bits = bits & 0x7;
+
+    float val;
+    if (exp_bits == 15 && man_bits == 7) {
+        val = 0.0f / 0.0f; // NaN
+    } else if (exp_bits == 0) {
+        if (man_bits == 0) {
+            val = 0.0f;
+        } else {
+            val = (sign_bit ? -1.0f : 1.0f) * (float)man_bits * (1.0f / 512.0f);
+        }
+    } else {
+        int exp_unbiased = (int)exp_bits - 7;
+        float significand = 1.0f + (float)man_bits / 8.0f;
+        val = (sign_bit ? -1.0f : 1.0f) * ldexpf(significand, exp_unbiased);
+    }
+
+    output[idx] = val * s;
+}
+
 // F32 variant of GPTQ dequantization
 extern "C" __global__ void gptq_dequant_f32(
     float* __restrict__ output,               // [out_features, in_features]

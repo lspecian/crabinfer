@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
+use crabinfer_core::serving::guided::GuidedConstraint;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_stream::wrappers::ReceiverStream;
@@ -118,7 +119,7 @@ pub async fn chat_completions(
 /// Non-streaming chat completions via the serving engine.
 async fn serving_chat_completions(
     state: &AppState,
-    engine: &crabinfer_core::serving::engine_loop::EngineHandle,
+    engine: &crabinfer_core::serving::worker_pool::WorkerPool,
     req: &ChatCompletionRequest,
 ) -> Result<axum::response::Response, ServerError> {
     use crabinfer_core::serving::sequence::SamplingParams;
@@ -142,6 +143,11 @@ async fn serving_chat_completions(
     let top_logprobs_n = req.top_logprobs.unwrap_or(0).min(20) as usize;
 
     let priority = req.priority.unwrap_or(0);
+    let guided_constraint = extract_guided_constraint(&req.response_format);
+
+    // Parse optional LoRA adapter from model field (e.g., "llama:my-adapter")
+    let (_base_model, lora_adapter) = crabinfer_core::serving::lora::parse_model_adapter(&req.model);
+    let lora_adapter = lora_adapter.map(|s| s.to_string());
 
     let params = SamplingParams {
         temperature,
@@ -150,6 +156,8 @@ async fn serving_chat_completions(
         logprobs: want_logprobs,
         top_logprobs: top_logprobs_n,
         priority,
+        guided_constraint,
+        lora_adapter,
         ..SamplingParams::default()
     };
 
@@ -424,7 +432,7 @@ async fn chat_completions_stream(
 /// Streaming chat completions via the serving engine.
 async fn serving_chat_completions_stream(
     state: Arc<AppState>,
-    engine: crabinfer_core::serving::engine_loop::EngineHandle,
+    engine: crabinfer_core::serving::worker_pool::WorkerPool,
     req: ChatCompletionRequest,
 ) -> Result<
     Sse<axum::response::sse::KeepAliveStream<ReceiverStream<Result<Event, std::convert::Infallible>>>>,
@@ -454,6 +462,11 @@ async fn serving_chat_completions_stream(
         .and_then(|o| o.include_usage)
         .unwrap_or(false);
     let priority = req.priority.unwrap_or(0);
+    let guided_constraint = extract_guided_constraint(&req.response_format);
+
+    // Parse optional LoRA adapter from model field (e.g., "llama:my-adapter")
+    let (_base_model, lora_adapter) = crabinfer_core::serving::lora::parse_model_adapter(&req.model);
+    let lora_adapter = lora_adapter.map(|s| s.to_string());
 
     let params = SamplingParams {
         temperature,
@@ -462,6 +475,8 @@ async fn serving_chat_completions_stream(
         logprobs: want_logprobs,
         top_logprobs: top_logprobs_n,
         priority,
+        guided_constraint,
+        lora_adapter,
         ..SamplingParams::default()
     };
 
@@ -703,7 +718,7 @@ fn prepare_messages(
             let tools_prompt = build_tools_system_prompt(tools, tool_choice);
             out.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(tools_prompt),
+                content: Some(tools_prompt.into()),
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,
@@ -716,7 +731,7 @@ fn prepare_messages(
         if let Some(prompt) = build_response_format_prompt(fmt) {
             out.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(prompt),
+                content: Some(prompt.into()),
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,
@@ -736,7 +751,7 @@ fn prepare_messages(
                     role: "user".to_string(),
                     content: Some(format!(
                         "[Tool result for {tool_name} (call_id: {tool_id})]:\n{result_text}"
-                    )),
+                    ).into()),
                     tool_call_id: None,
                     tool_calls: None,
                     name: None,
@@ -755,7 +770,7 @@ fn prepare_messages(
                 }
                 out.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some(content),
+                    content: Some(content.into()),
                     tool_call_id: None,
                     tool_calls: None,
                     name: None,
@@ -828,6 +843,24 @@ fn build_tools_system_prompt(tools: &[ToolDefinition], tool_choice: &Option<Tool
 // ---------------------------------------------------------------------------
 // Response format (JSON mode / structured output)
 // ---------------------------------------------------------------------------
+
+/// Extract a guided decoding constraint from the request's response_format.
+///
+/// Returns `Some(GuidedConstraint)` for `json_schema` type (token-level DFA masking).
+/// Returns `None` for `json_object` (prompt-only), `text`, or missing format.
+/// The prompt-based injection (`build_response_format_prompt`) still runs alongside
+/// the token-level constraint for belt-and-suspenders reliability.
+fn extract_guided_constraint(response_format: &Option<ResponseFormat>) -> Option<GuidedConstraint> {
+    let fmt = response_format.as_ref()?;
+    match fmt.type_field.as_str() {
+        "json_schema" => {
+            let spec = fmt.json_schema.as_ref()?;
+            let schema = spec.schema.as_ref()?;
+            Some(GuidedConstraint::JsonSchema(schema.clone()))
+        }
+        _ => None, // "text", "json_object", unknown -- no token-level constraint
+    }
+}
 
 /// Build a system prompt for response_format constraints.
 ///
@@ -1297,5 +1330,86 @@ mod tests {
         let text = r#"{"message": "Use {curly} braces"}"#;
         let v = extract_json_from_output(text).unwrap();
         assert_eq!(v["message"], "Use {curly} braces");
+    }
+
+    // ── Guided constraint extraction tests ──
+
+    #[test]
+    fn test_response_format_json_schema_creates_constraint() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+        let fmt = Some(ResponseFormat {
+            type_field: "json_schema".to_string(),
+            json_schema: Some(JsonSchemaSpec {
+                name: "UserProfile".to_string(),
+                description: Some("A user profile".to_string()),
+                schema: Some(schema.clone()),
+                strict: Some(true),
+            }),
+        });
+        let constraint = extract_guided_constraint(&fmt);
+        match constraint {
+            Some(GuidedConstraint::JsonSchema(v)) => {
+                assert_eq!(v, schema, "Schema value should match input");
+            }
+            other => panic!("Expected GuidedConstraint::JsonSchema, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_format_text_no_constraint() {
+        let fmt = Some(ResponseFormat {
+            type_field: "text".to_string(),
+            json_schema: None,
+        });
+        assert!(
+            extract_guided_constraint(&fmt).is_none(),
+            "text format should not produce a constraint"
+        );
+    }
+
+    #[test]
+    fn test_response_format_json_object_no_constraint() {
+        let fmt = Some(ResponseFormat {
+            type_field: "json_object".to_string(),
+            json_schema: None,
+        });
+        assert!(
+            extract_guided_constraint(&fmt).is_none(),
+            "json_object format should not produce a constraint (prompt-only)"
+        );
+    }
+
+    #[test]
+    fn test_response_format_none_no_constraint() {
+        let fmt: Option<ResponseFormat> = None;
+        assert!(
+            extract_guided_constraint(&fmt).is_none(),
+            "None response_format should not produce a constraint"
+        );
+    }
+
+    #[test]
+    fn test_response_format_json_schema_no_schema_value() {
+        // json_schema type but no actual schema provided -- should return None
+        let fmt = Some(ResponseFormat {
+            type_field: "json_schema".to_string(),
+            json_schema: Some(JsonSchemaSpec {
+                name: "Empty".to_string(),
+                description: None,
+                schema: None,
+                strict: None,
+            }),
+        });
+        assert!(
+            extract_guided_constraint(&fmt).is_none(),
+            "json_schema without schema value should not produce a constraint"
+        );
     }
 }

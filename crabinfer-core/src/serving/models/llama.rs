@@ -4,7 +4,13 @@
 //! passes using the serving system's paged KV cache. Compatible with:
 //! - Llama 2/3
 //! - CodeLlama
+//! - Qwen2/2.5 (via QKV biases — `attn_q_bias`, `attn_k_bias`, `attn_v_bias`)
+//! - Qwen3/3.5 (via QKV biases + QK normalization — `attn_q_norm`, `attn_k_norm`)
 //! - Other Llama-derived architectures (same GGUF weight names)
+//!
+//! For HuggingFace safetensors loading of Qwen models, see
+//! [`SafetensorsQwenModel`](super::super::safetensors_loader) which provides
+//! explicit Qwen2/3 dispatch with bias and QK norm support.
 //!
 //! MoE (Mixture of Experts) variants are not yet supported — use the standard
 //! Llama loader for dense models only.
@@ -20,6 +26,7 @@ use crate::serving::quantization::{MaybeQuantizedLinear, QuantizationMethod};
 // ─── Transformer layer ───────────────────────────────────────────────────
 
 /// Single transformer layer for the Llama architecture.
+#[derive(Clone)]
 struct LlamaLayer {
     /// Pre-attention RMS normalization.
     attn_norm: RmsNorm,
@@ -353,8 +360,32 @@ impl ModelRunner for LlamaModel {
         }
 
         // Final norm + output projection: [total_tokens, hidden_size] -> [total_tokens, vocab_size]
-        let hidden_states = self.norm.forward_fused(&hidden_states, ctx.backend)?;
-        self.lm_head.forward(&hidden_states)
+        // Uses fused norm+linear when lm_head is a dense weight (eliminates intermediate tensor).
+        self.norm.forward_linear_fused(&hidden_states, &self.lm_head, ctx.backend)
+    }
+
+    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        // Look up token embeddings from the model's learned embedding table,
+        // then mean-pool across the sequence dimension to produce a single
+        // fixed-size vector per input.
+        // input_ids: [num_tokens] -> embeddings: [num_tokens, hidden_size]
+        let embeddings = self.embed_table.index_select(input_ids, 0)?;
+        // Mean-pool: [num_tokens, hidden_size] -> [hidden_size]
+        embeddings.mean(0)
+    }
+
+    fn embedding_table(&self) -> Option<&Tensor> {
+        Some(&self.embed_table)
+    }
+
+    fn clone_model(&self) -> Box<dyn ModelRunner> {
+        Box::new(LlamaModel {
+            embed_table: self.embed_table.clone(),
+            layers: self.layers.clone(),
+            norm: self.norm.clone(),
+            lm_head: self.lm_head.clone(),
+            config: self.config.clone(),
+        })
     }
 
     fn num_layers(&self) -> usize {
