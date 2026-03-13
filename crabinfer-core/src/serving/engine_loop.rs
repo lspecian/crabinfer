@@ -1362,27 +1362,30 @@ impl ServingEngineInner {
             bt_offset += max_blocks;
         }
 
-        // Create tensors on the model's device from arena slices
+        // Create tensors on the model's device from arena slices.
+        // We build from u32 arena data but cast to I32 because:
+        //  - candle's CUDA index_select requires I32/I64 (not U32)
+        //  - Our CUDA paged attention kernels read block_tables/slot_mapping/context_lens as i32
         let input_ids = Tensor::new(
             &arena_input_ids[..token_offset],
             &self.device,
-        )?;
+        )?.to_dtype(candle_core::DType::I64)?;
         let positions = Tensor::new(
             &arena_positions[..token_offset],
             &self.device,
-        )?;
+        )?.to_dtype(candle_core::DType::I64)?;
         let slot_mapping = Tensor::new(
             &arena_slot_mapping[..token_offset],
             &self.device,
-        )?;
+        )?.to_dtype(candle_core::DType::I32)?;
         let context_lens = Tensor::new(
             &arena_context_lens[..seq_idx],
             &self.device,
-        )?;
+        )?.to_dtype(candle_core::DType::I32)?;
         let block_table = Tensor::new(
             &flat_block_table[..flat_bt_len],
             &self.device,
-        )?
+        )?.to_dtype(candle_core::DType::I32)?
         .reshape((num_seqs, max_blocks))?;
 
         Ok(BatchInput {
