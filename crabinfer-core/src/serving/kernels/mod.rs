@@ -65,14 +65,17 @@ pub const NUM_THREADS: usize = 256;
 
 /// Detect and return the best available kernel backend for this platform.
 ///
+/// If `device` is provided and is a CUDA device, the backend will share
+/// that CUDA context so kernels operate on the same device as model tensors.
+///
 /// Selection order:
 /// 1. CUDA (if `cuda` feature enabled and NVIDIA GPU available)
 /// 2. Metal (if `metal` feature enabled — Apple Silicon)
 /// 3. CPU (always available, used for CI and testing)
-pub fn detect_backend() -> Box<dyn KernelBackend> {
+pub fn detect_backend(device: Option<&candle_core::Device>) -> Box<dyn KernelBackend> {
     #[cfg(feature = "cuda")]
     {
-        match CudaBackend::new(0) {
+        match CudaBackend::new_with_device(device, 0) {
             Ok(backend) => {
                 tracing::info!("Kernel backend: CUDA (device 0)");
                 return Box::new(backend);
@@ -82,6 +85,9 @@ pub fn detect_backend() -> Box<dyn KernelBackend> {
             }
         }
     }
+
+    // Silence unused variable warning on non-CUDA builds
+    let _ = device;
 
     #[cfg(feature = "metal")]
     {

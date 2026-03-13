@@ -368,8 +368,8 @@ impl EngineHandle {
             tracing::info!("Speculative decoding enabled");
         }
 
-        // Detect kernel backend (CUDA > Metal > CPU)
-        let backend = super::kernels::detect_backend();
+        // Detect kernel backend (CUDA > Metal > CPU), sharing the model's device context
+        let backend = super::kernels::detect_backend(Some(&device));
 
         // Initialize CUDA graph cache
         let graph_config = super::cuda_graphs::CudaGraphConfig {

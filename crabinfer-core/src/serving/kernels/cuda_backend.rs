@@ -32,12 +32,20 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
-    /// Create a new CUDA backend on the given device ordinal (usually 0).
+    /// Create a new CUDA backend, optionally sharing a `candle_core::Device`.
+    ///
+    /// If `shared_device` is `Some(Device::Cuda(..))`, the backend reuses that
+    /// CUDA context so kernels run on the same device as model tensors.
+    /// Otherwise, opens a new CUDA device at `ordinal`.
     ///
     /// Compiles the embedded CUDA kernels to PTX using NVRTC at construction time.
-    pub fn new(ordinal: usize) -> std::result::Result<Self, String> {
-        let device = candle_core::CudaDevice::new_with_stream(ordinal)
-            .map_err(|e| format!("failed to open CUDA device {ordinal}: {e}"))?;
+    pub fn new_with_device(shared_device: Option<&Device>, ordinal: usize) -> std::result::Result<Self, String> {
+        let device = if let Some(Device::Cuda(cuda_dev)) = shared_device {
+            cuda_dev.clone()
+        } else {
+            candle_core::CudaDevice::new_with_stream(ordinal)
+                .map_err(|e| format!("failed to open CUDA device {ordinal}: {e}"))?
+        };
 
         // Compile CUDA source to PTX using NVRTC.
         // We need to pass the CUDA include path for headers like cuda_fp16.h.
@@ -62,6 +70,11 @@ impl CudaBackend {
             device,
             compiled_ptx,
         })
+    }
+
+    /// Create a new CUDA backend on the given device ordinal (usually 0).
+    pub fn new(ordinal: usize) -> std::result::Result<Self, String> {
+        Self::new_with_device(None, ordinal)
     }
 
     /// Get a CudaFunc for the named kernel, loading from pre-compiled PTX.
@@ -1760,7 +1773,7 @@ mod tests {
             eprintln!("SKIP: no CUDA device");
             return;
         }
-        let backend = crate::serving::kernels::detect_backend();
+        let backend = crate::serving::kernels::detect_backend(None);
         assert_eq!(backend.name(), "cuda");
     }
 
