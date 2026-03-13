@@ -1151,9 +1151,11 @@ impl ServingEngineInner {
         let bs = 1;
         let input_ids = Tensor::zeros((bs,), DType::I64, &self.device)?;
         let positions = Tensor::zeros((bs,), DType::I64, &self.device)?;
-        let slot_mapping = Tensor::zeros((bs,), DType::I32, &self.device)?;
-        let block_table = Tensor::zeros((bs, 1), DType::I32, &self.device)?;
-        let context_lens = Tensor::ones((bs,), DType::I32, &self.device)?;
+        // Create I32 tensors on CPU first, then copy to device.
+        // Workaround: candle's CUDA fill kernel doesn't have const_set_i32.
+        let slot_mapping = Tensor::zeros((bs,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        let block_table = Tensor::zeros((bs, 1), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        let context_lens = Tensor::ones((bs,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
 
         let ctx = ForwardContext {
             positions: &positions,
@@ -1200,15 +1202,16 @@ impl ServingEngineInner {
             self.cuda_graph_cache.insert_graph(batch_size, buffers);
         }
 
-        // Build dummy decode inputs (I64 for index_select, I32 for CUDA kernels)
+        // Build dummy decode inputs (I64 for index_select, I32 for CUDA kernels).
+        // I32 tensors created on CPU first — candle's CUDA fill kernel lacks const_set_i32.
         let input_ids = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
         let positions = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
-        let slot_mapping = Tensor::zeros((batch_size,), DType::I32, &self.device)?;
+        let slot_mapping = Tensor::zeros((batch_size,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
         let max_blocks = self.kv_caches.first()
             .map(|(k, _)| k.dims()[0])  // num_blocks dimension
             .unwrap_or(1);
-        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), DType::I32, &self.device)?;
-        let context_lens = Tensor::ones((batch_size,), DType::I32, &self.device)?;
+        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        let context_lens = Tensor::ones((batch_size,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
 
         let query_start_loc: Vec<usize> = (0..=batch_size).collect();
         let seq_lens: Vec<usize> = vec![1; batch_size];
@@ -1362,31 +1365,26 @@ impl ServingEngineInner {
             bt_offset += max_blocks;
         }
 
-        // Create tensors on the model's device from arena slices.
-        // We build from u32 arena data but cast to I32 because:
-        //  - candle's CUDA index_select requires I32/I64 (not U32)
-        //  - Our CUDA paged attention kernels read block_tables/slot_mapping/context_lens as i32
-        let input_ids = Tensor::new(
-            &arena_input_ids[..token_offset],
-            &self.device,
-        )?.to_dtype(candle_core::DType::I64)?;
-        let positions = Tensor::new(
-            &arena_positions[..token_offset],
-            &self.device,
-        )?.to_dtype(candle_core::DType::I64)?;
-        let slot_mapping = Tensor::new(
-            &arena_slot_mapping[..token_offset],
-            &self.device,
-        )?.to_dtype(candle_core::DType::I32)?;
-        let context_lens = Tensor::new(
-            &arena_context_lens[..seq_idx],
-            &self.device,
-        )?.to_dtype(candle_core::DType::I32)?;
-        let block_table = Tensor::new(
-            &flat_block_table[..flat_bt_len],
-            &self.device,
-        )?.to_dtype(candle_core::DType::I32)?
-        .reshape((num_seqs, max_blocks))?;
+        // Create tensors from arena u32 data.
+        // We reinterpret u32 as i64/i32 on CPU (safe: values are small positive numbers),
+        // then transfer to the model's device. This avoids CUDA cast/fill kernels that
+        // don't exist for I32 in candle's kernel set.
+        let ids_i64: Vec<i64> = arena_input_ids[..token_offset].iter().map(|&x| x as i64).collect();
+        let input_ids = Tensor::new(ids_i64.as_slice(), &Device::Cpu)?.to_device(&self.device)?;
+
+        let pos_i64: Vec<i64> = arena_positions[..token_offset].iter().map(|&x| x as i64).collect();
+        let positions = Tensor::new(pos_i64.as_slice(), &Device::Cpu)?.to_device(&self.device)?;
+
+        let sm_i32: Vec<i32> = arena_slot_mapping[..token_offset].iter().map(|&x| x as i32).collect();
+        let slot_mapping = Tensor::new(sm_i32.as_slice(), &Device::Cpu)?.to_device(&self.device)?;
+
+        let cl_i32: Vec<i32> = arena_context_lens[..seq_idx].iter().map(|&x| x as i32).collect();
+        let context_lens = Tensor::new(cl_i32.as_slice(), &Device::Cpu)?.to_device(&self.device)?;
+
+        let bt_i32: Vec<i32> = flat_block_table[..flat_bt_len].iter().map(|&x| x as i32).collect();
+        let block_table = Tensor::new(bt_i32.as_slice(), &Device::Cpu)?
+            .to_device(&self.device)?
+            .reshape((num_seqs, max_blocks))?;
 
         Ok(BatchInput {
             input_ids,

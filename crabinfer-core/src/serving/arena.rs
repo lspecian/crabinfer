@@ -112,7 +112,13 @@ impl TensorBufferPool {
             let key = (shape.to_vec(), dtype);
             let tensors = free.entry(key).or_default();
             for _ in 0..count {
-                tensors.push(Tensor::zeros(shape, dtype, device)?);
+                // candle's CUDA kernels lack const_set_i32/i16, so create on CPU and transfer.
+                let t = if matches!(dtype, DType::I32 | DType::I16) && !device.is_cpu() {
+                    Tensor::zeros(shape, dtype, &Device::Cpu)?.to_device(device)?
+                } else {
+                    Tensor::zeros(shape, dtype, device)?
+                };
+                tensors.push(t);
             }
         }
         Ok(Self {
