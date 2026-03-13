@@ -909,10 +909,15 @@ pub fn load_model_from_safetensors_with_backend(
         unsafe { candle_core::safetensors::MmapedSafetensors::multi(&st_files)? }
     };
 
-    // Load all tensors into a HashMap for easy lookup
+    // Load all tensors into a HashMap on CPU first.
+    // We load to CPU because candle's CUDA backend lacks some kernels
+    // (e.g., const_set_i32) that would be invoked if we loaded I32 tensors
+    // (like GPTQ qweight/qzeros) directly to GPU.
+    // Individual tensors are moved to the target device when accessed by
+    // load_tensor() / load_raw_tensor().
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for (name, _view) in tensors.tensors() {
-        let tensor = tensors.load(&name, device)?;
+        let tensor = tensors.load(&name, &Device::Cpu)?;
         weights.insert(name, tensor);
     }
 
