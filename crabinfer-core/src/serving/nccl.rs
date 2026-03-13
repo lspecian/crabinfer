@@ -45,6 +45,7 @@ mod ffi {
         pub internal: [u8; super::NCCL_UNIQUE_ID_BYTES],
     }
 
+    #[link(name = "nccl")]
     extern "C" {
         pub fn ncclGetUniqueId(unique_id: *mut NcclUniqueId) -> NcclResult;
         pub fn ncclCommInitRank(
