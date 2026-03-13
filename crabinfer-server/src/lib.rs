@@ -242,7 +242,22 @@ fn load_serving_engine(
     let device = if config.cpu {
         candle_core::Device::Cpu
     } else {
-        candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        // Try CUDA first, then Metal, then CPU
+        #[cfg(feature = "cuda")]
+        {
+            candle_core::Device::new_cuda(0).unwrap_or_else(|_| {
+                tracing::warn!("CUDA device not available, falling back to CPU");
+                candle_core::Device::Cpu
+            })
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
+        }
+        #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+        {
+            candle_core::Device::Cpu
+        }
     };
     tracing::info!("Serving engine device: {:?}", device);
 
