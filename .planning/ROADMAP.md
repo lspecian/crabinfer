@@ -45,7 +45,13 @@ Plans:
   2. The engine makes zero CUDA allocation calls during a steady-state forward pass (pre-allocated arena and buffer pool cover all temporary tensors)
   3. Concurrent requests tokenize in parallel — throughput scales with batch size without a serialization bottleneck
   4. Tokenizer is compiled/cached at startup; repeated identical strings hit the cache rather than re-running tokenization
-**Plans**: TBD
+**Plans:** 4 plans
+
+Plans:
+- [ ] 02-00-PLAN.md — Wave 0: failing test stubs for all Phase 2 behaviors (Nyquist compliance)
+- [ ] 02-01-PLAN.md — Fused LayerNorm+linear CUDA kernel with KernelBackend trait wiring
+- [ ] 02-02-PLAN.md — Arena allocator and tensor buffer pool for zero-alloc inference
+- [ ] 02-03-PLAN.md — Cached tokenizer with LRU cache and parallel batch encoding
 
 ### Phase 3: Guided Decoding
 **Goal**: Clients can request constrained generation via JSON Schema or regex and receive outputs that conform to the constraint with less than 5% overhead vs unconstrained
@@ -76,6 +82,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Model Loading and Quantization | 3/4 | In Progress|  |
-| 2. Performance Optimization | 0/TBD | Not started | - |
+| 2. Performance Optimization | 0/4 | Planned | - |
 | 3. Guided Decoding | 0/TBD | Not started | - |
 | 4. Production Infrastructure | 0/TBD | Not started | - |
