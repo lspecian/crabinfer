@@ -24,15 +24,17 @@ impl CpuBackend {
 /// This mirrors GPU backends which mutate buffer memory through shared
 /// tensor references via command encoders / kernel launches.
 unsafe fn cpu_f32_mut(tensor: &Tensor) -> Result<&mut [f32]> {
-    let (mut storage, layout) = tensor.storage_mut_and_layout();
+    let (storage, layout) = tensor.storage_and_layout();
     let offset = layout.start_offset();
-    match &mut *storage {
+    match &*storage {
         candle_core::Storage::Cpu(cpu_storage) => match cpu_storage {
-            candle_core::CpuStorage::F32(ref mut data) => {
-                let slice = &mut data[offset..];
-                // Extend lifetime to match tensor — safe because the engine loop
-                // is single-threaded and caches outlive all operations.
-                Ok(std::mem::transmute::<&mut [f32], &mut [f32]>(slice))
+            candle_core::CpuStorage::F32(data) => {
+                // Cast away immutability — safe because the engine loop
+                // is single-threaded, caches outlive all operations, and
+                // candle's `storage_mut_and_layout` is pub(crate).
+                let ptr = data.as_ptr() as *mut f32;
+                let len = data.len() - offset;
+                Ok(std::slice::from_raw_parts_mut(ptr.add(offset), len))
             }
             _ => candle_core::bail!("expected F32 CPU storage"),
         },

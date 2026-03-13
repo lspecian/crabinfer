@@ -69,7 +69,8 @@ impl Model {
     fn clear_kv_cache(&mut self) {
         match self {
             Model::Qwen3(m) => m.clear_kv_cache(),
-            Model::Qwen3Moe(m) => m.clear_kv_cache(),
+            // Qwen3MoE: clear_kv_cache not yet upstream; silently skip
+            Model::Qwen3Moe(_m) => {},
             // Other architectures auto-reset on index_pos==0
             _ => {}
         }
