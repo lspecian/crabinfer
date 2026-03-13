@@ -415,8 +415,8 @@ impl SwapManager {
 
                 // Get raw GPU pointers via DevicePtr trait
                 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-                let k_slice = k_cuda.as_cuda_slice::<u8>()?;
-                let v_slice = v_cuda.as_cuda_slice::<u8>()?;
+                let k_slice = k_cuda.as_cuda_slice::<f32>()?;
+                let v_slice = v_cuda.as_cuda_slice::<f32>()?;
                 let stream = k_cuda.device.cuda_stream();
                 let (k_base_ptr, _k_sync) = k_slice.device_ptr(&stream);
                 let (v_base_ptr, _v_sync) = v_slice.device_ptr(&stream);
@@ -499,8 +499,8 @@ impl SwapManager {
                 let gpu_v_byte_offset = gpu_block_id * block_elems_per_layer * self.kv_config.dtype_bytes;
 
                 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-                let k_slice = k_cuda.as_cuda_slice::<u8>()?;
-                let v_slice = v_cuda.as_cuda_slice::<u8>()?;
+                let k_slice = k_cuda.as_cuda_slice::<f32>()?;
+                let v_slice = v_cuda.as_cuda_slice::<f32>()?;
                 let stream = k_cuda.device.cuda_stream();
                 let (k_base_ptr, _k_sync) = k_slice.device_ptr(&stream);
                 let (v_base_ptr, _v_sync) = v_slice.device_ptr(&stream);
