@@ -481,34 +481,36 @@ impl KernelBackend for CudaBackend {
             shared_mem_bytes: 0,
         };
 
-        let (o_st, _) = output.storage_and_layout();
-        let (g_st, _) = gate.storage_and_layout();
-        let (u_st, _) = up.storage_and_layout();
-        let o_cuda = as_cuda(&o_st)?;
-        let g_cuda = as_cuda(&g_st)?;
-        let u_cuda = as_cuda(&u_st)?;
-        let arg_total = total_elements as i32;
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (g_st, _) = gate.storage_and_layout();
+            let (u_st, _) = up.storage_and_layout();
+            let o_cuda = as_cuda(&o_st)?;
+            let g_cuda = as_cuda(&g_st)?;
+            let u_cuda = as_cuda(&u_st)?;
+            let arg_total = total_elements as i32;
 
-        match gate.dtype() {
-            DType::F32 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&g_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&u_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_total);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul_f32 launch: {e}")))?;
+            match gate.dtype() {
+                DType::F32 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(g_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(u_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_total);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul_f32 launch: {e}")))?;
+                }
+                DType::F16 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(g_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(u_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(&arg_total);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul_f16 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F16 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&g_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&u_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&arg_total);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_silu_mul_f16 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok(output)
@@ -554,52 +556,54 @@ impl KernelBackend for CudaBackend {
         };
 
         // Get raw CUDA slices
-        let (o_st, _) = output.storage_and_layout();
-        let (p_st, _) = positions_u32.storage_and_layout();
-        let (c_st, _) = cos.storage_and_layout();
-        let (s_st, _) = sin.storage_and_layout();
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (p_st, _) = positions_u32.storage_and_layout();
+            let (c_st, _) = cos.storage_and_layout();
+            let (s_st, _) = sin.storage_and_layout();
 
-        let o_cuda = as_cuda(&o_st)?;
-        let p_cuda = as_cuda(&p_st)?;
-        let c_cuda = as_cuda(&c_st)?;
-        let s_cuda = as_cuda(&s_st)?;
+            let o_cuda = as_cuda(&o_st)?;
+            let p_cuda = as_cuda(&p_st)?;
+            let c_cuda = as_cuda(&c_st)?;
+            let s_cuda = as_cuda(&s_st)?;
 
-        let pos_slice = p_cuda.as_cuda_slice::<u32>()?;
-        let cos_slice = c_cuda.as_cuda_slice::<f32>()?;
-        let sin_slice = s_cuda.as_cuda_slice::<f32>()?;
+            let pos_slice = p_cuda.as_cuda_slice::<u32>()?;
+            let cos_slice = c_cuda.as_cuda_slice::<f32>()?;
+            let sin_slice = s_cuda.as_cuda_slice::<f32>()?;
 
-        let arg_num_heads = num_heads as i32;
-        let arg_head_size = head_size as i32;
-        let arg_rope_dim = rope_dim as i32;
+            let arg_num_heads = num_heads as i32;
+            let arg_head_size = head_size as i32;
+            let arg_rope_dim = rope_dim as i32;
 
-        match x.dtype() {
-            DType::F32 => {
-                let x_slice = o_cuda.as_cuda_slice::<f32>()?;
-                let mut builder = func.builder();
-                builder.arg(&x_slice);
-                builder.arg(&pos_slice);
-                builder.arg(&cos_slice);
-                builder.arg(&sin_slice);
-                builder.arg(&arg_num_heads);
-                builder.arg(&arg_head_size);
-                builder.arg(&arg_rope_dim);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_rope_f32 launch: {e}")))?;
+            match x.dtype() {
+                DType::F32 => {
+                    let x_slice = o_cuda.as_cuda_slice::<f32>()?;
+                    let mut builder = func.builder();
+                    builder.arg(x_slice);
+                    builder.arg(pos_slice);
+                    builder.arg(cos_slice);
+                    builder.arg(sin_slice);
+                    builder.arg(&arg_num_heads);
+                    builder.arg(&arg_head_size);
+                    builder.arg(&arg_rope_dim);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_rope_f32 launch: {e}")))?;
+                }
+                DType::F16 => {
+                    let x_slice = o_cuda.as_cuda_slice::<f16>()?;
+                    let mut builder = func.builder();
+                    builder.arg(x_slice);
+                    builder.arg(pos_slice);
+                    builder.arg(cos_slice);
+                    builder.arg(sin_slice);
+                    builder.arg(&arg_num_heads);
+                    builder.arg(&arg_head_size);
+                    builder.arg(&arg_rope_dim);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_rope_f16 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F16 => {
-                let x_slice = o_cuda.as_cuda_slice::<f16>()?;
-                let mut builder = func.builder();
-                builder.arg(&x_slice);
-                builder.arg(&pos_slice);
-                builder.arg(&cos_slice);
-                builder.arg(&sin_slice);
-                builder.arg(&arg_num_heads);
-                builder.arg(&arg_head_size);
-                builder.arg(&arg_rope_dim);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_rope_f16 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok(output)
@@ -635,37 +639,39 @@ impl KernelBackend for CudaBackend {
         // Weight must be F32 for the kernel
         let weight_f32 = weight.to_dtype(DType::F32)?;
 
-        let (o_st, _) = output.storage_and_layout();
-        let (x_st, _) = x.storage_and_layout();
-        let (w_st, _) = weight_f32.storage_and_layout();
-        let o_cuda = as_cuda(&o_st)?;
-        let x_cuda = as_cuda(&x_st)?;
-        let w_cuda = as_cuda(&w_st)?;
-        let arg_hidden = hidden_size as i32;
-        let arg_eps = eps;
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (x_st, _) = x.storage_and_layout();
+            let (w_st, _) = weight_f32.storage_and_layout();
+            let o_cuda = as_cuda(&o_st)?;
+            let x_cuda = as_cuda(&x_st)?;
+            let w_cuda = as_cuda(&w_st)?;
+            let arg_hidden = hidden_size as i32;
+            let arg_eps = eps;
 
-        match x.dtype() {
-            DType::F32 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&x_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&w_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_rmsnorm_f32 launch: {e}")))?;
+            match x.dtype() {
+                DType::F32 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(x_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(w_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_rmsnorm_f32 launch: {e}")))?;
+                }
+                DType::F16 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(x_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(w_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_rmsnorm_f16 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F16 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&x_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&w_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_rmsnorm_f16 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok(output)
@@ -707,41 +713,43 @@ impl KernelBackend for CudaBackend {
 
         let weight_f32 = weight.to_dtype(DType::F32)?;
 
-        let (o_st, _) = output.storage_and_layout();
-        let (xb_st, _) = x_buf.storage_and_layout();
-        let (r_st, _) = residual.storage_and_layout();
-        let (w_st, _) = weight_f32.storage_and_layout();
-        let o_cuda = as_cuda(&o_st)?;
-        let xb_cuda = as_cuda(&xb_st)?;
-        let r_cuda = as_cuda(&r_st)?;
-        let w_cuda = as_cuda(&w_st)?;
-        let arg_hidden = hidden_size as i32;
-        let arg_eps = eps;
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (xb_st, _) = x_buf.storage_and_layout();
+            let (r_st, _) = residual.storage_and_layout();
+            let (w_st, _) = weight_f32.storage_and_layout();
+            let o_cuda = as_cuda(&o_st)?;
+            let xb_cuda = as_cuda(&xb_st)?;
+            let r_cuda = as_cuda(&r_st)?;
+            let w_cuda = as_cuda(&w_st)?;
+            let arg_hidden = hidden_size as i32;
+            let arg_eps = eps;
 
-        match x.dtype() {
-            DType::F32 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&xb_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&r_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&w_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_add_rmsnorm_f32 launch: {e}")))?;
+            match x.dtype() {
+                DType::F32 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(xb_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(r_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(w_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_add_rmsnorm_f32 launch: {e}")))?;
+                }
+                DType::F16 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(xb_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(r_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(w_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_add_rmsnorm_f16 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F16 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&xb_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&r_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&w_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_add_rmsnorm_f16 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok((output, x_buf))
@@ -800,44 +808,46 @@ impl KernelBackend for CudaBackend {
         // Linear weight must match x's dtype
         let lw = linear_weight.to_dtype(x.dtype())?;
 
-        let (o_st, _) = output.storage_and_layout();
-        let (x_st, _) = x.storage_and_layout();
-        let (nw_st, _) = weight_f32.storage_and_layout();
-        let (lw_st, _) = lw.storage_and_layout();
-        let o_cuda = as_cuda(&o_st)?;
-        let x_cuda = as_cuda(&x_st)?;
-        let nw_cuda = as_cuda(&nw_st)?;
-        let lw_cuda = as_cuda(&lw_st)?;
-        let arg_hidden = hidden_size as i32;
-        let arg_out = out_features as i32;
-        let arg_eps = eps;
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (x_st, _) = x.storage_and_layout();
+            let (nw_st, _) = weight_f32.storage_and_layout();
+            let (lw_st, _) = lw.storage_and_layout();
+            let o_cuda = as_cuda(&o_st)?;
+            let x_cuda = as_cuda(&x_st)?;
+            let nw_cuda = as_cuda(&nw_st)?;
+            let lw_cuda = as_cuda(&lw_st)?;
+            let arg_hidden = hidden_size as i32;
+            let arg_out = out_features as i32;
+            let arg_eps = eps;
 
-        match x.dtype() {
-            DType::F32 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&x_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&nw_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&lw_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_out);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f32 launch: {e}")))?;
+            match x.dtype() {
+                DType::F32 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(x_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(nw_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(lw_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_out);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f32 launch: {e}")))?;
+                }
+                DType::F16 => {
+                    let mut builder = func.builder();
+                    builder.arg(o_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(x_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(nw_cuda.as_cuda_slice::<f32>()?);
+                    builder.arg(lw_cuda.as_cuda_slice::<f16>()?);
+                    builder.arg(&arg_hidden);
+                    builder.arg(&arg_out);
+                    builder.arg(&arg_eps);
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f16 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F16 => {
-                let mut builder = func.builder();
-                builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&x_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&nw_cuda.as_cuda_slice::<f32>()?);
-                builder.arg(&lw_cuda.as_cuda_slice::<f16>()?);
-                builder.arg(&arg_hidden);
-                builder.arg(&arg_out);
-                builder.arg(&arg_eps);
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("fused_layernorm_linear_f16 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok(output)
@@ -895,33 +905,40 @@ impl CudaBackend {
             shared_mem_bytes: 256 * 4, // float per thread for K-reduction
         };
 
-        let (o_st, _) = output.storage_and_layout();
-        let (i_st, _) = input_f16.storage_and_layout();
-        let (qw_st, _) = qweight_marlin.storage_and_layout();
-        let (sc_st, _) = scales_f16.storage_and_layout();
-        let (qz_st, _) = qzeros.storage_and_layout();
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (i_st, _) = input_f16.storage_and_layout();
+            let (qw_st, _) = qweight_marlin.storage_and_layout();
+            let (sc_st, _) = scales_f16.storage_and_layout();
+            let (qz_st, _) = qzeros.storage_and_layout();
 
-        let o_cuda = as_cuda(&o_st)?;
-        let i_cuda = as_cuda(&i_st)?;
-        let qw_cuda = as_cuda(&qw_st)?;
-        let sc_cuda = as_cuda(&sc_st)?;
-        let qz_cuda = as_cuda(&qz_st)?;
+            let o_cuda = as_cuda(&o_st)?;
+            let i_cuda = as_cuda(&i_st)?;
+            let qw_cuda = as_cuda(&qw_st)?;
+            let sc_cuda = as_cuda(&sc_st)?;
+            let qz_cuda = as_cuda(&qz_st)?;
 
-        let mut builder = func.builder();
-        builder.arg(&o_cuda.as_cuda_slice::<f16>()?);
-        builder.arg(&i_cuda.as_cuda_slice::<f16>()?);
-        builder.arg(&qw_cuda.as_cuda_slice::<u32>()?);
-        builder.arg(&sc_cuda.as_cuda_slice::<f16>()?);
-        builder.arg(&qz_cuda.as_cuda_slice::<u32>()?);
-        builder.arg(&(m as i32));
-        builder.arg(&(n as i32));
-        builder.arg(&(k as i32));
-        builder.arg(&(group_size as i32));
+            let arg_m = m as i32;
+            let arg_n = n as i32;
+            let arg_k = k as i32;
+            let arg_group = group_size as i32;
 
-        unsafe {
-            builder
-                .launch(cfg)
-                .map_err(|e| candle_core::Error::Msg(format!("marlin_gemm_f16 launch: {e}")))?;
+            let mut builder = func.builder();
+            builder.arg(o_cuda.as_cuda_slice::<f16>()?);
+            builder.arg(i_cuda.as_cuda_slice::<f16>()?);
+            builder.arg(qw_cuda.as_cuda_slice::<u32>()?);
+            builder.arg(sc_cuda.as_cuda_slice::<f16>()?);
+            builder.arg(qz_cuda.as_cuda_slice::<u32>()?);
+            builder.arg(&arg_m);
+            builder.arg(&arg_n);
+            builder.arg(&arg_k);
+            builder.arg(&arg_group);
+
+            unsafe {
+                builder
+                    .launch(cfg)
+                    .map_err(|e| candle_core::Error::Msg(format!("marlin_gemm_f16 launch: {e}")))?;
+            }
         }
 
         Ok(output)
@@ -971,65 +988,71 @@ impl CudaBackend {
         let func = self.get_func(func_name)?;
 
         // Get raw CUDA slices
-        let (o_st, _) = output.storage_and_layout();
-        let (qw_st, _) = qweight.storage_and_layout();
-        let (sc_st, _) = scales.storage_and_layout();
-        let (qz_st, _) = qzeros.storage_and_layout();
+        {
+            let (o_st, _) = output.storage_and_layout();
+            let (qw_st, _) = qweight.storage_and_layout();
+            let (sc_st, _) = scales.storage_and_layout();
+            let (qz_st, _) = qzeros.storage_and_layout();
 
-        let o_cuda = as_cuda(&o_st)?;
-        let qw_cuda = as_cuda(&qw_st)?;
-        let sc_cuda = as_cuda(&sc_st)?;
-        let qz_cuda = as_cuda(&qz_st)?;
+            let o_cuda = as_cuda(&o_st)?;
+            let qw_cuda = as_cuda(&qw_st)?;
+            let sc_cuda = as_cuda(&sc_st)?;
+            let qz_cuda = as_cuda(&qz_st)?;
 
-        // Launch config: one thread per (in_feature, out_feature) element
-        let block_x = 16u32;
-        let block_y = 16u32;
-        let grid_x = ((in_features as u32) + block_x - 1) / block_x;
-        let grid_y = ((out_features as u32) + block_y - 1) / block_y;
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, grid_y, 1),
-            block_dim: (block_x, block_y, 1),
-            shared_mem_bytes: 0,
-        };
+            // Launch config: one thread per (in_feature, out_feature) element
+            let block_x = 16u32;
+            let block_y = 16u32;
+            let grid_x = ((in_features as u32) + block_x - 1) / block_x;
+            let grid_y = ((out_features as u32) + block_y - 1) / block_y;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (block_x, block_y, 1),
+                shared_mem_bytes: 0,
+            };
 
-        match output_dtype {
-            DType::F16 => {
-                let o_slice = o_cuda.as_cuda_slice::<f16>()?;
-                let qw_slice = qw_cuda.as_cuda_slice::<u32>()?;
-                let sc_slice = sc_cuda.as_cuda_slice::<f16>()?;
-                let qz_slice = qz_cuda.as_cuda_slice::<u32>()?;
+            let arg_in_features = in_features as i32;
+            let arg_out_features = out_features as i32;
+            let arg_group_size = group_size as i32;
 
-                let mut builder = func.builder();
-                builder.arg(&o_slice);
-                builder.arg(&qw_slice);
-                builder.arg(&sc_slice);
-                builder.arg(&qz_slice);
-                builder.arg(&(in_features as i32));
-                builder.arg(&(out_features as i32));
-                builder.arg(&(group_size as i32));
+            match output_dtype {
+                DType::F16 => {
+                    let o_slice = o_cuda.as_cuda_slice::<f16>()?;
+                    let qw_slice = qw_cuda.as_cuda_slice::<u32>()?;
+                    let sc_slice = sc_cuda.as_cuda_slice::<f16>()?;
+                    let qz_slice = qz_cuda.as_cuda_slice::<u32>()?;
 
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("gptq_dequant_f16 launch: {e}")))?;
+                    let mut builder = func.builder();
+                    builder.arg(o_slice);
+                    builder.arg(qw_slice);
+                    builder.arg(sc_slice);
+                    builder.arg(qz_slice);
+                    builder.arg(&arg_in_features);
+                    builder.arg(&arg_out_features);
+                    builder.arg(&arg_group_size);
+
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("gptq_dequant_f16 launch: {e}")))?;
+                }
+                DType::F32 => {
+                    let o_slice = o_cuda.as_cuda_slice::<f32>()?;
+                    let qw_slice = qw_cuda.as_cuda_slice::<u32>()?;
+                    let sc_slice = sc_cuda.as_cuda_slice::<f32>()?;
+                    let qz_slice = qz_cuda.as_cuda_slice::<u32>()?;
+
+                    let mut builder = func.builder();
+                    builder.arg(o_slice);
+                    builder.arg(qw_slice);
+                    builder.arg(sc_slice);
+                    builder.arg(qz_slice);
+                    builder.arg(&arg_in_features);
+                    builder.arg(&arg_out_features);
+                    builder.arg(&arg_group_size);
+
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("gptq_dequant_f32 launch: {e}")))?;
+                }
+                _ => unreachable!(),
             }
-            DType::F32 => {
-                let o_slice = o_cuda.as_cuda_slice::<f32>()?;
-                let qw_slice = qw_cuda.as_cuda_slice::<u32>()?;
-                let sc_slice = sc_cuda.as_cuda_slice::<f32>()?;
-                let qz_slice = qz_cuda.as_cuda_slice::<u32>()?;
-
-                let mut builder = func.builder();
-                builder.arg(&o_slice);
-                builder.arg(&qw_slice);
-                builder.arg(&sc_slice);
-                builder.arg(&qz_slice);
-                builder.arg(&(in_features as i32));
-                builder.arg(&(out_features as i32));
-                builder.arg(&(group_size as i32));
-
-                unsafe { builder.launch(cfg) }
-                    .map_err(|e| candle_core::Error::Msg(format!("gptq_dequant_f32 launch: {e}")))?;
-            }
-            _ => unreachable!(),
         }
 
         Ok(output)

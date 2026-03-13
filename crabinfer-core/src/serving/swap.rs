@@ -413,11 +413,15 @@ impl SwapManager {
                 let gpu_k_byte_offset = gpu_block_id * block_elems_per_layer * self.kv_config.dtype_bytes;
                 let gpu_v_byte_offset = gpu_block_id * block_elems_per_layer * self.kv_config.dtype_bytes;
 
-                // Get raw GPU pointers
+                // Get raw GPU pointers via DevicePtr trait
+                use candle_core::cuda_backend::cudarc::driver::DevicePtr;
                 let k_slice = k_cuda.as_cuda_slice::<u8>()?;
                 let v_slice = v_cuda.as_cuda_slice::<u8>()?;
-                let k_ptr = *k_slice.device_ptr() as usize + gpu_k_byte_offset;
-                let v_ptr = *v_slice.device_ptr() as usize + gpu_v_byte_offset;
+                let stream = k_cuda.device.cuda_stream();
+                let (k_base_ptr, _k_sync) = k_slice.device_ptr(&stream);
+                let (v_base_ptr, _v_sync) = v_slice.device_ptr(&stream);
+                let k_ptr = k_base_ptr as usize + gpu_k_byte_offset;
+                let v_ptr = v_base_ptr as usize + gpu_v_byte_offset;
 
                 let cpu_k_ptr = self.cpu_buffer.slot_mut(cpu_k_offset, bytes_per_block_per_layer_kv).as_mut_ptr();
                 let cpu_v_ptr = self.cpu_buffer.slot_mut(cpu_v_offset, bytes_per_block_per_layer_kv).as_mut_ptr();
@@ -494,10 +498,14 @@ impl SwapManager {
                 let gpu_k_byte_offset = gpu_block_id * block_elems_per_layer * self.kv_config.dtype_bytes;
                 let gpu_v_byte_offset = gpu_block_id * block_elems_per_layer * self.kv_config.dtype_bytes;
 
+                use candle_core::cuda_backend::cudarc::driver::DevicePtr;
                 let k_slice = k_cuda.as_cuda_slice::<u8>()?;
                 let v_slice = v_cuda.as_cuda_slice::<u8>()?;
-                let k_ptr = *k_slice.device_ptr() as usize + gpu_k_byte_offset;
-                let v_ptr = *v_slice.device_ptr() as usize + gpu_v_byte_offset;
+                let stream = k_cuda.device.cuda_stream();
+                let (k_base_ptr, _k_sync) = k_slice.device_ptr(&stream);
+                let (v_base_ptr, _v_sync) = v_slice.device_ptr(&stream);
+                let k_ptr = k_base_ptr as usize + gpu_k_byte_offset;
+                let v_ptr = v_base_ptr as usize + gpu_v_byte_offset;
 
                 let cpu_k_ptr = self.cpu_buffer.slot(cpu_k_offset, bytes_per_block_per_layer_kv).as_ptr();
                 let cpu_v_ptr = self.cpu_buffer.slot(cpu_v_offset, bytes_per_block_per_layer_kv).as_ptr();

@@ -183,7 +183,7 @@ impl TensorParallelGroup {
     /// NCCL AllReduce implementation (CUDA only).
     #[cfg(feature = "cuda")]
     fn nccl_all_reduce(&self, tensor: &Tensor) -> Result<Tensor> {
-        use candle_core::backend::BackendDevice;
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 
         let device = tensor.device();
         let elem_count = tensor.elem_count();
@@ -191,33 +191,46 @@ impl TensorParallelGroup {
         // Allocate output tensor with same shape/dtype
         let output = Tensor::zeros(tensor.shape(), tensor.dtype(), device)?;
 
-        // Get raw CUDA pointers and stream
-        // Note: This requires candle's CUDA backend to expose raw pointers.
-        // The actual implementation depends on candle's CUDA storage internals.
-        let cuda_dev = match device {
-            candle_core::Device::Cuda(dev) => dev,
-            _ => {
-                return Err(candle_core::Error::Msg(
-                    "AllReduce: tensor must be on a CUDA device".to_string(),
-                ))
-            }
-        };
-
-        // For now, use a contiguous copy approach:
-        // 1. Ensure tensor is contiguous
+        // Ensure tensor is contiguous
         let tensor = tensor.contiguous()?;
 
-        // Get the CUDA stream from the device
-        let stream = std::ptr::null_mut(); // Default stream
+        // Extract raw CUDA pointers from candle's storage
+        {
+            let (in_storage, _in_layout) = tensor.storage_and_layout();
+            let (out_storage, _out_layout) = output.storage_and_layout();
 
-        // Access raw storage pointers through candle's CUDA backend
-        // This is a simplified implementation — production code would use
-        // cudarc's CudaSlice<T> directly.
-        let input_ptr = tensor.as_ptr() as *const std::ffi::c_void;
-        let output_ptr = output.as_ptr() as *mut std::ffi::c_void;
+            let in_cuda = match &*in_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "AllReduce: tensor must be on a CUDA device".to_string(),
+                    ))
+                }
+            };
+            let out_cuda = match &*out_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "AllReduce: output must be on a CUDA device".to_string(),
+                    ))
+                }
+            };
 
-        self.comm
-            .all_reduce_sum_f32(input_ptr, output_ptr, elem_count, stream)?;
+            let stream = in_cuda.device.cuda_stream();
+            let in_slice = in_cuda.as_cuda_slice::<u8>()?;
+            let out_slice = out_cuda.as_cuda_slice::<u8>()?;
+            let (in_ptr, _in_sync) = in_slice.device_ptr(&stream);
+            let (out_ptr, _out_sync) = out_slice.device_ptr(&stream);
+
+            let input_ptr = in_ptr as *const std::ffi::c_void;
+            let output_ptr = out_ptr as *mut std::ffi::c_void;
+
+            // Use null stream for default CUDA stream
+            let nccl_stream = std::ptr::null_mut();
+
+            self.comm
+                .all_reduce_sum_f32(input_ptr, output_ptr, elem_count, nccl_stream)?;
+        }
 
         Ok(output)
     }
@@ -225,6 +238,8 @@ impl TensorParallelGroup {
     /// NCCL AllGather implementation (CUDA only).
     #[cfg(feature = "cuda")]
     fn nccl_all_gather(&self, tensor: &Tensor) -> Result<Tensor> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
         let device = tensor.device();
         let send_count = tensor.elem_count();
         let world_size = self.config.world_size;
@@ -238,15 +253,45 @@ impl TensorParallelGroup {
         }
         output_shape[0] *= world_size;
 
-        let output = Tensor::zeros(&output_shape, tensor.dtype(), device)?;
+        let output = Tensor::zeros(output_shape.as_slice(), tensor.dtype(), device)?;
         let tensor = tensor.contiguous()?;
 
-        let stream = std::ptr::null_mut();
-        let input_ptr = tensor.as_ptr() as *const std::ffi::c_void;
-        let output_ptr = output.as_ptr() as *mut std::ffi::c_void;
+        // Extract raw CUDA pointers from candle's storage
+        {
+            let (in_storage, _in_layout) = tensor.storage_and_layout();
+            let (out_storage, _out_layout) = output.storage_and_layout();
 
-        self.comm
-            .all_gather_f32(input_ptr, output_ptr, send_count, stream)?;
+            let in_cuda = match &*in_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "AllGather: tensor must be on a CUDA device".to_string(),
+                    ))
+                }
+            };
+            let out_cuda = match &*out_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "AllGather: output must be on a CUDA device".to_string(),
+                    ))
+                }
+            };
+
+            let stream = in_cuda.device.cuda_stream();
+            let in_slice = in_cuda.as_cuda_slice::<u8>()?;
+            let out_slice = out_cuda.as_cuda_slice::<u8>()?;
+            let (in_ptr, _in_sync) = in_slice.device_ptr(&stream);
+            let (out_ptr, _out_sync) = out_slice.device_ptr(&stream);
+
+            let input_ptr = in_ptr as *const std::ffi::c_void;
+            let output_ptr = out_ptr as *mut std::ffi::c_void;
+
+            let nccl_stream = std::ptr::null_mut();
+
+            self.comm
+                .all_gather_f32(input_ptr, output_ptr, send_count, nccl_stream)?;
+        }
 
         Ok(output)
     }
