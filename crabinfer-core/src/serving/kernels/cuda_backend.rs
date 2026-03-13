@@ -66,6 +66,17 @@ impl CudaBackend {
         // `to_src()` converts the NVRTC-compiled image into a PTX source string.
         let compiled_ptx = ptx.to_src();
 
+        // Log available kernel entry points for debugging
+        let entries: Vec<&str> = compiled_ptx
+            .lines()
+            .filter(|l| l.contains(".entry"))
+            .map(|l| l.trim())
+            .collect();
+        tracing::info!("CUDA PTX compiled: {} bytes, {} entry points", compiled_ptx.len(), entries.len());
+        for entry in &entries {
+            tracing::debug!("  PTX entry: {entry}");
+        }
+
         Ok(Self {
             device,
             compiled_ptx,
@@ -81,6 +92,10 @@ impl CudaBackend {
     fn get_func(&self, func_name: &str) -> Result<candle_core::cuda_backend::CudaFunc> {
         self.device
             .get_or_load_custom_func(func_name, MODULE_NAME, &self.compiled_ptx)
+            .map_err(|e| {
+                tracing::error!("Failed to load CUDA kernel '{func_name}' from module '{MODULE_NAME}': {e}");
+                e
+            })
     }
 }
 
