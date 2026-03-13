@@ -294,9 +294,34 @@ fn load_serving_engine(
                 .unwrap_or("unknown")
                 .to_string()
         });
+        // Detect architecture from config.json model_type for chat template selection
+        let architecture = {
+            let config_path = model_path.join("config.json");
+            if config_path.exists() {
+                let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+                let config_json: serde_json::Value =
+                    serde_json::from_str(&config_text).unwrap_or_default();
+                let model_type = config_json
+                    .get("model_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("llama");
+                // Map HF model_type to our chat template architecture names
+                match model_type {
+                    "qwen2" | "qwen2_5" => "qwen2".to_string(),
+                    "qwen3" | "qwen3_5" => "qwen2".to_string(), // Qwen3 uses ChatML like Qwen2
+                    "phi3" | "phi" => "phi3".to_string(),
+                    "gemma" | "gemma2" | "gemma3" => "gemma3".to_string(),
+                    "mistral" => "mistral".to_string(),
+                    _ => "llama".to_string(),
+                }
+            } else {
+                "llama".to_string()
+            }
+        };
+
         let model_info = ModelInfo {
             model_name: model_name.clone(),
-            architecture: "llama".to_string(),
+            architecture,
             parameter_count: 0, // Not easily available from safetensors without counting
             active_parameter_count: 0,
             quantization: quantization.to_string(),
