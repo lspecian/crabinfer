@@ -403,9 +403,9 @@ impl EngineHandle {
         let shape_batched = [config.max_num_batched_tokens];
         let shape_seqs = [config.max_num_seqs];
         let pool_specs: Vec<(&[usize], DType, usize)> = vec![
-            (&shape_batched, DType::U32, 2),  // input_ids, positions
-            (&shape_batched, DType::U32, 2),  // slot_mapping
-            (&shape_seqs, DType::U32, 2),     // context_lens
+            (&shape_batched, DType::I64, 2),  // input_ids, positions
+            (&shape_batched, DType::I32, 2),  // slot_mapping
+            (&shape_seqs, DType::I32, 2),     // context_lens
         ];
         let buffer_pool = TensorBufferPool::new(&pool_specs, &device)?;
 
@@ -1149,11 +1149,11 @@ impl ServingEngineInner {
     #[cfg(feature = "cuda")]
     fn warmup_eager_pass(&mut self) -> CandleResult<()> {
         let bs = 1;
-        let input_ids = Tensor::zeros((bs,), DType::U32, &self.device)?;
-        let positions = Tensor::zeros((bs,), DType::U32, &self.device)?;
-        let slot_mapping = Tensor::zeros((bs,), DType::U32, &self.device)?;
-        let block_table = Tensor::zeros((bs, 1), DType::U32, &self.device)?;
-        let context_lens = Tensor::ones((bs,), DType::U32, &self.device)?;
+        let input_ids = Tensor::zeros((bs,), DType::I64, &self.device)?;
+        let positions = Tensor::zeros((bs,), DType::I64, &self.device)?;
+        let slot_mapping = Tensor::zeros((bs,), DType::I32, &self.device)?;
+        let block_table = Tensor::zeros((bs, 1), DType::I32, &self.device)?;
+        let context_lens = Tensor::ones((bs,), DType::I32, &self.device)?;
 
         let ctx = ForwardContext {
             positions: &positions,
@@ -1200,15 +1200,15 @@ impl ServingEngineInner {
             self.cuda_graph_cache.insert_graph(batch_size, buffers);
         }
 
-        // Build dummy decode inputs
-        let input_ids = Tensor::zeros((batch_size,), DType::U32, &self.device)?;
-        let positions = Tensor::zeros((batch_size,), DType::U32, &self.device)?;
-        let slot_mapping = Tensor::zeros((batch_size,), DType::U32, &self.device)?;
+        // Build dummy decode inputs (I64 for index_select, I32 for CUDA kernels)
+        let input_ids = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
+        let positions = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
+        let slot_mapping = Tensor::zeros((batch_size,), DType::I32, &self.device)?;
         let max_blocks = self.kv_caches.first()
             .map(|(k, _)| k.dims()[0])  // num_blocks dimension
             .unwrap_or(1);
-        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), DType::U32, &self.device)?;
-        let context_lens = Tensor::ones((batch_size,), DType::U32, &self.device)?;
+        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), DType::I32, &self.device)?;
+        let context_lens = Tensor::ones((batch_size,), DType::I32, &self.device)?;
 
         let query_start_loc: Vec<usize> = (0..=batch_size).collect();
         let seq_lens: Vec<usize> = vec![1; batch_size];
