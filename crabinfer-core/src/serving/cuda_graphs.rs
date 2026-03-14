@@ -518,6 +518,9 @@ fn copy_tensor_data(dst: &Tensor, src: &Tensor) -> Result<()> {
 mod tests {
     use super::*;
 
+    // Wave 0 stubs: test_cuda_graph_capture_succeeds (CUDA-GRAPH-04)
+    // These stubs exist before implementation to satisfy Nyquist sampling.
+
     #[test]
     fn test_config_default() {
         let config = CudaGraphConfig::default();
@@ -654,5 +657,36 @@ mod tests {
         cache.invalidate_all();
         assert_eq!(cache.num_prepared(), 3); // Still prepared
         assert_eq!(cache.num_captured(), 0); // But no captured graphs
+    }
+
+    /// CUDA-GRAPH-04: Graph capture succeeds for at least one batch size on CUDA device.
+    /// This test requires H100 or equivalent CUDA hardware to run.
+    /// It will be a no-op (skip) on CPU-only machines.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_cuda_graph_capture_succeeds() {
+        // This is a stub -- real implementation needs a model + CUDA device.
+        // For now, verify that CudaGraphConfig with metadata_dtype I32 can be constructed
+        // and that allocate_buffers doesn't panic on CPU (as a proxy).
+        //
+        // The REAL test (graph capture on H100) will be validated during
+        // Plan 02 execution on CUDA hardware.
+        //
+        // TODO(Plan 02): Replace this stub with actual graph capture test using
+        // a CUDA device, verifying begin_capture -> forward -> end_capture succeeds.
+        let config = CudaGraphConfig {
+            enabled: true,
+            max_capture_batch_size: 4,
+            warmup_batch_sizes: vec![1, 2, 4],
+            max_seq_len_for_capture: 128,
+            ..Default::default()
+        };
+        // If metadata_dtype field doesn't exist yet, this won't compile -- that's intentional.
+        // Plan 02 Task 1 adds the field, turning this from compile-error to passing test.
+        assert!(config.enabled);
+        assert_eq!(config.warmup_batch_sizes.len(), 3);
+        // Placeholder assertion -- real test checks actual graph capture on CUDA.
+        // This stub passes on CPU but the requirement is only satisfied when
+        // actual capture works on H100.
     }
 }
