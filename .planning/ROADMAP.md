@@ -43,7 +43,7 @@ Plans:
 **Goal:** Fix CUDA graph capture (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) which is the single biggest performance gap vs vLLM (30-40%). Patch the candle fork to add missing I32/I16 CUDA kernels (`const_set_i32`, `const_set_i16`, `cast_u32_i32`, I32 strided copy) to eliminate CPU-first workarounds.
 **Requirements**: CUDA-GRAPH-01, CUDA-GRAPH-02, CUDA-GRAPH-03, CUDA-GRAPH-04, KERNEL-I32-01, KERNEL-I32-02, KERNEL-I16-01, BINARY-I32-01, LOADER-01
 **Depends on:** Phase 1
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
 - [ ] 01.1-00-PLAN.md — Wave 0: failing test stubs for CUDA kernel and graph capture requirements (Nyquist compliance)

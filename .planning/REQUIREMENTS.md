@@ -53,8 +53,8 @@
 
 ### Prefix Cache
 
-- [ ] **PCCH-01**: Cache salting — per-request salt to isolate tenants (prevent cross-user cache hits)
-- [ ] **PCCH-02**: Cache-aware request routing — expose block hashes via API for multi-instance deployments
+- [x] **PCCH-01**: Cache salting — per-request salt to isolate tenants (prevent cross-user cache hits)
+- [x] **PCCH-02**: Cache-aware request routing — expose block hashes via API for multi-instance deployments
 
 ### Embeddings
 
@@ -119,8 +119,8 @@
 | WORK-03 | Phase 4 | Pending |
 | CONF-01 | Phase 4 | Pending |
 | CONF-02 | Phase 4 | Pending |
-| PCCH-01 | Phase 4 | Pending |
-| PCCH-02 | Phase 4 | Pending |
+| PCCH-01 | Phase 4 | Complete |
+| PCCH-02 | Phase 4 | Complete |
 | EMBD-01 | Phase 4 | Pending |
 | EMBD-02 | Phase 4 | Pending |
 | EMBD-03 | Phase 4 | Pending |

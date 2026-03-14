@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01-model-loading-and-quantization-01-PLAN.md
-last_updated: "2026-03-12T22:59:16.108Z"
+stopped_at: Completed 01.1-00-PLAN.md
+last_updated: "2026-03-14T13:44:20.765Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
-  total_phases: 4
-  completed_phases: 0
-  total_plans: 4
-  completed_plans: 3
+  total_phases: 6
+  completed_phases: 4
+  total_plans: 18
+  completed_plans: 16
   percent: 25
 ---
 
@@ -53,6 +53,8 @@ Progress: [███░░░░░░░] 25%
 | Phase 01 P02 | 8 | 2 tasks | 4 files |
 | Phase 01-model-loading-and-quantization P00 | 15 | 1 tasks | 5 files |
 | Phase 01-model-loading-and-quantization P01 | 12min | 2 tasks | 5 files |
+| Phase 04 P02 | 6 | 2 tasks | 6 files |
+| Phase 01.1 P00 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -72,18 +74,28 @@ Recent decisions affecting current work:
 - [Phase 01-model-loading-and-quantization]: sha2 made non-optional (always-on) — SHA-256 is core security, not just for providers
 - [Phase 01-model-loading-and-quantization]: tokio::runtime::Handle::current().block_on() for sync-to-async bridge in load_serving_engine
 - [Phase 01-model-loading-and-quantization]: HF repo ID used as model_id instead of directory basename for consistent reporting
+- [Phase 04]: Salt bytes mixed into FNV-1a initial state on first block only; chaining propagates salt
+- [Phase 04]: Arc<Mutex<Vec<BlockHash>>> snapshot pattern for non-blocking block_hashes() reads
+- [Phase 01.1]: Tests gated with cfg(feature=cuda) so they compile only when CUDA toolchain available
 
 ### Pending Todos
 
 None yet.
 
+### Roadmap Evolution
+
+- Phase 01.1 inserted after Phase 1: CUDA Graph Capture and Candle Fork Patches (URGENT) — H100 testing revealed CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED is the #1 performance gap vs vLLM (30-40%)
+- Phase 01.2 inserted after Phase 1: BF16/FP16 Serving Support (URGENT) — H100 testing showed FP32-only serving wastes 2x VRAM (40GB vs needed 20GB)
+
 ### Blockers/Concerns
 
 - Phase 3 (Guided Decoding) depends only on Phase 1 (not Phase 2) — can be parallelized if needed
 - Marlin kernel (QLOAD-03) is the highest-risk item: PTX-level optimization targeting sm_86
+- CUDA graph capture fix (Phase 1.1) needs GPU hardware to test — requires another Vast.ai session
+- BF16 support (Phase 1.2) can be developed and partially tested locally
 
 ## Session Continuity
 
-Last session: 2026-03-12T22:59:16.106Z
-Stopped at: Completed 01-model-loading-and-quantization-01-PLAN.md
+Last session: 2026-03-14T13:44:20.763Z
+Stopped at: Completed 01.1-00-PLAN.md
 Resume file: None
