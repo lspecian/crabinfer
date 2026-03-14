@@ -849,8 +849,19 @@ fn unpack_int4_tensor(packed: &Tensor, pack_dim: usize, target_size: usize) -> R
     let outer: usize = shape[..pack_dim].iter().product();
     let inner: usize = shape[pack_dim + 1..].iter().product();
 
-    // Read packed u32 values
-    let flat_u32: Vec<u32> = packed.flatten_all()?.to_vec1()?;
+    // Read packed values as u32 (for bit manipulation).
+    // Safetensors stores GPTQ packed weights as I32 (torch.int32),
+    // but the bit pattern is identical to U32 for packed INT4 nibbles.
+    let flat_u32: Vec<u32> = {
+        let flat = packed.flatten_all()?;
+        match flat.dtype() {
+            DType::U32 => flat.to_vec1::<u32>()?,
+            DType::I32 => flat.to_vec1::<i32>()?.into_iter().map(|v| v as u32).collect(),
+            other => return Err(candle_core::Error::Msg(format!(
+                "unpack_int4: expected U32 or I32 packed tensor, got {other:?}"
+            ))),
+        }
+    };
 
     let mut unpacked = vec![0u8; outer * target_size * inner];
 
