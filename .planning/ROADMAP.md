@@ -13,6 +13,8 @@ Complete the remaining CUDA/Linux features for CrabInfer's PagedAttention servin
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: Model Loading and Quantization** - Load GPTQ/AWQ models from HuggingFace Hub with Marlin fused kernel
+- [ ] **Phase 1.1: CUDA Graph Capture and Candle Fork Patches** - Fix CUDA graph capture failure and patch candle fork for missing I32/I16 kernels (INSERTED)
+- [ ] **Phase 1.2: BF16/FP16 Serving Support** - Auto-downcast FP32 models to BF16/FP16, halving VRAM usage (INSERTED)
 - [ ] **Phase 2: Performance Optimization** - Fused LayerNorm+linear kernel, memory pool, and fast tokenization
 - [ ] **Phase 3: Guided Decoding** - Token-level constrained generation via JSON Schema and regex DFA
 - [ ] **Phase 4: Production Infrastructure** - Multi-worker serving, TOML config, prefix cache salting, and embeddings endpoint
@@ -35,6 +37,28 @@ Plans:
 - [ ] 01-01-PLAN.md — HuggingFace Hub download client with caching and SHA256 verification
 - [ ] 01-02-PLAN.md — GPTQ/AWQ weight loading from HuggingFace safetensors format
 - [ ] 01-03-PLAN.md — Marlin fused dequant+GEMM CUDA kernel with model-load activation
+
+### Phase 01.1: CUDA Graph Capture and Candle Fork Patches (INSERTED)
+
+**Goal:** Fix CUDA graph capture (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) which is the single biggest performance gap vs vLLM (30-40%). Patch the candle fork to add missing I32/I16 CUDA kernels (`const_set_i32`, `const_set_i16`, `cast_u32_i32`, I32 strided copy) to eliminate CPU-first workarounds.
+**Requirements**: CUDA-GRAPH-01, CUDA-GRAPH-02, CUDA-GRAPH-03, CUDA-GRAPH-04, KERNEL-I32-01, KERNEL-I32-02, KERNEL-I16-01, BINARY-I32-01, LOADER-01
+**Depends on:** Phase 1
+**Plans:** 3 plans
+
+Plans:
+- [ ] 01.1-00-PLAN.md — Wave 0: failing test stubs for CUDA kernel and graph capture requirements (Nyquist compliance)
+- [ ] 01.1-01-PLAN.md — Candle fork kernel patches: I32/I16 fill, cast, unary, binary CUDA kernels + Rust dispatch
+- [ ] 01.1-02-PLAN.md — CUDA graph config, partial capture, and engine loop CPU-workaround elimination
+
+### Phase 01.2: BF16/FP16 Serving Support (INSERTED)
+
+**Goal:** Add automatic dtype downcasting so FP32 safetensors models can be served in BF16/FP16, halving VRAM usage (40GB → 20GB for Qwen3-8B) and improving throughput via reduced memory bandwidth and H100 FP16 tensor cores.
+**Requirements**: TBD
+**Depends on:** Phase 1
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 01.2 to break down)
 
 ### Phase 2: Performance Optimization
 **Goal**: The inference hot path runs with zero per-request GPU allocations, fused LayerNorm+linear, and parallel tokenization — maximizing tokens-per-second on RTX 3060
@@ -88,11 +112,13 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4
+Phases execute in numeric order: 1 → 1.1 → 1.2 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Model Loading and Quantization | 3/4 | In Progress|  |
+| 1. Model Loading and Quantization | 3/4 | In Progress |  |
+| 1.1 CUDA Graph Capture + Candle Patches | 0/3 | Planned | - |
+| 1.2 BF16/FP16 Serving Support | 0/? | Not Planned | - |
 | 2. Performance Optimization | 0/4 | Planned | - |
 | 3. Guided Decoding | 0/3 | Planned | - |
 | 4. Production Infrastructure | 0/4 | Planned | - |
