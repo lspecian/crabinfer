@@ -891,15 +891,27 @@ pub fn load_model_from_safetensors_with_backend(
         unsafe { candle_core::safetensors::MmapedSafetensors::multi(&st_files)? }
     };
 
-    // Load all tensors into a HashMap on CPU first.
-    // We load to CPU because candle's CUDA backend lacks some kernels
-    // (e.g., const_set_i32) that would be invoked if we loaded I32 tensors
-    // (like GPTQ qweight/qzeros) directly to GPU.
-    // Individual tensors are moved to the target device when accessed by
-    // load_tensor() / load_raw_tensor().
+    // Load tensors into a HashMap. When the target device is CUDA, load I32/I16
+    // tensors directly to GPU (candle fork now has const_set_i32/i16 kernels from
+    // Plan 01). Non-CUDA builds or other dtypes load to CPU first.
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for (name, _view) in tensors.tensors() {
-        let tensor = tensors.load(&name, &Device::Cpu)?;
+        let tensor = if device.is_cuda() {
+            // Direct GPU loading — no CPU roundtrip (requires I32/I16 CUDA kernels from Plan 01)
+            match tensors.load(&name, device) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Fallback to CPU load + transfer if direct GPU loading fails for any tensor
+                    tracing::debug!(
+                        "Direct GPU load failed for tensor '{}', falling back to CPU: {e}",
+                        name
+                    );
+                    tensors.load(&name, &Device::Cpu)?
+                }
+            }
+        } else {
+            tensors.load(&name, &Device::Cpu)?
+        };
         weights.insert(name, tensor);
     }
 

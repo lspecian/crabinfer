@@ -1150,13 +1150,13 @@ impl ServingEngineInner {
     #[cfg(feature = "cuda")]
     fn warmup_eager_pass(&mut self) -> CandleResult<()> {
         let bs = 1;
+        let metadata_dtype = self.cuda_graph_cache.config().metadata_dtype;
         let input_ids = Tensor::zeros((bs,), DType::I64, &self.device)?;
         let positions = Tensor::zeros((bs,), DType::I64, &self.device)?;
-        // Create I32 tensors on CPU first, then copy to device.
-        // Workaround: candle's CUDA fill kernel doesn't have const_set_i32.
-        let slot_mapping = Tensor::zeros((bs,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
-        let block_table = Tensor::zeros((bs, 1), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
-        let context_lens = Tensor::ones((bs,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        // Direct GPU creation — candle fork now has const_set_i32 kernel (Plan 01).
+        let slot_mapping = Tensor::zeros((bs,), metadata_dtype, &self.device)?;
+        let block_table = Tensor::zeros((bs, 1), metadata_dtype, &self.device)?;
+        let context_lens = Tensor::ones((bs,), metadata_dtype, &self.device)?;
 
         let ctx = ForwardContext {
             positions: &positions,
@@ -1203,16 +1203,17 @@ impl ServingEngineInner {
             self.cuda_graph_cache.insert_graph(batch_size, buffers);
         }
 
-        // Build dummy decode inputs (I64 for index_select, I32 for CUDA kernels).
-        // I32 tensors created on CPU first — candle's CUDA fill kernel lacks const_set_i32.
+        // Build dummy decode inputs (I64 for index_select, I32 for metadata).
+        // Direct GPU creation — candle fork now has const_set_i32 kernel (Plan 01).
+        let metadata_dtype = self.cuda_graph_cache.config().metadata_dtype;
         let input_ids = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
         let positions = Tensor::zeros((batch_size,), DType::I64, &self.device)?;
-        let slot_mapping = Tensor::zeros((batch_size,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        let slot_mapping = Tensor::zeros((batch_size,), metadata_dtype, &self.device)?;
         let max_blocks = self.kv_caches.first()
             .map(|(k, _)| k.dims()[0])  // num_blocks dimension
             .unwrap_or(1);
-        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
-        let context_lens = Tensor::ones((batch_size,), DType::I32, &Device::Cpu)?.to_device(&self.device)?;
+        let block_table = Tensor::zeros((batch_size, max_blocks.min(256)), metadata_dtype, &self.device)?;
+        let context_lens = Tensor::ones((batch_size,), metadata_dtype, &self.device)?;
 
         let query_start_loc: Vec<usize> = (0..=batch_size).collect();
         let seq_lens: Vec<usize> = vec![1; batch_size];
@@ -1366,10 +1367,9 @@ impl ServingEngineInner {
             bt_offset += max_blocks;
         }
 
-        // Create tensors from arena u32 data.
-        // We reinterpret u32 as i64/i32 on CPU (safe: values are small positive numbers),
-        // then transfer to the model's device. This avoids CUDA cast/fill kernels that
-        // don't exist for I32 in candle's kernel set.
+        // NOTE: These to_device() calls are outside the capture region and are fine —
+        // data originates on CPU (arena slices). We create tensors from Rust Vecs,
+        // then transfer to the model's device via H2D copy.
         let ids_i64: Vec<i64> = arena_input_ids[..token_offset].iter().map(|&x| x as i64).collect();
         let input_ids = Tensor::new(ids_i64.as_slice(), &Device::Cpu)?.to_device(&self.device)?;
 
