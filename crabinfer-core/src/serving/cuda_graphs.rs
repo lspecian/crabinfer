@@ -58,6 +58,11 @@ pub struct CudaGraphConfig {
     /// Maximum sequence length for captured graphs. Graphs are captured at this
     /// length; shorter sequences are padded.
     pub max_seq_len_for_capture: usize,
+
+    /// Dtype for metadata tensors (block_tables, slot_mapping, context_lens).
+    /// I32 saves memory and matches vLLM default. I64 for large-scale deployments
+    /// where block indices may exceed i32 range.
+    pub metadata_dtype: DType,
 }
 
 impl Default for CudaGraphConfig {
@@ -67,6 +72,7 @@ impl Default for CudaGraphConfig {
             enabled: true,
             warmup_batch_sizes: Vec::new(),
             max_seq_len_for_capture: 4096,
+            metadata_dtype: DType::I32,
         }
     }
 }
@@ -260,11 +266,11 @@ impl CudaGraphCache {
             positions: Tensor::zeros((batch_size,), DType::U32, dev)?,
             block_tables: Tensor::zeros(
                 (batch_size, self.max_blocks_per_seq),
-                DType::I64,
+                self.config.metadata_dtype,
                 dev,
             )?,
-            slot_mapping: Tensor::zeros((batch_size,), DType::I64, dev)?,
-            context_lens: Tensor::zeros((batch_size,), DType::I64, dev)?,
+            slot_mapping: Tensor::zeros((batch_size,), self.config.metadata_dtype, dev)?,
+            context_lens: Tensor::zeros((batch_size,), self.config.metadata_dtype, dev)?,
             output_logits: Tensor::zeros((batch_size, self.vocab_size), self.dtype, dev)?,
         })
     }
@@ -443,6 +449,36 @@ impl CudaGraphCache {
                 format!("no graph for batch_size={}", batch_size),
             ))?;
 
+        // Assert dtype consistency to prevent silent memory corruption (Pitfall 5).
+        assert_eq!(
+            entry.buffers.slot_mapping.dtype(),
+            slot_mapping.dtype(),
+            "slot_mapping dtype mismatch: buffer={:?}, input={:?}",
+            entry.buffers.slot_mapping.dtype(),
+            slot_mapping.dtype()
+        );
+        assert_eq!(
+            entry.buffers.context_lens.dtype(),
+            context_lens.dtype(),
+            "context_lens dtype mismatch: buffer={:?}, input={:?}",
+            entry.buffers.context_lens.dtype(),
+            context_lens.dtype()
+        );
+        assert_eq!(
+            entry.buffers.input_ids.dtype(),
+            input_ids.dtype(),
+            "input_ids dtype mismatch: buffer={:?}, input={:?}",
+            entry.buffers.input_ids.dtype(),
+            input_ids.dtype()
+        );
+        assert_eq!(
+            entry.buffers.positions.dtype(),
+            positions.dtype(),
+            "positions dtype mismatch: buffer={:?}, input={:?}",
+            entry.buffers.positions.dtype(),
+            positions.dtype()
+        );
+
         // Copy each input into the graph's fixed buffer
         copy_tensor_data(&entry.buffers.input_ids, input_ids)?;
         copy_tensor_data(&entry.buffers.positions, positions)?;
@@ -526,6 +562,7 @@ mod tests {
         let config = CudaGraphConfig::default();
         assert!(config.enabled);
         assert_eq!(config.max_capture_batch_size, 32);
+        assert_eq!(config.metadata_dtype, DType::I32);
     }
 
     #[test]
@@ -585,6 +622,11 @@ mod tests {
         assert_eq!(g.buffers.input_ids.dims(), &[4]);
         assert_eq!(g.buffers.output_logits.dims(), &[4, 32000]);
         assert_eq!(g.buffers.block_tables.dims(), &[4, 16]);
+
+        // Verify metadata tensors use I32 (not I64) by default
+        assert_eq!(g.buffers.block_tables.dtype(), DType::I32);
+        assert_eq!(g.buffers.slot_mapping.dtype(), DType::I32);
+        assert_eq!(g.buffers.context_lens.dtype(), DType::I32);
     }
 
     #[test]
@@ -665,28 +707,27 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn test_cuda_graph_capture_succeeds() {
-        // This is a stub -- real implementation needs a model + CUDA device.
-        // For now, verify that CudaGraphConfig with metadata_dtype I32 can be constructed
-        // and that allocate_buffers doesn't panic on CPU (as a proxy).
+        // Verify CudaGraphConfig with metadata_dtype I32 can be constructed
+        // and allocate_buffers produces I32 metadata tensors.
         //
-        // The REAL test (graph capture on H100) will be validated during
-        // Plan 02 execution on CUDA hardware.
-        //
-        // TODO(Plan 02): Replace this stub with actual graph capture test using
-        // a CUDA device, verifying begin_capture -> forward -> end_capture succeeds.
+        // The REAL graph capture test (begin_capture -> forward -> end_capture)
+        // requires a model + CUDA device and is validated during H100 testing.
         let config = CudaGraphConfig {
             enabled: true,
             max_capture_batch_size: 4,
             warmup_batch_sizes: vec![1, 2, 4],
             max_seq_len_for_capture: 128,
-            ..Default::default()
+            metadata_dtype: DType::I32,
         };
-        // If metadata_dtype field doesn't exist yet, this won't compile -- that's intentional.
-        // Plan 02 Task 1 adds the field, turning this from compile-error to passing test.
         assert!(config.enabled);
+        assert_eq!(config.metadata_dtype, DType::I32);
         assert_eq!(config.warmup_batch_sizes.len(), 3);
-        // Placeholder assertion -- real test checks actual graph capture on CUDA.
-        // This stub passes on CPU but the requirement is only satisfied when
-        // actual capture works on H100.
+
+        // Verify allocate_buffers uses metadata_dtype
+        let cache = CudaGraphCache::new(config, Device::Cpu, 100, 4, DType::F32);
+        let buffers = cache.allocate_buffers(2).unwrap();
+        assert_eq!(buffers.block_tables.dtype(), DType::I32);
+        assert_eq!(buffers.slot_mapping.dtype(), DType::I32);
+        assert_eq!(buffers.context_lens.dtype(), DType::I32);
     }
 }

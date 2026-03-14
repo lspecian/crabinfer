@@ -377,6 +377,7 @@ impl EngineHandle {
             max_capture_batch_size: config.max_cuda_graph_batch_size,
             max_seq_len_for_capture: 4096,
             warmup_batch_sizes: Vec::new(),
+            metadata_dtype: DType::I32,
         };
         let max_blocks_per_seq = (graph_config.max_seq_len_for_capture + config.block_size - 1) / config.block_size;
         let mut cuda_graph_cache = super::cuda_graphs::CudaGraphCache::new(
