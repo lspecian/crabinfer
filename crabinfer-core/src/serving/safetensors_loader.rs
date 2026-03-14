@@ -743,8 +743,6 @@ fn load_raw_tensor(
 /// - `{prefix}.scales`  → per-group scale factors
 /// - `{prefix}.bias`    → optional bias
 ///
-/// Handles transposed qweight: if `dim(1) > dim(0) * 8`, the tensor is stored
-/// in column-major layout and is transposed to `[in_features/8, out_features]`.
 fn load_gptq_linear(
     weights: &HashMap<String, Tensor>,
     prefix: &str,
@@ -753,21 +751,7 @@ fn load_gptq_linear(
 ) -> Result<MaybeQuantizedLinear> {
     use super::quantization::GptqLinear;
 
-    // Load qweight on CPU first — transpose may need .contiguous() which
-    // requires a strided copy kernel that candle doesn't have for I32 on CUDA.
-    let qweight_cpu = weights
-        .get(&format!("{prefix}.qweight"))
-        .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {prefix}.qweight")))?
-        .to_device(&Device::Cpu)?;
-
-    // Detect transposed layout on CPU where .contiguous() always works.
-    let qweight_cpu = if qweight_cpu.dim(1)? > qweight_cpu.dim(0)? * 8 {
-        qweight_cpu.t()?.contiguous()?
-    } else {
-        qweight_cpu
-    };
-
-    let qweight = qweight_cpu.to_device(device)?;
+    let qweight = load_raw_tensor(weights, &format!("{prefix}.qweight"), device)?;
     let qzeros = load_raw_tensor(weights, &format!("{prefix}.qzeros"), device)?;
     let scales = load_raw_tensor(weights, &format!("{prefix}.scales"), device)?;
     let bias = if weights.contains_key(&format!("{prefix}.bias")) {
@@ -792,21 +776,7 @@ fn load_awq_linear(
 ) -> Result<MaybeQuantizedLinear> {
     use super::quantization::AwqLinear;
 
-    // Load qweight on CPU first — transpose may need .contiguous() which
-    // requires a strided copy kernel that candle doesn't have for I32 on CUDA.
-    let qweight_cpu = weights
-        .get(&format!("{prefix}.qweight"))
-        .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {prefix}.qweight")))?
-        .to_device(&Device::Cpu)?;
-
-    // Detect transposed layout on CPU where .contiguous() always works.
-    let qweight_cpu = if qweight_cpu.dim(1)? > qweight_cpu.dim(0)? * 8 {
-        qweight_cpu.t()?.contiguous()?
-    } else {
-        qweight_cpu
-    };
-
-    let qweight = qweight_cpu.to_device(device)?;
+    let qweight = load_raw_tensor(weights, &format!("{prefix}.qweight"), device)?;
     let qzeros = load_raw_tensor(weights, &format!("{prefix}.qzeros"), device)?;
     let scales = load_raw_tensor(weights, &format!("{prefix}.scales"), device)?;
     let bias = if weights.contains_key(&format!("{prefix}.bias")) {
