@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01.1-00-PLAN.md
-last_updated: "2026-03-14T13:44:20.765Z"
+stopped_at: Completed 01.1-02-PLAN.md
+last_updated: "2026-03-14T17:07:36.272Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 6
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 18
-  completed_plans: 16
+  completed_plans: 18
   percent: 25
 ---
 
@@ -55,6 +55,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 01-model-loading-and-quantization P01 | 12min | 2 tasks | 5 files |
 | Phase 04 P02 | 6 | 2 tasks | 6 files |
 | Phase 01.1 P00 | 2min | 2 tasks | 2 files |
+| Phase 01.1 P02 | 33 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Salt bytes mixed into FNV-1a initial state on first block only; chaining propagates salt
 - [Phase 04]: Arc<Mutex<Vec<BlockHash>>> snapshot pattern for non-blocking block_hashes() reads
 - [Phase 01.1]: Tests gated with cfg(feature=cuda) so they compile only when CUDA toolchain available
+- [Phase 01.1]: I32 as default metadata_dtype for CUDA graph buffers (matches vLLM, halves metadata memory)
+- [Phase 01.1]: Safetensors loader uses direct GPU load with CPU fallback for I32/I16 tensors
 
 ### Pending Todos
 
@@ -96,6 +99,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-14T13:44:20.763Z
-Stopped at: Completed 01.1-00-PLAN.md
+Last session: 2026-03-14T17:07:36.271Z
+Stopped at: Completed 01.1-02-PLAN.md
 Resume file: None
