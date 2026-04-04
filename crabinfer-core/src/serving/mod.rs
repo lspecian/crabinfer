@@ -34,6 +34,7 @@ pub mod pipeline_parallel;
 pub mod tensor_parallel;
 pub mod tokenizer_cache;
 pub mod worker_pool;
+pub use worker_pool::RoutingPolicy;
 
 #[cfg(test)]
 mod hub_download_tests;

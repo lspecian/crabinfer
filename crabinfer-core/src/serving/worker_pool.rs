@@ -1,19 +1,35 @@
 //! Multi-worker pool for distributing inference requests across engine workers.
 //!
 //! `WorkerPool` wraps one or more `EngineHandle` instances and distributes
-//! incoming requests via round-robin. All workers share the same model weights
-//! (candle tensors are Arc-based internally), but each has its own KV cache,
-//! scheduler, and engine thread.
+//! incoming requests via round-robin or cache-aware routing. All workers share
+//! the same model weights (candle tensors are Arc-based internally), but each
+//! has its own KV cache, scheduler, and engine thread.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokenizers::Tokenizer;
 
+use super::block::BlockHash;
 use super::engine_loop::{EngineError, EngineHandle, GeneratedToken};
 use super::sequence::SamplingParams;
 use super::tokenizer_cache::CachedTokenizer;
 
-/// A pool of inference engine workers with round-robin request distribution.
+/// Request routing policy for multi-worker pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoutingPolicy {
+    /// Distribute requests evenly across workers (default).
+    #[default]
+    RoundRobin,
+    /// Route to the worker whose prefix cache best matches the request's prompt.
+    ///
+    /// Uses `EngineHandle::block_hashes()` to compare the request's prefix
+    /// block hashes against each worker's active block hashes, selecting the
+    /// worker with the highest number of matching prefix hashes. Falls back to
+    /// round-robin when no worker has any matching prefix.
+    CacheAware,
+}
+
+/// A pool of inference engine workers with configurable request distribution.
 ///
 /// `WorkerPool` provides the same API surface as `EngineHandle`, making it a
 /// drop-in replacement. When the pool contains a single worker, behavior is
@@ -21,10 +37,16 @@ use super::tokenizer_cache::CachedTokenizer;
 pub struct WorkerPool {
     workers: Vec<EngineHandle>,
     next_worker: AtomicUsize,
+    /// Routing policy used to select workers for incoming requests.
+    routing_policy: RoutingPolicy,
+    /// Token block size used when computing prefix block hashes for cache-aware routing.
+    block_size: usize,
 }
 
 impl WorkerPool {
     /// Create a new worker pool from a non-empty list of engine handles.
+    ///
+    /// Uses `RoutingPolicy::RoundRobin` and a default block size of 16 tokens.
     ///
     /// # Panics
     /// Panics if `workers` is empty.
@@ -33,6 +55,31 @@ impl WorkerPool {
         Self {
             workers,
             next_worker: AtomicUsize::new(0),
+            routing_policy: RoutingPolicy::RoundRobin,
+            block_size: super::block::DEFAULT_BLOCK_SIZE,
+        }
+    }
+
+    /// Create a new worker pool with an explicit routing policy and block size.
+    ///
+    /// `block_size` must match the KV cache block size of the workers (used to
+    /// chunk prompt tokens into prefix blocks for hash computation). Pass
+    /// `super::block::DEFAULT_BLOCK_SIZE` (16) when unsure.
+    ///
+    /// # Panics
+    /// Panics if `workers` is empty or `block_size` is zero.
+    pub fn new_with_policy(
+        workers: Vec<EngineHandle>,
+        policy: RoutingPolicy,
+        block_size: usize,
+    ) -> Self {
+        assert!(!workers.is_empty(), "WorkerPool requires at least one worker");
+        assert!(block_size > 0, "block_size must be > 0");
+        Self {
+            workers,
+            next_worker: AtomicUsize::new(0),
+            routing_policy: policy,
+            block_size,
         }
     }
 
@@ -41,13 +88,79 @@ impl WorkerPool {
         self.workers.len()
     }
 
-    /// Submit an inference request, routing to the next worker via round-robin.
+    /// Compute prefix block hashes for the given prompt tokens.
+    ///
+    /// Tokens are chunked into `block_size`-token blocks and hashed with FNV-1a
+    /// chaining so that each block's hash encodes the entire prefix up to that block.
+    fn compute_prompt_hashes(&self, prompt_tokens: &[u32]) -> Vec<BlockHash> {
+        let mut hashes = Vec::new();
+        let mut prev_hash = None;
+        for chunk in prompt_tokens.chunks(self.block_size) {
+            let h = BlockHash::from_tokens(chunk, prev_hash);
+            hashes.push(h);
+            prev_hash = Some(h);
+        }
+        hashes
+    }
+
+    /// Count how many of the prompt's prefix hashes appear in a worker's active block hashes.
+    fn prefix_match_count(prompt_hashes: &[BlockHash], worker_hashes: &[BlockHash]) -> usize {
+        use std::collections::HashSet;
+        let worker_set: HashSet<u64> = worker_hashes.iter().map(|h| h.0).collect();
+        prompt_hashes.iter().filter(|h| worker_set.contains(&h.0)).count()
+    }
+
+    /// Find the worker index with the best prefix match for the given prompt tokens.
+    ///
+    /// Falls back to round-robin when no worker has any matching prefix hashes,
+    /// or when the prompt produces no block hashes (empty token list).
+    fn best_prefix_worker(&self, prompt_tokens: &[u32]) -> usize {
+        let prompt_hashes = self.compute_prompt_hashes(prompt_tokens);
+        if prompt_hashes.is_empty() {
+            return self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        }
+
+        let mut best_idx = 0;
+        let mut best_count = 0;
+        for (i, worker) in self.workers.iter().enumerate() {
+            let count = Self::prefix_match_count(&prompt_hashes, &worker.block_hashes());
+            if count > best_count {
+                best_count = count;
+                best_idx = i;
+            }
+        }
+
+        if best_count == 0 {
+            // No worker has any matching prefix — fall back to round-robin
+            self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+        } else {
+            best_idx
+        }
+    }
+
+    /// Submit an inference request, routing to a worker according to the pool's `RoutingPolicy`.
+    ///
+    /// - `RoundRobin`: distributes requests evenly across workers (default).
+    /// - `CacheAware`: routes to the worker whose prefix cache best matches the
+    ///   request's prompt; falls back to round-robin when no prefix match exists.
+    ///   Single-worker pools always route to worker 0.
     pub fn submit(
         &self,
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
     ) -> Result<tokio::sync::mpsc::Receiver<GeneratedToken>, EngineError> {
-        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let idx = match self.routing_policy {
+            RoutingPolicy::RoundRobin => {
+                self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+            }
+            RoutingPolicy::CacheAware => {
+                if self.workers.len() == 1 {
+                    0
+                } else {
+                    self.best_prefix_worker(&prompt_tokens)
+                }
+            }
+        };
         self.workers[idx].submit(prompt_tokens, sampling_params)
     }
 
@@ -177,6 +290,8 @@ impl Clone for WorkerPool {
         Self {
             workers: self.workers.clone(),
             next_worker: AtomicUsize::new(self.next_worker.load(Ordering::Relaxed)),
+            routing_policy: self.routing_policy,
+            block_size: self.block_size,
         }
     }
 }
