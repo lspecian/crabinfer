@@ -209,6 +209,13 @@ pub struct EngineHandle {
     guided_cache_evictions: Arc<std::sync::atomic::AtomicU64>,
     /// Current guided decoding index cache size (updated by engine loop).
     guided_cache_size: Arc<std::sync::atomic::AtomicU64>,
+    /// Encoder-only embedding model (BERT/NomicBert).
+    ///
+    /// When `Some`, `embed()` routes through the full encoder forward pass rather
+    /// than the token-table lookup path. Set by `new_embedding_only()`.
+    /// The `Arc<Mutex<...>>` allows sharing the model reference across cloned handles
+    /// while serializing access (encoder inference is stateful).
+    embedding_model: Option<Arc<Mutex<Box<dyn ModelRunner>>>>,
 }
 
 impl Clone for EngineHandle {
@@ -230,6 +237,7 @@ impl Clone for EngineHandle {
             guided_cache_misses: self.guided_cache_misses.clone(),
             guided_cache_evictions: self.guided_cache_evictions.clone(),
             guided_cache_size: self.guided_cache_size.clone(),
+            embedding_model: self.embedding_model.clone(),
         }
     }
 }
@@ -512,7 +520,51 @@ impl EngineHandle {
             guided_cache_misses,
             guided_cache_evictions,
             guided_cache_size,
+            embedding_model: None,
         })
+    }
+
+    /// Create a lightweight handle for an encoder-only embedding model.
+    ///
+    /// Unlike `start()`, this constructor does NOT:
+    /// - Start a background engine thread
+    /// - Allocate a KV cache
+    /// - Create a scheduler
+    ///
+    /// Instead, embed() calls are dispatched synchronously to the model via
+    /// a Mutex-guarded reference. This is correct for BERT/NomicBert, which
+    /// have no auto-regressive generation and no KV cache concept.
+    ///
+    /// The `request_tx` is backed by a channel whose receiver is immediately
+    /// dropped, so submit() will return `Err(EngineError::Shutdown)` — callers
+    /// must use embed() for encoder-only models.
+    pub fn new_embedding_only(
+        model: Box<dyn ModelRunner>,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        // Create a channel and immediately drop the receiver so that any
+        // accidental submit() calls return Err(Shutdown) cleanly.
+        let (request_tx, _rx) = std::sync::mpsc::channel::<EngineRequest>();
+
+        Self {
+            request_tx,
+            tokenizer: Arc::new(CachedTokenizer::new(tokenizer, 2048)),
+            eos_token_id: 0,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: 0,
+            kv_blocks_used: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            kv_blocks_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            prefix_cache_hit_rate_bps: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            num_waiting: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            block_hash_snapshot: Arc::new(Mutex::new(Vec::new())),
+            embed_table: None,
+            guided_cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            guided_cache_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            guided_cache_evictions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            guided_cache_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            embedding_model: Some(Arc::new(Mutex::new(model))),
+        }
     }
 
     /// Submit an inference request.
@@ -643,14 +695,19 @@ impl EngineHandle {
 
     /// Compute embeddings for the given texts.
     ///
-    /// Tokenizes each input string and returns a fixed-dimension embedding vector
-    /// per input. When the model exposes an embedding table, this performs a
-    /// real embedding lookup (index_select) followed by mean-pooling across the
-    /// token dimension, producing `hidden_size`-dimensional vectors that carry
-    /// genuine semantic information from the model's learned representations.
+    /// Three code paths, in priority order:
     ///
-    /// Falls back to a hash-based deterministic stub if no embedding table is
-    /// available (e.g. if the ModelRunner does not implement `embedding_table()`).
+    /// 1. **Encoder model** (`embedding_model` is `Some`): routes each tokenized
+    ///    sequence through the full encoder forward pass (`model.embed()`).
+    ///    Produces semantically meaningful vectors (BERT/NomicBert quality).
+    ///
+    /// 2. **Embedding table** (`embed_table` is `Some`): looks up token vectors
+    ///    from the model's learned embedding table and mean-pools across the
+    ///    token dimension. This is used for causal LMs that expose their
+    ///    embedding table (e.g., Llama loaded via safetensors).
+    ///
+    /// 3. **Hash fallback**: deterministic 128-dim hash-based stub used when
+    ///    neither an encoder model nor an embedding table is available.
     ///
     /// Returns: one `Vec<f32>` per input text, plus token counts.
     pub fn embed(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, Vec<u32>), EngineError> {
@@ -663,7 +720,16 @@ impl EngineHandle {
         for token_ids in &token_ids_batch {
             token_counts.push(token_ids.len() as u32);
 
-            let emb = if let Some(ref table) = self.embed_table {
+            let emb = if let Some(ref encoder) = self.embedding_model {
+                // Encoder-only path: run the full BERT/NomicBert forward pass.
+                // Tokenize to a 1-D tensor and call model.embed() which
+                // handles masked-mean-pooling and L2 normalization internally.
+                let model = encoder.lock().map_err(|_| EngineError::Shutdown)?;
+                match Self::embed_with_encoder(model.as_ref(), token_ids) {
+                    Some(v) => v,
+                    None => Self::embed_hash_fallback(token_ids),
+                }
+            } else if let Some(ref table) = self.embed_table {
                 // Real embedding: look up token vectors from the model's
                 // learned embedding table and mean-pool across the sequence.
                 Self::embed_with_table(table, token_ids)
@@ -675,6 +741,25 @@ impl EngineHandle {
         }
 
         Ok((embeddings, token_counts))
+    }
+
+    /// Run encoder model embed() on a sequence of token IDs.
+    ///
+    /// Constructs a 1-D `[seq_len]` CPU tensor of token IDs and calls
+    /// `model.embed()`. Returns `None` on any candle error so the caller
+    /// can fall back to `embed_hash_fallback`.
+    fn embed_with_encoder(model: &dyn ModelRunner, token_ids: &[u32]) -> Option<Vec<f32>> {
+        let ids_tensor = Tensor::new(token_ids, &candle_core::Device::Cpu).ok()?;
+        let output = model.embed(&ids_tensor).ok()?;
+        // output is [hidden_size] — convert to f32 Vec
+        let vec: Vec<f32> = output.to_dtype(DType::F32).ok()?.to_vec1().ok()?;
+        // L2 normalize (encoder may already normalize, but do it defensively)
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            Some(vec.into_iter().map(|x| x / norm).collect())
+        } else {
+            Some(vec)
+        }
     }
 
     /// Produce an embedding by looking up token vectors in the model's

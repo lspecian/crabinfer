@@ -325,6 +325,9 @@ fn load_serving_engine(
                     "phi3" | "phi" => "phi3".to_string(),
                     "gemma" | "gemma2" | "gemma3" => "gemma3".to_string(),
                     "mistral" => "mistral".to_string(),
+                    // Encoder-only models don't use chat templates but need a
+                    // valid architecture name (not "llama") to avoid confusion.
+                    "bert" | "nomic_bert" => "bert".to_string(),
                     _ => "llama".to_string(),
                 }
             } else {
@@ -398,6 +401,34 @@ fn load_serving_engine(
 
         (model, model_info, model_id, tokenizer, eos)
     };
+
+    // ── Detect embedding-only architecture (BERT/NomicBert) ──
+    // Encoder-only models have no KV cache, no autoregressive loop, and must
+    // bypass the PagedAttention engine entirely. Detect from config.json and
+    // return early with a lightweight embedding-only EngineHandle.
+    if is_safetensors {
+        let config_path = model_path.join("config.json");
+        if config_path.exists() {
+            let config_text = std::fs::read_to_string(&config_path)
+                .unwrap_or_default();
+            let arch_probe: crabinfer_core::serving::safetensors_loader::HfArchitectureProbe =
+                serde_json::from_str(&config_text).unwrap_or_default();
+            let architecture = crabinfer_core::serving::safetensors_loader::ModelArchitecture::detect(
+                &arch_probe.architectures,
+                arch_probe.model_type.as_deref(),
+            );
+            if architecture.is_embedding_only() {
+                tracing::info!(
+                    "Detected embedding-only model ({:?}) — skipping PagedAttention engine",
+                    architecture
+                );
+                let handle = EngineHandle::new_embedding_only(model, tokenizer);
+                let pool = WorkerPool::new(vec![handle]);
+                tracing::info!("Embedding-only serving engine started");
+                return Ok((None, Some(pool), model_info, model_id));
+            }
+        }
+    }
 
     let model_config = model.config().clone();
     tracing::info!("EOS token ID: {eos_token_id}");

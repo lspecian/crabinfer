@@ -191,17 +191,20 @@ pub(crate) fn detect_quant_config(
 ///
 /// Reads the `architectures` and `model_type` fields to determine which model
 /// implementation to use.
-#[derive(Debug, serde::Deserialize)]
-struct HfArchitectureProbe {
+///
+/// This type is exposed publicly so the server crate can perform architecture
+/// detection without re-reading config.json.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct HfArchitectureProbe {
     #[serde(default)]
-    architectures: Vec<String>,
+    pub architectures: Vec<String>,
     #[serde(default)]
-    model_type: Option<String>,
+    pub model_type: Option<String>,
 }
 
 /// Detected model architecture family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelArchitecture {
+pub enum ModelArchitecture {
     Llama,
     Phi3,
     Mistral,
