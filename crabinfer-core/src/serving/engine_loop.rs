@@ -2959,4 +2959,40 @@ mod tests {
 
         handle.shutdown();
     }
+
+    // ─── Wave 0: BF16/FP16 dtype stubs (DTYPE-05, DTYPE-02) ─────────────
+    //
+    // DTYPE-06: Forward pass dtype is automatic -- candle matmul uses tensor's
+    // native dtype. No dedicated test needed; validated by integration testing on GPU.
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_kv_dtype_auto_follows_serving_dtype_bf16() {
+        // DTYPE-05: when serving_dtype is BF16,
+        //   KVCacheDType::Auto.resolve(serving_dtype.to_candle_dtype()) should return DType::BF16
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_kv_dtype_auto_follows_serving_dtype_f16() {
+        // DTYPE-05: when serving_dtype is F16,
+        //   KVCacheDType::Auto.resolve(serving_dtype.to_candle_dtype()) should return DType::F16
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_kv_cache_explicit_override_ignores_serving_dtype() {
+        // DTYPE-05: KVCacheDType::F16.resolve(bf16_dtype) should return DType::F16
+        //           (explicit override is not affected by serving dtype)
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_default_config_has_serving_dtype_auto() {
+        // DTYPE-02: ServingEngineConfig::default().serving_dtype == ServingDType::Auto
+        todo!("not yet implemented")
+    }
 }

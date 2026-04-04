@@ -1748,4 +1748,30 @@ mod tests {
         assert_eq!(config.sliding_window, Some(32768));
         assert_eq!(config.use_sliding_window, Some(false));
     }
+
+    // ─── Wave 0: BF16/FP16 dtype stubs (DTYPE-03) ────────────────────────
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_load_tensor_dtype_bf16_cpu() {
+        // DTYPE-03: load_tensor(weights, name, &Device::Cpu, DType::BF16)
+        //           should return a BF16 tensor on success
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_load_tensor_fp32_preserves_dtype() {
+        // DTYPE-03: load_tensor_fp32(weights, name, &Device::Cpu)
+        //           should always return DType::F32 regardless of on-disk dtype
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_load_tensor_cross_cast_skip() {
+        // DTYPE-03: if tensor on disk is already BF16 and target dtype is F16,
+        //           the loader should NOT cross-cast (log info, keep original dtype)
+        todo!("not yet implemented")
+    }
 }
