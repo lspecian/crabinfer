@@ -138,6 +138,11 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `crabinfer serve --model nomic-ai/nomic-embed-text-v1.5` downloads and loads the model without errors
   2. `POST /v1/embeddings` with that model returns semantically meaningful 768-dim vectors (cosine similarity between related texts > 0.5)
+**Plans:** 2 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — BERT/NomicBert embedding model runners with architecture detection and safetensors dispatch
+- [ ] 06-02-PLAN.md — Engine wiring: bypass PagedAttention for encoder-only models, wire embed() through real encoder
 
 ## Progress
 
@@ -153,4 +158,4 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
 | 3. Guided Decoding | 5/5 | Complete | 2026-04-04 |
 | 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
 | 5. Wiring Fixes | 1/2 | In Progress|  |
-| 6. Embedding Model Loader | 0/0 | Planned | - |
+| 6. Embedding Model Loader | 0/2 | Planned | - |
