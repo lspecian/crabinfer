@@ -184,10 +184,91 @@ impl Clone for WorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::block::BlockHash;
 
     // WorkerPool requires real EngineHandle instances which need a running
     // model. We test the round-robin index distribution logic directly since
     // that is the core algorithmic component of WorkerPool.
+
+    // --- Tests for prefix_match_count ---
+
+    #[test]
+    fn test_prefix_match_count_no_overlap() {
+        // Two disjoint sets -> 0 matches
+        let prompt_hashes = vec![BlockHash(1), BlockHash(2), BlockHash(3)];
+        let worker_hashes = vec![BlockHash(4), BlockHash(5), BlockHash(6)];
+        assert_eq!(WorkerPool::prefix_match_count(&prompt_hashes, &worker_hashes), 0);
+    }
+
+    #[test]
+    fn test_prefix_match_count_full_overlap() {
+        // Identical sets -> N matches
+        let hashes = vec![BlockHash(10), BlockHash(20), BlockHash(30)];
+        assert_eq!(WorkerPool::prefix_match_count(&hashes, &hashes), 3);
+    }
+
+    #[test]
+    fn test_prefix_match_count_partial() {
+        // Overlapping sets -> correct count
+        let prompt_hashes = vec![BlockHash(1), BlockHash(2), BlockHash(3), BlockHash(4)];
+        let worker_hashes = vec![BlockHash(2), BlockHash(4), BlockHash(99)];
+        assert_eq!(WorkerPool::prefix_match_count(&prompt_hashes, &worker_hashes), 2);
+    }
+
+    // --- Tests for compute_prompt_hashes ---
+
+    #[test]
+    fn test_compute_prompt_hashes_empty() {
+        let pool = WorkerPool {
+            workers: vec![],
+            next_worker: AtomicUsize::new(0),
+            routing_policy: RoutingPolicy::RoundRobin,
+            block_size: 16,
+        };
+        let hashes = pool.compute_prompt_hashes(&[]);
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn test_compute_prompt_hashes_single_block() {
+        // Tokens shorter than block_size -> 1 hash
+        let pool = WorkerPool {
+            workers: vec![],
+            next_worker: AtomicUsize::new(0),
+            routing_policy: RoutingPolicy::RoundRobin,
+            block_size: 16,
+        };
+        let tokens: Vec<u32> = (0..8).collect();
+        let hashes = pool.compute_prompt_hashes(&tokens);
+        assert_eq!(hashes.len(), 1);
+        // Verify the hash matches manual computation
+        let expected = BlockHash::from_tokens(&tokens, None);
+        assert_eq!(hashes[0], expected);
+    }
+
+    #[test]
+    fn test_compute_prompt_hashes_multiple_blocks() {
+        // Tokens spanning 3 blocks -> 3 hashes with chaining
+        let pool = WorkerPool {
+            workers: vec![],
+            next_worker: AtomicUsize::new(0),
+            routing_policy: RoutingPolicy::RoundRobin,
+            block_size: 4,
+        };
+        let tokens: Vec<u32> = (0..12).collect();
+        let hashes = pool.compute_prompt_hashes(&tokens);
+        assert_eq!(hashes.len(), 3);
+        // Verify chaining: each hash depends on the previous
+        let h0 = BlockHash::from_tokens(&tokens[0..4], None);
+        let h1 = BlockHash::from_tokens(&tokens[4..8], Some(h0));
+        let h2 = BlockHash::from_tokens(&tokens[8..12], Some(h1));
+        assert_eq!(hashes[0], h0);
+        assert_eq!(hashes[1], h1);
+        assert_eq!(hashes[2], h2);
+        // Verify hashes are not equal (chaining produces distinct values)
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+    }
 
     #[test]
     fn test_round_robin_index_distribution() {
