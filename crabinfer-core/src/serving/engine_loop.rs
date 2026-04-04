@@ -1512,7 +1512,10 @@ impl ServingEngineInner {
             // Sample token
             let token_id = sample_token(&logits_vec, &params);
 
-            // Compute logprobs if requested
+            // Compute logprobs if requested.
+            // Logprobs are computed from post-mask logits, reflecting the actual
+            // sampling distribution after guided decoding constraints are applied.
+            // This means masked (disallowed) tokens appear as NEG_INFINITY in logprobs.
             let (sampled_logprob, top_logprobs_vec) = if params.logprobs {
                 let lp = log_softmax(&logits_vec);
                 let sampled_lp = lp[token_id as usize];
@@ -1558,7 +1561,12 @@ impl ServingEngineInner {
 
             seq.append_token(token_id);
 
-            let should_stop = is_eos || seq.should_stop(token_id);
+            // Suppress stop_token_ids check when guided decoding is active.
+            // The DFA controls when generation ends; allowing stop tokens to
+            // fire mid-sequence would prematurely terminate valid guided output
+            // (e.g., a stop token that happens to be in the DFA's allowed set).
+            let has_guided = self.guided_states.contains_key(&sched.seq_id);
+            let should_stop = is_eos || (!has_guided && seq.should_stop(token_id));
             let reached_max = seq.reached_max_tokens();
 
             let finish_reason = if should_stop {

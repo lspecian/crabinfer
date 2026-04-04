@@ -129,6 +129,24 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> String {
              # TYPE crabinfer_requests_waiting gauge\n\
              crabinfer_requests_waiting {num_waiting}\n"
         ));
+
+        // Guided decoding index cache metrics
+        let gc = engine.guided_cache_stats();
+        out.push_str(&format!(
+            "# HELP crabinfer_guided_cache_hits Total guided decoding index cache hits.\n\
+             # TYPE crabinfer_guided_cache_hits counter\n\
+             crabinfer_guided_cache_hits {}\n\
+             # HELP crabinfer_guided_cache_misses Total guided decoding index cache misses.\n\
+             # TYPE crabinfer_guided_cache_misses counter\n\
+             crabinfer_guided_cache_misses {}\n\
+             # HELP crabinfer_guided_cache_size Current number of entries in the guided decoding index cache.\n\
+             # TYPE crabinfer_guided_cache_size gauge\n\
+             crabinfer_guided_cache_size {}\n\
+             # HELP crabinfer_guided_cache_evictions Total guided decoding index cache evictions.\n\
+             # TYPE crabinfer_guided_cache_evictions counter\n\
+             crabinfer_guided_cache_evictions {}\n",
+            gc.hits, gc.misses, gc.size, gc.evictions,
+        ));
     }
 
     // Tokens per second (computed gauge)

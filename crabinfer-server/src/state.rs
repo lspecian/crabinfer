@@ -128,6 +128,15 @@ pub struct ServerMetrics {
     pub ttft: Histogram,
     /// Inter-token latency (seconds).
     pub itl: Histogram,
+
+    /// Guided decoding index cache hits (absolute, updated each request).
+    pub guided_cache_hits: AtomicU64,
+    /// Guided decoding index cache misses (absolute, updated each request).
+    pub guided_cache_misses: AtomicU64,
+    /// Guided decoding index cache evictions (absolute, updated each request).
+    pub guided_cache_evictions: AtomicU64,
+    /// Guided decoding index cache current size (absolute, updated each request).
+    pub guided_cache_size: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -142,7 +151,22 @@ impl ServerMetrics {
             request_latency: Histogram::new(LATENCY_BUCKETS),
             ttft: Histogram::new(LATENCY_BUCKETS),
             itl: Histogram::new(ITL_BUCKETS),
+            guided_cache_hits: AtomicU64::new(0),
+            guided_cache_misses: AtomicU64::new(0),
+            guided_cache_evictions: AtomicU64::new(0),
+            guided_cache_size: AtomicU64::new(0),
         }
+    }
+
+    /// Update guided decoding cache statistics from a snapshot.
+    ///
+    /// Uses `store` (not `fetch_add`) because the snapshot values are already
+    /// absolute counters from IndexCache.
+    pub fn update_guided_cache_stats(&self, hits: u64, misses: u64, evictions: u64, size: u64) {
+        self.guided_cache_hits.store(hits, Ordering::Relaxed);
+        self.guided_cache_misses.store(misses, Ordering::Relaxed);
+        self.guided_cache_evictions.store(evictions, Ordering::Relaxed);
+        self.guided_cache_size.store(size, Ordering::Relaxed);
     }
 
     pub fn inc_request(&self) {
