@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 05-01-PLAN.md (SHA-256 wiring)
-last_updated: "2026-04-04T16:09:05.785Z"
+stopped_at: Completed 06-01-PLAN.md (BERT/NomicBert embedding runners)
+last_updated: "2026-04-04T21:37:05.630Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 8
   completed_phases: 7
-  total_plans: 23
-  completed_plans: 26
+  total_plans: 25
+  completed_plans: 27
   percent: 25
 ---
 
@@ -62,6 +62,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 03-guided-decoding P04 | 7 | 2 tasks | 8 files |
 | Phase 05-wiring-fixes P02 | 3min | 1 tasks | 2 files |
 | Phase 05-wiring-fixes P01 | 3min | 1 tasks | 1 files |
+| Phase 06-embedding-model-loader P01 | 6 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,9 @@ Recent decisions affecting current work:
 - [Phase 05-wiring-fixes]: block_size field on WorkerPool (default 16) mirrors KV cache block size for hash chunking
 - [Phase 05-wiring-fixes]: parse_lfs_sha256_map extracted as pure function for testability without HTTP
 - [Phase 05-wiring-fixes]: graceful degradation on HF API failure: empty map + warn, never block download
+- [Phase 06-embedding-model-loader]: BertEmbeddingRunner wraps candle-transformers BertModel; NomicBertRunner implements custom encoder inline for non-standard nomic-bert architecture
+- [Phase 06-embedding-model-loader]: clone_model() reloads from disk for embedding models (not cheaply clonable)
+- [Phase 06-embedding-model-loader]: broadcast_matmul via unsqueeze(0) for 3D x 2D tensor matmul (candle requires same rank)
 
 ### Pending Todos
 
@@ -118,6 +122,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-04T16:09:05.782Z
-Stopped at: Completed 05-01-PLAN.md (SHA-256 wiring)
+Last session: 2026-04-04T21:37:05.628Z
+Stopped at: Completed 06-01-PLAN.md (BERT/NomicBert embedding runners)
 Resume file: None

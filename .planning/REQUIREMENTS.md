@@ -59,7 +59,7 @@
 ### Embeddings
 
 - [ ] **EMBD-01**: `POST /v1/embeddings` endpoint returning vectors in OpenAI format
-- [ ] **EMBD-02**: Load embedding models (nomic-embed, gte-small) in serving engine
+- [x] **EMBD-02**: Load embedding models (nomic-embed, gte-small) in serving engine
 - [ ] **EMBD-03**: Batch embedding support (multiple inputs in single request)
 
 ## v2 Requirements
@@ -122,7 +122,7 @@
 | PCCH-01 | Phase 4 | Complete |
 | PCCH-02 | Phase 4 | Complete |
 | EMBD-01 | Phase 4 | Complete |
-| EMBD-02 | Phase 6 | Pending |
+| EMBD-02 | Phase 6 | Complete |
 | EMBD-03 | Phase 4 | Complete |
 
 **Coverage:**
