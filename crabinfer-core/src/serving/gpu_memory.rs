@@ -47,7 +47,7 @@ pub fn kv_cache_block_bytes(
 /// This is a rough estimate based on parameter counts. The actual memory
 /// may differ for quantized models, but this gives a reasonable upper bound
 /// for memory planning purposes.
-fn estimate_weights_memory(model_config: &ModelConfig) -> usize {
+fn estimate_weights_memory(model_config: &ModelConfig, weight_dtype_bytes: usize) -> usize {
     // Per transformer layer:
     //   QKV projection: hidden * (num_heads + 2*num_kv_heads) * head_size
     //   Output projection: hidden * hidden
@@ -71,9 +71,9 @@ fn estimate_weights_memory(model_config: &ModelConfig) -> usize {
 
     let total_params = model_config.num_layers * per_layer + embedding + lm_head + final_norm;
 
-    // Assume 2 bytes per parameter (F16/BF16 — quantized models use less,
-    // but we err on the side of overestimating for safety margin).
-    total_params * 2
+    // Bytes per parameter depends on serving dtype (4 for F32, 2 for F16/BF16).
+    // Quantized models use less, but we err on the side of overestimating.
+    total_params * weight_dtype_bytes
 }
 
 /// Estimate activation memory (intermediate tensors during forward pass).
@@ -115,15 +115,17 @@ fn estimate_activation_memory(
 /// - `gpu_memory_utilization`: Fraction of total memory to use (0.0–1.0)
 /// - `max_num_batched_tokens`: Maximum tokens per batch step
 /// - `kv_dtype_bytes`: Bytes per KV cache element (4 for F32, 2 for F16)
+/// - `weight_dtype_bytes`: Bytes per model weight parameter (4 for F32, 2 for F16/BF16)
 pub fn profile_gpu_memory(
     model_config: &ModelConfig,
     device: &candle_core::Device,
     gpu_memory_utilization: f64,
     max_num_batched_tokens: usize,
     kv_dtype_bytes: usize,
+    weight_dtype_bytes: usize,
 ) -> GpuMemoryProfile {
     let total_memory = query_device_memory(device);
-    let weights_memory = estimate_weights_memory(model_config);
+    let weights_memory = estimate_weights_memory(model_config, weight_dtype_bytes);
     let activation_memory = estimate_activation_memory(model_config, max_num_batched_tokens);
 
     let usable_memory = (total_memory as f64 * gpu_memory_utilization) as usize;
@@ -315,7 +317,7 @@ mod tests {
     #[test]
     fn test_estimate_weights_memory() {
         let config = test_model_config();
-        let mem = estimate_weights_memory(&config);
+        let mem = estimate_weights_memory(&config, 2); // F16/BF16 = 2 bytes
         // Llama 7B has ~7B params → ~14GB at 2 bytes each
         // Our estimate should be in the right ballpark (5-20 GB)
         assert!(mem > 5_000_000_000, "weights memory too low: {mem}");
@@ -335,7 +337,7 @@ mod tests {
     fn test_profile_gpu_memory() {
         let config = test_model_config();
         let device = candle_core::Device::Cpu;
-        let profile = profile_gpu_memory(&config, &device, 0.90, 2048, 4);
+        let profile = profile_gpu_memory(&config, &device, 0.90, 2048, 4, 2);
 
         assert!(profile.num_blocks >= 16, "too few blocks: {}", profile.num_blocks);
         assert!(profile.bytes_per_block > 0);

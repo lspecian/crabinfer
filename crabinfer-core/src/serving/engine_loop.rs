@@ -285,6 +285,16 @@ impl EngineHandle {
             config.serving_dtype, &device
         )?;
 
+        let weight_dtype_bytes = serving_dtype.size_in_bytes();
+        if serving_dtype != DType::F32 {
+            let savings_pct = (1.0 - weight_dtype_bytes as f64 / 4.0) * 100.0;
+            tracing::info!(
+                "Serving dtype {:?}: estimated {:.0}% weight memory savings vs F32",
+                serving_dtype,
+                savings_pct,
+            );
+        }
+
         // KV cache dtype: resolve from config (Auto → serving dtype, or user-specified F16/BF16/FP8).
         let kv_dtype = config.kv_cache_dtype.resolve(serving_dtype);
         let kv_dtype_bytes = kv_dtype.size_in_bytes();
@@ -317,6 +327,7 @@ impl EngineHandle {
                     config.gpu_memory_utilization,
                     config.max_num_batched_tokens,
                     kv_dtype_bytes,
+                    weight_dtype_bytes,
                 );
                 tracing::info!(
                     "GPU memory profile: total={:.1}GB, weights={:.1}GB, activations={:.1}MB, kv_available={:.1}GB, blocks={}",
