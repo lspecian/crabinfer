@@ -73,11 +73,63 @@ pub fn should_download(filename: &str) -> bool {
     )
 }
 
+/// Parse LFS SHA-256 entries from a HuggingFace API JSON response.
+///
+/// Iterates `siblings` array and collects `rfilename -> lfs.sha256` for every
+/// sibling that has an `lfs.sha256` field.  Returns an empty map when the JSON
+/// structure is unexpected or when no siblings have LFS metadata.
+///
+/// This is a pure function so it can be unit-tested without making HTTP requests.
+pub fn parse_lfs_sha256_map(json: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+
+    if let Some(siblings) = json["siblings"].as_array() {
+        for sibling in siblings {
+            if let (Some(name), Some(sha256)) = (
+                sibling["rfilename"].as_str(),
+                sibling["lfs"]["sha256"].as_str(),
+            ) {
+                if !sha256.is_empty() {
+                    map.insert(name.to_string(), sha256.to_string());
+                }
+            }
+        }
+    }
+
+    map
+}
+
+/// Fetch LFS SHA-256 checksums for all files in `repo_id` from the HF API.
+///
+/// Uses a blocking HTTP request.  Returns an empty map on any failure so that
+/// callers can degrade gracefully rather than blocking the download.
+///
+/// This function is `#[cfg(feature = "providers")]` because it requires the
+/// optional `reqwest` dependency.
+#[cfg(feature = "providers")]
+fn fetch_lfs_sha256_map_blocking(
+    repo_id: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let client = reqwest::blocking::Client::new();
+    let url = format!("https://huggingface.co/api/models/{repo_id}");
+    let mut req = client.get(&url);
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send()?.json::<serde_json::Value>()?;
+    Ok(parse_lfs_sha256_map(&resp))
+}
+
 /// Download all relevant model files for `repo_id` and return the local cache directory.
 ///
 /// Files are cached under `~/.cache/crabinfer/<repo_id>/`. Already-cached files
 /// are not re-downloaded (the `hf-hub` crate handles this automatically via its
 /// etag-based caching).
+///
+/// After each safetensors file is downloaded its SHA-256 digest is verified
+/// against the LFS metadata from the HuggingFace API.  If the API is
+/// unreachable a warning is logged and verification is skipped so that
+/// air-gapped or rate-limited environments are not blocked.
 ///
 /// The `HF_TOKEN` environment variable is read automatically by `hf-hub` for
 /// gated/private models.
@@ -109,6 +161,21 @@ pub async fn ensure_model_cached(repo_id: &str) -> anyhow::Result<std::path::Pat
         .await
         .context("Failed to fetch repository info from HuggingFace Hub")?;
 
+    // Fetch LFS SHA-256 metadata before the download loop.
+    // On failure we warn and continue with an empty map (graceful degradation).
+    let repo_id_for_sha = repo_id.to_string();
+    let lfs_sha_map = tokio::task::spawn_blocking(move || {
+        fetch_lfs_sha256_map_blocking(&repo_id_for_sha)
+    })
+    .await
+    .unwrap_or_else(|_| Ok(std::collections::HashMap::new()))
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            "Could not fetch LFS checksums for {repo_id}, skipping SHA-256 verification: {e}"
+        );
+        std::collections::HashMap::new()
+    });
+
     // Download each relevant file
     for sibling in &files.siblings {
         let filename = &sibling.rfilename;
@@ -122,6 +189,16 @@ pub async fn ensure_model_cached(repo_id: &str) -> anyhow::Result<std::path::Pat
             .await
             .with_context(|| format!("Failed to download {filename} from {repo_id}"))?;
         tracing::info!("Cached: {}", local_path.display());
+
+        // Verify SHA-256 for safetensors files when we have an LFS checksum.
+        let lower = filename.to_lowercase();
+        if lower.ends_with(".safetensors") {
+            if let Some(expected_sha) = lfs_sha_map.get(filename.as_str()) {
+                verify_sha256(&local_path, expected_sha)
+                    .with_context(|| format!("Integrity check failed for {filename}"))?;
+                tracing::info!("SHA-256 verified: {}", filename);
+            }
+        }
     }
 
     // The local directory is the snapshot directory for the model
@@ -304,5 +381,96 @@ mod tests {
     fn test_verify_sha256_missing_file() {
         let result = verify_sha256(std::path::Path::new("/nonexistent/file.bin"), "abc123");
         assert!(result.is_err(), "Should fail for missing file");
+    }
+
+    // ── parse_lfs_sha256_map ───────────────────────────────────────────────────
+
+    /// Test 3: parse_lfs_sha256_map correctly extracts LFS sha256 entries from
+    /// a HF API response with a mix of LFS and non-LFS files.
+    #[test]
+    fn test_parse_lfs_sha256_from_json() {
+        let json_str = r#"{
+            "siblings": [
+                {
+                    "rfilename": "model.safetensors",
+                    "lfs": {
+                        "sha256": "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+                        "size": 1234567890,
+                        "pointer_size": 134
+                    }
+                },
+                {
+                    "rfilename": "config.json"
+                },
+                {
+                    "rfilename": "pytorch_model.bin",
+                    "lfs": {
+                        "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                        "size": 9876543210,
+                        "pointer_size": 134
+                    }
+                }
+            ]
+        }"#;
+
+        let json: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let map = parse_lfs_sha256_map(&json);
+
+        // safetensors file with LFS should be present
+        assert_eq!(
+            map.get("model.safetensors"),
+            Some(&"abc123def456abc123def456abc123def456abc123def456abc123def456abc1".to_string()),
+            "safetensors LFS sha256 should be in map"
+        );
+
+        // pytorch_model.bin with LFS should also be present
+        assert_eq!(
+            map.get("pytorch_model.bin"),
+            Some(&"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            "pytorch_model.bin LFS sha256 should be in map"
+        );
+
+        // config.json has no LFS metadata — must NOT be in map
+        assert!(
+            !map.contains_key("config.json"),
+            "config.json (no LFS) should not be in map"
+        );
+    }
+
+    /// Test 4: parse_lfs_sha256_map returns an empty map when no siblings have
+    /// LFS metadata (tokenizer.json, config.json, etc.).
+    #[test]
+    fn test_parse_lfs_sha256_non_lfs_files_empty_map() {
+        let json_str = r#"{
+            "siblings": [
+                { "rfilename": "config.json" },
+                { "rfilename": "tokenizer.json" },
+                { "rfilename": "tokenizer_config.json" },
+                { "rfilename": "special_tokens_map.json" }
+            ]
+        }"#;
+
+        let json: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let map = parse_lfs_sha256_map(&json);
+
+        assert!(
+            map.is_empty(),
+            "Non-LFS files should produce an empty sha256 map, got: {:?}",
+            map
+        );
+    }
+
+    /// Edge case: empty siblings array returns empty map.
+    #[test]
+    fn test_parse_lfs_sha256_empty_siblings() {
+        let json: serde_json::Value = serde_json::from_str(r#"{"siblings": []}"#).unwrap();
+        assert!(parse_lfs_sha256_map(&json).is_empty());
+    }
+
+    /// Edge case: missing siblings key returns empty map.
+    #[test]
+    fn test_parse_lfs_sha256_missing_siblings_key() {
+        let json: serde_json::Value = serde_json::from_str(r#"{"sha": "abc"}"#).unwrap();
+        assert!(parse_lfs_sha256_map(&json).is_empty());
     }
 }
