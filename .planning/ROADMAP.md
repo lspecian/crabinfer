@@ -88,12 +88,14 @@ Plans:
   1. A `response_format: {type: "json_schema", json_schema: {...}}` request produces output that validates against the schema — every token is constrained, not just post-processed
   2. A regex pattern submitted via the API compiles to a DFA and every generated token is a valid continuation of the DFA state
   3. Constrained generation adds less than 5% latency overhead compared to the same model running unconstrained on identical prompts
-**Plans:** 3 plans
+**Plans:** 5 plans
 
 Plans:
-- [ ] 03-00-PLAN.md — Wave 0: outlines-core dependency and failing test stubs for all 4 GDEC behaviors
-- [ ] 03-01-PLAN.md — Core guided decoding module (GuidedState, IndexCache, apply_guided_mask) and engine loop integration
-- [ ] 03-02-PLAN.md — Server-side ResponseFormat to GuidedConstraint wiring in OpenAI routes
+- [x] 03-00-PLAN.md — Wave 0: outlines-core dependency and failing test stubs for all 4 GDEC behaviors
+- [x] 03-01-PLAN.md — Core guided decoding module (GuidedState, IndexCache, apply_guided_mask) and engine loop integration
+- [x] 03-02-PLAN.md — Server-side ResponseFormat to GuidedConstraint wiring in OpenAI routes
+- [ ] 03-03-PLAN.md — LRU eviction for IndexCache with Prometheus cache metrics
+- [ ] 03-04-PLAN.md — Unified guided endpoint, configurable error behavior, and stop token override
 
 ### Phase 4: Production Infrastructure
 **Goal**: The server runs across multiple workers with shared weights, reads config from TOML, safely isolates cache across tenants, and serves embedding vectors via the standard OpenAI endpoint
@@ -123,5 +125,5 @@ Phases execute in numeric order: 1 → 1.1 → 1.2 → 2 → 3 → 4
 | 1.1 CUDA Graph Capture + Candle Patches | 3/3 | Done (needs H100 validation) | 2026-04-02 |
 | 1.2 BF16/FP16 Serving Support | 0/4 | In Progress | - |
 | 2. Performance Optimization | 0/4 | Planned | - |
-| 3. Guided Decoding | 0/3 | Planned | - |
+| 3. Guided Decoding | 3/5 | In Progress | - |
 | 4. Production Infrastructure | 0/4 | Planned | - |
