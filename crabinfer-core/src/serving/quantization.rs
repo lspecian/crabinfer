@@ -1589,3 +1589,68 @@ mod tests {
         assert_eq!(f16_bytes * 2, f32_bytes, "F16 should be exactly half of F32");
     }
 }
+
+#[cfg(test)]
+mod serving_dtype_tests {
+    // Tests for ServingDType, is_fp32_weight, and resolve_serving_dtype.
+    // These stubs are Wave 0 (Nyquist compliance) — they compile and panic
+    // with "not yet implemented" until Plan 01 replaces todo!() with real assertions.
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_serving_dtype_fromstr() {
+        // DTYPE-02: Parse "auto" -> Auto, "bf16" -> BF16, "f16" -> F16, "f32" -> F32, "invalid" -> Err
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_serving_dtype_display() {
+        // DTYPE-02: Display output for each variant:
+        //   Auto -> "auto", BF16 -> "bf16", F16 -> "f16", F32 -> "f32"
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_serving_dtype_default() {
+        // DTYPE-02: ServingDType::default() == ServingDType::Auto
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_is_fp32_weight_embed_tokens() {
+        // DTYPE-04: is_fp32_weight("model.embed_tokens.weight") == true
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_is_fp32_weight_rms_norm() {
+        // DTYPE-04: is_fp32_weight("model.layers.0.input_layernorm.weight") == true
+        //           is_fp32_weight("model.norm.weight") == true
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_is_fp32_weight_linear_proj() {
+        // DTYPE-04: is_fp32_weight("model.layers.0.self_attn.q_proj.weight") == false  (negative case)
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_resolve_serving_dtype_auto_cpu() {
+        // DTYPE-01: resolve_serving_dtype(ServingDType::Auto, &Device::Cpu) == ServingDType::F32
+        todo!("not yet implemented")
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn test_resolve_serving_dtype_explicit_f16() {
+        // DTYPE-01: resolve_serving_dtype(ServingDType::F16, &Device::Cpu) == ServingDType::F16
+        todo!("not yet implemented")
+    }
+}
