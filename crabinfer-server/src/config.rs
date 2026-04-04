@@ -37,6 +37,7 @@ pub struct CrabInferConfig {
     pub disable_prefix_cache: Option<bool>,
     pub quantization: Option<String>,
     pub kv_cache_dtype: Option<String>,
+    pub dtype: Option<String>,
     pub max_model_len: Option<usize>,
     pub chat_template: Option<String>,
     pub swap_space: Option<f64>,
@@ -69,6 +70,7 @@ pub struct CliOverrides {
     pub disable_prefix_cache: Option<bool>,
     pub quantization: Option<String>,
     pub kv_cache_dtype: Option<String>,
+    pub dtype: Option<String>,
     pub max_model_len: Option<usize>,
     pub chat_template: Option<String>,
     pub swap_space: Option<f64>,
@@ -108,6 +110,7 @@ impl CrabInferConfig {
         merge!(disable_prefix_cache);
         merge!(quantization);
         merge!(kv_cache_dtype);
+        merge!(dtype);
         merge!(max_model_len);
         merge!(chat_template);
         merge!(swap_space);
@@ -140,6 +143,7 @@ impl CrabInferConfig {
             disable_prefix_cache: self.disable_prefix_cache.unwrap_or(false),
             quantization: self.quantization.clone().unwrap_or_else(|| "none".to_string()),
             kv_cache_dtype: self.kv_cache_dtype.clone().unwrap_or_else(|| "auto".to_string()),
+            dtype: self.dtype.clone().unwrap_or_else(|| "auto".to_string()),
             max_model_len: self.max_model_len,
             chat_template: self.chat_template.clone(),
             swap_space: self.swap_space.unwrap_or(0.0),
@@ -194,6 +198,7 @@ pub fn load_config(path: Option<&Path>) -> Result<CrabInferConfig, Box<dyn std::
 /// - `CRABINFER_MAX_MODEL_LEN` -- override model context length
 /// - `CRABINFER_QUANTIZATION` -- weight quantization method
 /// - `CRABINFER_KV_CACHE_DTYPE` -- KV cache data type
+/// - `CRABINFER_DTYPE` -- model weight dtype (auto, f32, f16, bf16)
 /// - `CRABINFER_CHAT_TEMPLATE` -- chat template override
 /// - `CRABINFER_ENFORCE_EAGER` -- set to "1" or "true" to disable CUDA graphs
 /// - `CRABINFER_SWAP_SPACE` -- CPU swap space for KV cache in GiB (0 = disabled)
@@ -233,6 +238,9 @@ pub fn apply_env_overrides(config: &mut ServerConfig) {
     }
     if let Ok(v) = env::var("CRABINFER_KV_CACHE_DTYPE") {
         config.kv_cache_dtype = v;
+    }
+    if let Ok(v) = env::var("CRABINFER_DTYPE") {
+        config.dtype = v;
     }
     if let Ok(v) = env::var("CRABINFER_CHAT_TEMPLATE") {
         config.chat_template = Some(v);
@@ -319,6 +327,9 @@ pub fn apply_cli_overrides(config: &mut ServerConfig, overrides: &CliOverrides) 
     }
     if let Some(ref v) = overrides.kv_cache_dtype {
         config.kv_cache_dtype = v.clone();
+    }
+    if let Some(ref v) = overrides.dtype {
+        config.dtype = v.clone();
     }
     if overrides.max_model_len.is_some() {
         config.max_model_len = overrides.max_model_len;

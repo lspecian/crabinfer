@@ -73,6 +73,10 @@ struct Cli {
     #[arg(long)]
     kv_cache_dtype: Option<String>,
 
+    /// Model weight dtype: auto, f32, f16, bf16 (default: auto)
+    #[arg(long, help = "Model weight dtype: auto, f32, f16, bf16 (default: auto)")]
+    dtype: Option<String>,
+
     /// Maximum model context length (overrides model default)
     #[arg(long)]
     max_model_len: Option<usize>,
@@ -155,6 +159,7 @@ async fn main() {
         disable_prefix_cache: if cli.disable_prefix_cache { Some(true) } else { None },
         quantization: cli.quantization,
         kv_cache_dtype: cli.kv_cache_dtype,
+        dtype: cli.dtype,
         max_model_len: cli.max_model_len,
         chat_template: cli.chat_template,
         swap_space: cli.swap_space,

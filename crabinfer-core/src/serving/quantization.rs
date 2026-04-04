@@ -221,10 +221,8 @@ impl std::str::FromStr for ServingDType {
 /// For CPU/Metal: always returns F32.
 #[cfg(feature = "cuda")]
 fn detect_best_dtype(device: &Device) -> DType {
-    use candle_core::backend::BackendDevice;
-
     if let Device::Cuda(cuda_dev) = device {
-        match cuda_dev.compute_capability() {
+        match cuda_dev.cuda_stream().context().compute_capability() {
             Ok((major, _minor)) => {
                 if major >= 8 {
                     DType::BF16
@@ -268,9 +266,8 @@ pub fn resolve_serving_dtype(dtype: ServingDType, device: &Device) -> Result<DTy
         ServingDType::BF16 => {
             #[cfg(feature = "cuda")]
             {
-                use candle_core::backend::BackendDevice;
                 if let Device::Cuda(cuda_dev) = device {
-                    match cuda_dev.compute_capability() {
+                    match cuda_dev.cuda_stream().context().compute_capability() {
                         Ok((major, minor)) => {
                             if major < 8 {
                                 let sm = major * 10 + minor;

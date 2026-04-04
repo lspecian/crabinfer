@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub quantization: String,
     /// KV cache data type (auto, fp16, bf16). Default: auto.
     pub kv_cache_dtype: String,
+    /// Model weight computation dtype (auto, f32, f16, bf16). Default: auto.
+    pub dtype: String,
     /// Maximum model context length. None = use model default.
     pub max_model_len: Option<usize>,
     /// Chat template override. Architecture name (e.g., "chatml", "llama3")
@@ -274,6 +276,11 @@ fn load_serving_engine(
         .parse()
         .map_err(|e: String| format!("Invalid KV cache dtype: {e}"))?;
 
+    let serving_dtype: crabinfer_core::serving::quantization::ServingDType = config
+        .dtype
+        .parse()
+        .map_err(|e: String| format!("Invalid dtype: {e}"))?;
+
     // ── Load model + tokenizer + model info (branching on format) ──
     let (model, model_info, model_id, tokenizer, eos_token_id) = if is_safetensors {
         tracing::info!("Detected HuggingFace safetensors directory");
@@ -438,6 +445,7 @@ fn load_serving_engine(
         gpu_memory_utilization: config.gpu_memory_utilization,
         quantization,
         kv_cache_dtype,
+        serving_dtype,
         max_model_len: config.max_model_len,
         enable_lora: config.enable_lora,
         max_loras: config.max_loras,

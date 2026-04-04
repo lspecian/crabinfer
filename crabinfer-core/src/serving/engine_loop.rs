@@ -91,10 +91,16 @@ pub struct ServingEngineConfig {
     /// Weight quantization method applied at model load time. Default: None.
     pub quantization: super::quantization::QuantizationMethod,
     /// KV cache dtype. Lower precision saves memory at minimal accuracy cost.
-    /// - `Auto`: use the model's compute dtype (currently F32)
+    /// - `Auto`: use the serving dtype (resolved from `serving_dtype` field)
     /// - `F16`: half-precision — 2x more context vs F32
     /// - `BF16`: bfloat16 — 2x more context, better dynamic range than F16
     pub kv_cache_dtype: super::quantization::KVCacheDType,
+    /// Model weight computation dtype. Default: `Auto` (detect best for device).
+    /// - `Auto`: BF16 on Ampere+, F16 on Volta+, F32 elsewhere
+    /// - `BF16`: requires Ampere (sm_80+) on CUDA; allowed on CPU
+    /// - `F16`: half-precision, supported on Volta+ GPUs
+    /// - `F32`: full precision, always available
+    pub serving_dtype: super::quantization::ServingDType,
     /// Maximum model context length (max sequence length).
     /// When `None`, uses the model's built-in context length from GGUF metadata.
     /// When set, overrides the model's default (useful for models that support
@@ -131,6 +137,7 @@ impl Default for ServingEngineConfig {
             max_cuda_graph_batch_size: 32,
             quantization: super::quantization::QuantizationMethod::None,
             kv_cache_dtype: super::quantization::KVCacheDType::Auto,
+            serving_dtype: super::quantization::ServingDType::Auto,
             max_model_len: None,
             enable_lora: false,
             max_loras: 4,
@@ -273,8 +280,13 @@ impl EngineHandle {
             model_config.max_seq_len = max_len;
         }
 
-        // KV cache dtype: resolve from config (Auto → F32, or user-specified F16/BF16/FP8).
-        let kv_dtype = config.kv_cache_dtype.resolve(DType::F32);
+        // Resolve serving dtype first — KV cache Auto needs this as its default.
+        let serving_dtype = super::quantization::resolve_serving_dtype(
+            config.serving_dtype, &device
+        )?;
+
+        // KV cache dtype: resolve from config (Auto → serving dtype, or user-specified F16/BF16/FP8).
+        let kv_dtype = config.kv_cache_dtype.resolve(serving_dtype);
         let kv_dtype_bytes = kv_dtype.size_in_bytes();
         let is_fp8_kv = config.kv_cache_dtype == super::quantization::KVCacheDType::Fp8E4M3;
         if kv_dtype != DType::F32 {
@@ -2966,33 +2978,36 @@ mod tests {
     // native dtype. No dedicated test needed; validated by integration testing on GPU.
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_kv_dtype_auto_follows_serving_dtype_bf16() {
-        // DTYPE-05: when serving_dtype is BF16,
-        //   KVCacheDType::Auto.resolve(serving_dtype.to_candle_dtype()) should return DType::BF16
-        todo!("not yet implemented")
+        // DTYPE-05: KVCacheDType::Auto.resolve(DType::BF16) returns DType::BF16
+        use crate::serving::quantization::KVCacheDType;
+        use candle_core::DType;
+        assert_eq!(KVCacheDType::Auto.resolve(DType::BF16), DType::BF16);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_kv_dtype_auto_follows_serving_dtype_f16() {
-        // DTYPE-05: when serving_dtype is F16,
-        //   KVCacheDType::Auto.resolve(serving_dtype.to_candle_dtype()) should return DType::F16
-        todo!("not yet implemented")
+        // DTYPE-05: KVCacheDType::Auto.resolve(DType::F16) returns DType::F16
+        use crate::serving::quantization::KVCacheDType;
+        use candle_core::DType;
+        assert_eq!(KVCacheDType::Auto.resolve(DType::F16), DType::F16);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_kv_cache_explicit_override_ignores_serving_dtype() {
         // DTYPE-05: KVCacheDType::F16.resolve(bf16_dtype) should return DType::F16
         //           (explicit override is not affected by serving dtype)
-        todo!("not yet implemented")
+        use crate::serving::quantization::KVCacheDType;
+        use candle_core::DType;
+        assert_eq!(KVCacheDType::F16.resolve(DType::BF16), DType::F16);
+        assert_eq!(KVCacheDType::BF16.resolve(DType::F16), DType::BF16);
+        assert_eq!(KVCacheDType::F16.resolve(DType::F32), DType::F16);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_default_config_has_serving_dtype_auto() {
         // DTYPE-02: ServingEngineConfig::default().serving_dtype == ServingDType::Auto
-        todo!("not yet implemented")
+        use crate::serving::quantization::ServingDType;
+        assert_eq!(ServingEngineConfig::default().serving_dtype, ServingDType::Auto);
     }
 }
