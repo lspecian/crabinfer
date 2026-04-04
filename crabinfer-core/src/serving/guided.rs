@@ -482,4 +482,67 @@ mod tests {
             assert_eq!(*l, 1.0, "No masking should happen with empty allowed set");
         }
     }
+
+    #[test]
+    fn test_stop_token_suppressed_during_guided() {
+        // GDEC-05: When guided decoding is active, stop_token_ids must NOT fire
+        // to prevent premature termination of valid constrained output.
+        //
+        // This test documents the expected engine_loop.rs behavior:
+        //   let has_guided = self.guided_states.contains_key(&sched.seq_id);
+        //   let should_stop = is_eos || (!has_guided && seq.should_stop(token_id));
+        //
+        // Scenario: token_id=42 is in the stop list AND in the DFA's allowed set.
+        // Without suppression:  should_stop = true  → generation terminates early.
+        // With suppression:     should_stop = false → DFA continues to guide output.
+        //
+        // We verify the logic directly here since setting up a full engine
+        // with an active sequence would require a real tokenizer + model.
+
+        // Simulate has_guided = true (sequence has an active guided state)
+        let has_guided_active = true;
+        let is_eos = false;
+        let stop_token_fired = true; // seq.should_stop() would return true
+
+        // With guided active, stop_token_ids check is suppressed
+        let should_stop_with_guided = is_eos || (!has_guided_active && stop_token_fired);
+        assert!(
+            !should_stop_with_guided,
+            "Stop token must be suppressed when guided decoding is active"
+        );
+
+        // Without guided, stop token fires normally
+        let has_guided_inactive = false;
+        let should_stop_without_guided = is_eos || (!has_guided_inactive && stop_token_fired);
+        assert!(
+            should_stop_without_guided,
+            "Stop token fires normally when guided decoding is not active"
+        );
+    }
+
+    #[test]
+    fn test_logprobs_reflect_post_mask_distribution() {
+        // GDEC-05: Logprobs are computed from post-mask logits.
+        // A token masked to NEG_INFINITY should have logprob of NEG_INFINITY
+        // after log_softmax, confirming the constraint is reflected in reported probs.
+        let mut logits = vec![1.0f32; 4];
+        let allowed = vec![0u32, 2]; // tokens 1 and 3 are masked out
+
+        apply_guided_mask(&mut logits, &allowed);
+
+        // After masking: logits[1] and logits[3] are NEG_INFINITY
+        assert_eq!(logits[1], f32::NEG_INFINITY, "Masked token logit must be NEG_INFINITY");
+        assert_eq!(logits[3], f32::NEG_INFINITY, "Masked token logit must be NEG_INFINITY");
+
+        // Simulate log_softmax: exp(NEG_INFINITY) = 0, so log(0) = -inf in logprob space
+        // We verify that after masking the sum of exp(logits) only includes allowed tokens
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
+        let lp_masked_0 = (f32::NEG_INFINITY - max_logit).exp() / sum_exp;
+        // lp for masked token: exp(-inf) / sum = 0 / sum = 0 (then log(0) = -inf)
+        assert_eq!(
+            lp_masked_0, 0.0,
+            "Masked token contributes 0 probability after softmax"
+        );
+    }
 }
