@@ -19,7 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 3: Guided Decoding** - Token-level constrained generation via JSON Schema and regex DFA
 - [ ] **Phase 4: Production Infrastructure** - Multi-worker serving, TOML config, prefix cache salting, and embeddings endpoint
 - [ ] **Phase 5: Wiring Fixes** - SHA-256 verification in download path + cache-aware worker routing
-- [ ] **Phase 6: Embedding Model Loader** - BERT/encoder model support for dedicated embedding models
+- [x] **Phase 6: Embedding Model Loader** - BERT/encoder model support for dedicated embedding models (completed 2026-04-04)
 
 ## Phase Details
 
@@ -138,7 +138,7 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `crabinfer serve --model nomic-ai/nomic-embed-text-v1.5` downloads and loads the model without errors
   2. `POST /v1/embeddings` with that model returns semantically meaningful 768-dim vectors (cosine similarity between related texts > 0.5)
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [ ] 06-01-PLAN.md — BERT/NomicBert embedding model runners with architecture detection and safetensors dispatch
@@ -158,4 +158,4 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
 | 3. Guided Decoding | 5/5 | Complete | 2026-04-04 |
 | 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
 | 5. Wiring Fixes | 1/2 | In Progress|  |
-| 6. Embedding Model Loader | 1/2 | In Progress|  |
+| 6. Embedding Model Loader | 2/2 | Complete   | 2026-04-04 |
