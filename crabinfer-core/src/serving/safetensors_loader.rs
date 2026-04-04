@@ -210,6 +210,10 @@ pub(crate) enum ModelArchitecture {
     Qwen2,
     /// Qwen3 and Qwen3.5 — Llama-compatible with QKV biases, QK normalization, and optional sliding window.
     Qwen3,
+    /// Standard BERT encoder (BertModel, RoBERTa, gte-small, etc.)
+    Bert,
+    /// NomicBert encoder (nomic-embed-text-v1.5) — custom RoPE+SwiGLU architecture.
+    NomicBert,
 }
 
 impl ModelArchitecture {
@@ -218,6 +222,13 @@ impl ModelArchitecture {
         // Check architectures array first (most reliable)
         for arch in architectures {
             let arch_lower = arch.to_lowercase();
+            // NomicBert must be checked BEFORE Bert (more specific)
+            if arch_lower.contains("nomicbert") {
+                return Self::NomicBert;
+            }
+            if arch_lower == "bertmodel" || arch_lower == "robertamodel" {
+                return Self::Bert;
+            }
             // Qwen3/3.5 must be checked before Qwen2 (since "qwen3" doesn't contain "qwen2")
             if arch_lower.contains("qwen3") {
                 return Self::Qwen3;
@@ -239,6 +250,13 @@ impl ModelArchitecture {
         // Fall back to model_type
         if let Some(mt) = model_type {
             let mt_lower = mt.to_lowercase();
+            // NomicBert before Bert (more specific)
+            if mt_lower == "nomic_bert" || mt_lower == "nomicbert" {
+                return Self::NomicBert;
+            }
+            if mt_lower == "bert" || mt_lower == "roberta" {
+                return Self::Bert;
+            }
             // Qwen3/3.5 before Qwen2
             if mt_lower == "qwen3" || mt_lower == "qwen3_5" || mt_lower == "qwen3.5" {
                 return Self::Qwen3;
@@ -259,6 +277,11 @@ impl ModelArchitecture {
 
         // Default to Llama (handles Llama, Yi, Gemma, CodeLlama, etc.)
         Self::Llama
+    }
+
+    /// Returns true for encoder-only embedding models that don't use paged KV cache.
+    pub fn is_embedding_only(&self) -> bool {
+        matches!(self, Self::Bert | Self::NomicBert)
     }
 }
 
@@ -982,6 +1005,18 @@ pub fn load_model_from_safetensors_with_backend(
 
     // ── Dispatch to architecture-specific loader ──
     match architecture {
+        ModelArchitecture::Bert => {
+            let model = super::models::bert::BertEmbeddingRunner::from_safetensors(
+                model_dir, device, weight_dtype,
+            )?;
+            return Ok(Box::new(model));
+        }
+        ModelArchitecture::NomicBert => {
+            let model = super::models::bert::NomicBertRunner::from_safetensors(
+                model_dir, device, weight_dtype,
+            )?;
+            return Ok(Box::new(model));
+        }
         ModelArchitecture::Phi3 => {
             let phi3_config: super::models::phi3::Phi3Config =
                 serde_json::from_str(&config_text).map_err(|e| {
@@ -1808,6 +1843,41 @@ mod tests {
         assert_eq!(config.qk_norm, Some(true));
         assert_eq!(config.sliding_window, Some(32768));
         assert_eq!(config.use_sliding_window, Some(false));
+    }
+
+    // ── Bert/NomicBert architecture detection tests ──────────────────────
+
+    #[test]
+    fn test_detect_architecture_bert() {
+        let arch = ModelArchitecture::detect(
+            &["BertModel".to_string()],
+            Some("bert"),
+        );
+        assert_eq!(arch, ModelArchitecture::Bert);
+    }
+
+    #[test]
+    fn test_detect_architecture_nomic_bert() {
+        let arch = ModelArchitecture::detect(
+            &["NomicBertModel".to_string()],
+            Some("nomic_bert"),
+        );
+        assert_eq!(arch, ModelArchitecture::NomicBert);
+    }
+
+    #[test]
+    fn test_detect_architecture_bert_model_type_only() {
+        let arch = ModelArchitecture::detect(&[], Some("bert"));
+        assert_eq!(arch, ModelArchitecture::Bert);
+    }
+
+    #[test]
+    fn test_detect_architecture_roberta() {
+        let arch = ModelArchitecture::detect(
+            &["RobertaModel".to_string()],
+            Some("roberta"),
+        );
+        assert_eq!(arch, ModelArchitecture::Bert);
     }
 
     // ─── Wave 0: BF16/FP16 dtype stubs (DTYPE-03) ────────────────────────

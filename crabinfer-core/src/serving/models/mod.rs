@@ -11,6 +11,7 @@
 //! - Positions passed as a tensor, not a scalar offset
 
 pub mod attention;
+pub mod bert;
 pub mod deepseek;
 pub mod llama;
 pub mod mistral;
