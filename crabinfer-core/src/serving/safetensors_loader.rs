@@ -699,16 +699,51 @@ impl SafetensorsQwenModel {
 // ─── Loading ─────────────────────────────────────────────────────────────
 
 /// Load a tensor from the weight map, converting to the target dtype.
+///
+/// Casting rules:
+/// - If the on-disk dtype already matches `dtype`, the tensor is returned as-is.
+/// - If the tensor is stored as a different half-precision format (BF16 vs F16),
+///   the cross-cast is skipped with an INFO log and the original dtype is kept.
+/// - For all other cases (e.g. F32 → BF16), the cast is applied.
 pub fn load_tensor(
     weights: &HashMap<String, Tensor>,
     name: &str,
     device: &Device,
+    dtype: DType,
 ) -> Result<Tensor> {
-    weights
+    let t = weights
         .get(name)
         .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {name}")))?
-        .to_device(device)?
-        .to_dtype(DType::F32)
+        .to_device(device)?;
+
+    let current = t.dtype();
+    if current == dtype {
+        return Ok(t);
+    }
+
+    // Detect cross-cast between half-precision formats (BF16 ↔ F16).
+    let is_half_precision = |d: DType| matches!(d, DType::F16 | DType::BF16);
+    if is_half_precision(current) && is_half_precision(dtype) {
+        tracing::info!(
+            "Weight '{}' is already {:?} on disk; skipping cross-cast to {:?}",
+            name, current, dtype,
+        );
+        return Ok(t);
+    }
+
+    t.to_dtype(dtype)
+}
+
+/// Load a tensor from the weight map, always returning it as FP32.
+///
+/// Use this for norm weights, embedding tables, and other parameters that
+/// must remain in full precision regardless of the serving dtype.
+pub fn load_tensor_fp32(
+    weights: &HashMap<String, Tensor>,
+    name: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    load_tensor(weights, name, device, DType::F32)
 }
 
 /// Load a weight as a MaybeQuantizedLinear.
@@ -717,8 +752,9 @@ pub fn load_linear(
     name: &str,
     device: &Device,
     quantization: QuantizationMethod,
+    dtype: DType,
 ) -> Result<MaybeQuantizedLinear> {
-    let w = load_tensor(weights, name, device)?;
+    let w = load_tensor(weights, name, device, dtype)?;
     let qmm = candle_core::quantized::QMatMul::Tensor(w);
     MaybeQuantizedLinear::from_qmatmul(qmm, quantization, device)
 }
@@ -803,8 +839,9 @@ pub fn load_model_from_safetensors(
     model_dir: &Path,
     device: &Device,
     quantization: QuantizationMethod,
+    serving_dtype: DType,
 ) -> Result<Box<dyn ModelRunner>> {
-    load_model_from_safetensors_with_backend(model_dir, device, quantization, None)
+    load_model_from_safetensors_with_backend(model_dir, device, quantization, None, serving_dtype)
 }
 
 /// Load a model from safetensors with an optional kernel backend for Marlin activation.
@@ -813,6 +850,7 @@ pub fn load_model_from_safetensors_with_backend(
     device: &Device,
     quantization: QuantizationMethod,
     kernel_backend: Option<Arc<dyn KernelBackend>>,
+    serving_dtype: DType,
 ) -> Result<Box<dyn ModelRunner>> {
     // ── Read config.json ──
     let config_path = model_dir.join("config.json");
@@ -858,6 +896,21 @@ pub fn load_model_from_safetensors_with_backend(
             (quantization, 128)
         }
     };
+
+    // ── Determine weight dtype ──
+    // Quantized models (GPTQ/AWQ) have their own packed format — dtype casting
+    // would corrupt the packed INT4/INT8 data. Always use F32 for those.
+    let weight_dtype = match effective_quantization {
+        QuantizationMethod::None | QuantizationMethod::Int8WeightOnly | QuantizationMethod::Fp8 => {
+            serving_dtype
+        }
+        QuantizationMethod::Gptq | QuantizationMethod::Awq => DType::F32,
+    };
+
+    tracing::info!(
+        "Loading model weights in {:?} (quantization: {})",
+        weight_dtype, effective_quantization,
+    );
 
     // ── Find and load safetensors files ──
     let mut st_files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)
@@ -939,6 +992,7 @@ pub fn load_model_from_safetensors_with_backend(
                 &weights,
                 device,
                 effective_quantization,
+                weight_dtype,
             )?;
             return Ok(Box::new(model));
         }
@@ -952,6 +1006,7 @@ pub fn load_model_from_safetensors_with_backend(
                 &weights,
                 device,
                 effective_quantization,
+                weight_dtype,
             )?;
             return Ok(Box::new(model));
         }
@@ -965,6 +1020,7 @@ pub fn load_model_from_safetensors_with_backend(
                 &weights,
                 device,
                 effective_quantization,
+                weight_dtype,
             )?;
             return Ok(Box::new(model));
         }
@@ -1003,30 +1059,30 @@ pub fn load_model_from_safetensors_with_backend(
                 max_seq_len,
             };
 
-            // Load embeddings
-            let embed_table = load_tensor(&weights, "model.embed_tokens.weight", device)?;
+            // Load embeddings (always FP32 — norm/embed preservation per DTYPE-04)
+            let embed_table = load_tensor_fp32(&weights, "model.embed_tokens.weight", device)?;
 
-            // Load output projection
+            // Load output projection (lm_head stays FP32 — tied to embed_table)
             let lm_head = if weights.contains_key("lm_head.weight") {
-                load_linear(&weights, "lm_head.weight", device, QuantizationMethod::None)?
+                load_linear(&weights, "lm_head.weight", device, QuantizationMethod::None, DType::F32)?
             } else {
                 let qmm = candle_core::quantized::QMatMul::Tensor(embed_table.clone());
                 MaybeQuantizedLinear::from_qmatmul(qmm, QuantizationMethod::None, device)?
             };
 
-            // Final norm
-            let norm_weight = load_tensor(&weights, "model.norm.weight", device)?;
+            // Final norm (always FP32)
+            let norm_weight = load_tensor_fp32(&weights, "model.norm.weight", device)?;
             let norm = RmsNorm { weight: norm_weight, eps: rms_norm_eps as f32 };
 
             // Precompute shared RoPE tables
             let (rope_cos, rope_sin) = precompute_rope(rope_dim, rope_theta, max_seq_len, device)?;
 
-            // Build linear layer loader
+            // Build linear layer loader — projection weights cast to weight_dtype
             let load_proj = |weights: &HashMap<String, Tensor>, prefix: &str| -> Result<MaybeQuantizedLinear> {
                 match effective_quantization {
                     QuantizationMethod::Gptq => load_gptq_linear(weights, prefix, quant_group_size, device),
                     QuantizationMethod::Awq => load_awq_linear(weights, prefix, quant_group_size, device),
-                    other => load_linear(weights, &format!("{prefix}.weight"), device, other),
+                    other => load_linear(weights, &format!("{prefix}.weight"), device, other, weight_dtype),
                 }
             };
 
@@ -1035,7 +1091,8 @@ pub fn load_model_from_safetensors_with_backend(
             for i in 0..hf_config.num_hidden_layers {
                 let prefix = format!("model.layers.{i}");
 
-                let attn_norm_weight = load_tensor(
+                // Norm weights are always FP32 (DTYPE-04)
+                let attn_norm_weight = load_tensor_fp32(
                     &weights,
                     &format!("{prefix}.input_layernorm.weight"),
                     device,
@@ -1050,7 +1107,7 @@ pub fn load_model_from_safetensors_with_backend(
                 let attn_v = load_proj(&weights, &format!("{prefix}.self_attn.v_proj"))?;
                 let attn_output = load_proj(&weights, &format!("{prefix}.self_attn.o_proj"))?;
 
-                // QKV biases (Qwen2 and Qwen3 both use them)
+                // QKV biases (Qwen2 and Qwen3 both use them) — always FP32
                 let attn_q_bias = weights
                     .get(&format!("{prefix}.self_attn.q_proj.bias"))
                     .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
@@ -1064,7 +1121,7 @@ pub fn load_model_from_safetensors_with_backend(
                     .map(|t| t.to_device(device).and_then(|t| t.to_dtype(DType::F32)))
                     .transpose()?;
 
-                // QK normalization (Qwen3 only)
+                // QK normalization (Qwen3 only) — always FP32
                 let (attn_q_norm, attn_k_norm) = if has_qk_norm {
                     let q_norm_w = weights
                         .get(&format!("{prefix}.self_attn.q_norm.weight"))
@@ -1082,7 +1139,8 @@ pub fn load_model_from_safetensors_with_backend(
                     (None, None)
                 };
 
-                let ffn_norm_weight = load_tensor(
+                // FFN norm — always FP32
+                let ffn_norm_weight = load_tensor_fp32(
                     &weights,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                     device,
@@ -1185,34 +1243,35 @@ pub fn load_model_from_safetensors_with_backend(
         max_seq_len,
     };
 
-    // ── Load embeddings ──
-    let embed_table = load_tensor(&weights, "model.embed_tokens.weight", device)?;
+    // ── Load embeddings (always FP32 — norm/embed preservation per DTYPE-04) ──
+    let embed_table = load_tensor_fp32(&weights, "model.embed_tokens.weight", device)?;
 
     // ── Load output projection ──
-    // lm_head is never quantized — it maps hidden states to vocab logits
+    // lm_head is never quantized — it maps hidden states to vocab logits.
+    // Keep as FP32 (tied to embed_table which is FP32; QMatMul handles mixed dtypes).
     let lm_head = if weights.contains_key("lm_head.weight") {
-        load_linear(&weights, "lm_head.weight", device, QuantizationMethod::None)?
+        load_linear(&weights, "lm_head.weight", device, QuantizationMethod::None, DType::F32)?
     } else {
         // Tied embeddings: reuse embed_tokens
         let qmm = candle_core::quantized::QMatMul::Tensor(embed_table.clone());
         MaybeQuantizedLinear::from_qmatmul(qmm, QuantizationMethod::None, device)?
     };
 
-    // ── Load final norm ──
-    let norm_weight = load_tensor(&weights, "model.norm.weight", device)?;
+    // ── Load final norm (always FP32) ──
+    let norm_weight = load_tensor_fp32(&weights, "model.norm.weight", device)?;
     let norm = RmsNorm { weight: norm_weight, eps: rms_norm_eps as f32 };
 
     // ── Precompute shared RoPE tables ──
     let (rope_cos, rope_sin) = precompute_rope(rope_dim, rope_theta, max_seq_len, device)?;
 
     // ── Build linear layer loader ──
-    // Projection weights (q/k/v/o/gate/down/up) use quantized loaders for GPTQ/AWQ.
-    // Norm weights and embeddings are always loaded as FP tensors.
+    // Projection weights (q/k/v/o/gate/down/up) cast to weight_dtype.
+    // Norm weights and embeddings are always loaded as FP32 (DTYPE-04).
     let load_proj = |weights: &HashMap<String, Tensor>, prefix: &str| -> Result<MaybeQuantizedLinear> {
         match effective_quantization {
             QuantizationMethod::Gptq => load_gptq_linear(weights, prefix, quant_group_size, device),
             QuantizationMethod::Awq => load_awq_linear(weights, prefix, quant_group_size, device),
-            other => load_linear(weights, &format!("{prefix}.weight"), device, other),
+            other => load_linear(weights, &format!("{prefix}.weight"), device, other, weight_dtype),
         }
     };
 
@@ -1221,7 +1280,8 @@ pub fn load_model_from_safetensors_with_backend(
     for i in 0..hf_config.num_hidden_layers {
         let prefix = format!("model.layers.{i}");
 
-        let attn_norm_weight = load_tensor(
+        // Norm weights are always FP32 (DTYPE-04)
+        let attn_norm_weight = load_tensor_fp32(
             &weights,
             &format!("{prefix}.input_layernorm.weight"),
             device,
@@ -1236,7 +1296,8 @@ pub fn load_model_from_safetensors_with_backend(
         let attn_v = load_proj(&weights, &format!("{prefix}.self_attn.v_proj"))?;
         let attn_output = load_proj(&weights, &format!("{prefix}.self_attn.o_proj"))?;
 
-        let ffn_norm_weight = load_tensor(
+        // FFN norm — always FP32
+        let ffn_norm_weight = load_tensor_fp32(
             &weights,
             &format!("{prefix}.post_attention_layernorm.weight"),
             device,
@@ -1548,7 +1609,7 @@ mod tests {
     fn test_load_missing_config() {
         let tmp = std::env::temp_dir().join("crabinfer_test_no_config");
         let _ = std::fs::create_dir_all(&tmp);
-        let result = load_model_from_safetensors(&tmp, &Device::Cpu, QuantizationMethod::None);
+        let result = load_model_from_safetensors(&tmp, &Device::Cpu, QuantizationMethod::None, DType::F32);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1752,26 +1813,36 @@ mod tests {
     // ─── Wave 0: BF16/FP16 dtype stubs (DTYPE-03) ────────────────────────
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_load_tensor_dtype_bf16_cpu() {
         // DTYPE-03: load_tensor(weights, name, &Device::Cpu, DType::BF16)
-        //           should return a BF16 tensor on success
-        todo!("not yet implemented")
+        //           should return a BF16 tensor on success (F32 on-disk → BF16)
+        let t = Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap();
+        let mut weights = HashMap::new();
+        weights.insert("proj.weight".to_string(), t);
+        let result = load_tensor(&weights, "proj.weight", &Device::Cpu, DType::BF16).unwrap();
+        assert_eq!(result.dtype(), DType::BF16);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_load_tensor_fp32_preserves_dtype() {
         // DTYPE-03: load_tensor_fp32(weights, name, &Device::Cpu)
         //           should always return DType::F32 regardless of on-disk dtype
-        todo!("not yet implemented")
+        let t = Tensor::zeros((4, 4), DType::BF16, &Device::Cpu).unwrap();
+        let mut weights = HashMap::new();
+        weights.insert("norm.weight".to_string(), t);
+        let result = load_tensor_fp32(&weights, "norm.weight", &Device::Cpu).unwrap();
+        assert_eq!(result.dtype(), DType::F32);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_load_tensor_cross_cast_skip() {
         // DTYPE-03: if tensor on disk is already BF16 and target dtype is F16,
-        //           the loader should NOT cross-cast (log info, keep original dtype)
-        todo!("not yet implemented")
+        //           the loader should NOT cross-cast (log info, keep original BF16)
+        let t = Tensor::zeros((4, 4), DType::BF16, &Device::Cpu).unwrap();
+        let mut weights = HashMap::new();
+        weights.insert("proj.weight".to_string(), t);
+        // Request F16, but tensor is BF16 → cross-cast skipped, stays BF16
+        let result = load_tensor(&weights, "proj.weight", &Device::Cpu, DType::F16).unwrap();
+        assert_eq!(result.dtype(), DType::BF16);
     }
 }

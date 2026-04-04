@@ -281,13 +281,19 @@ fn load_serving_engine(
         .parse()
         .map_err(|e: String| format!("Invalid dtype: {e}"))?;
 
+    // Resolve the serving dtype to a concrete DType before loading model weights.
+    // The model loader uses this to cast linear projection weights to BF16/F16/F32.
+    let resolved_serving_dtype = crabinfer_core::serving::quantization::resolve_serving_dtype(
+        serving_dtype, &device,
+    ).map_err(|e| format!("Dtype resolution failed: {e}"))?;
+
     // ── Load model + tokenizer + model info (branching on format) ──
     let (model, model_info, model_id, tokenizer, eos_token_id) = if is_safetensors {
         tracing::info!("Detected HuggingFace safetensors directory");
         tracing::info!("Loading paged-attention model from safetensors...");
 
         let model = crabinfer_core::serving::safetensors_loader::load_model_from_safetensors(
-            model_path, &device, quantization,
+            model_path, &device, quantization, resolved_serving_dtype,
         )
         .map_err(|e| format!("Failed to load safetensors model: {e}"))?;
 
