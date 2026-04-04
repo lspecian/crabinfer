@@ -19,9 +19,9 @@
 
 ### Guided Decoding
 
-- [ ] **GDEC-01**: JSON Schema constrained generation — generate CFG from JSON Schema, mask invalid tokens during sampling
-- [ ] **GDEC-02**: Regex constrained generation — compile regex to DFA, mask invalid tokens at each step
-- [ ] **GDEC-03**: `response_format` with `json_schema` uses token-level constraints (not just prompt-based)
+- [x] **GDEC-01**: JSON Schema constrained generation — generate CFG from JSON Schema, mask invalid tokens during sampling
+- [x] **GDEC-02**: Regex constrained generation — compile regex to DFA, mask invalid tokens at each step
+- [x] **GDEC-03**: `response_format` with `json_schema` uses token-level constraints (not just prompt-based)
 - [x] **GDEC-04**: Constrained generation adds <5% overhead vs unconstrained
 
 ### CUDA Kernel Fusion
@@ -103,9 +103,9 @@
 | MLOAD-01 | Phase 1 | Complete |
 | MLOAD-02 | Phase 1 | Complete |
 | MLOAD-03 | Phase 1 | Complete |
-| GDEC-01 | Phase 3 | Pending |
-| GDEC-02 | Phase 3 | Pending |
-| GDEC-03 | Phase 3 | Pending |
+| GDEC-01 | Phase 3 | Complete |
+| GDEC-02 | Phase 3 | Complete |
+| GDEC-03 | Phase 3 | Complete |
 | GDEC-04 | Phase 3 | Complete |
 | KERN-01 | Phase 2 | Pending |
 | KERN-02 | Phase 2 | Pending |

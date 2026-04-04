@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 03-guided-decoding 03-03-PLAN.md
-last_updated: "2026-04-04T15:07:33.532Z"
+stopped_at: Completed 03-04-PLAN.md
+last_updated: "2026-04-04T15:08:29.783Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 21
-  completed_plans: 23
+  completed_plans: 24
   percent: 25
 ---
 
@@ -59,6 +59,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 01.2 P00 | 2min | 2 tasks | 3 files |
 | Phase 01.2 P03 | 8 | 1 tasks | 2 files |
 | Phase 03-guided-decoding P03 | 7 | 2 tasks | 5 files |
+| Phase 03-guided-decoding P04 | 7 | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -90,6 +91,8 @@ Recent decisions affecting current work:
 - [Phase 03-guided-decoding]: IndexCache::new(vocab, max_entries) + new_default(vocab) API: explicit capacity; default 256
 - [Phase 03-guided-decoding]: store() not fetch_add() for guided cache counters — IndexCache snapshots are absolute cumulative values
 - [Phase 03-guided-decoding]: guided_cache_stats() reads from EngineHandle shared atomics directly — no engine thread round-trip needed at /metrics read path
+- [Phase 03-guided-decoding]: validate_constraint_via_tempvocab: WorkerPool::validate_constraint() builds temporary vocabulary per call — no caching, but correct and avoids architectural changes
+- [Phase 03-guided-decoding]: stop_token_suppression: implemented inline in sample_and_distribute() using guided_states.contains_key() — no new message types needed
 
 ### Pending Todos
 
@@ -109,6 +112,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-04T15:07:33.530Z
-Stopped at: Completed 03-guided-decoding 03-03-PLAN.md
+Last session: 2026-04-04T15:08:29.781Z
+Stopped at: Completed 03-04-PLAN.md
 Resume file: None
