@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01.2-00-PLAN.md
-last_updated: "2026-04-04T13:12:47.872Z"
+stopped_at: Completed 01.2-03-PLAN.md
+last_updated: "2026-04-04T13:52:03.684Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 21
-  completed_plans: 19
+  completed_phases: 6
+  total_plans: 22
+  completed_plans: 22
   percent: 25
 ---
 
@@ -57,6 +57,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 01.1 P00 | 2min | 2 tasks | 2 files |
 | Phase 01.1 P02 | 33 | 2 tasks | 3 files |
 | Phase 01.2 P00 | 2min | 2 tasks | 3 files |
+| Phase 01.2 P03 | 8 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,8 @@ Recent decisions affecting current work:
 - [Phase 01.1]: Safetensors loader uses direct GPU load with CPU fallback for I32/I16 tensors
 - [Phase 01.2]: Wave 0 stubs use #[should_panic(expected = 'not yet implemented')] so they compile but fail at runtime — Plan 01 will replace todo!() with real assertions
 - [Phase 01.2]: DTYPE-06 (forward pass dtype) has no dedicated test — candle matmul uses tensor native dtype automatically; covered by GPU integration testing
+- [Phase 01.2]: weight_dtype_bytes added as final parameter to profile_gpu_memory (after kv_dtype_bytes) for API consistency
+- [Phase 01.2]: VRAM savings log guarded by serving_dtype != DType::F32 to avoid noisy F32-only startup logs
 
 ### Pending Todos
 
@@ -102,6 +105,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-04T13:12:47.871Z
-Stopped at: Completed 01.2-00-PLAN.md
+Last session: 2026-04-04T13:52:03.682Z
+Stopped at: Completed 01.2-03-PLAN.md
 Resume file: None
