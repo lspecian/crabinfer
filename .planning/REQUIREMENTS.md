@@ -15,7 +15,7 @@
 
 - [x] **MLOAD-01**: `--model` flag accepts HuggingFace repo ID (e.g., `meta-llama/Llama-3.1-8B-Instruct`)
 - [x] **MLOAD-02**: Auto-download from HuggingFace Hub with local caching (~/.cache/crabinfer/)
-- [x] **MLOAD-03**: Resume interrupted downloads, verify file integrity (SHA256)
+- [ ] **MLOAD-03**: Resume interrupted downloads, verify file integrity (SHA256)
 
 ### Guided Decoding
 
@@ -44,7 +44,7 @@
 
 - [ ] **WORK-01**: Spawn N inference workers behind internal load balancer
 - [ ] **WORK-02**: Shared model weights via memory mapping (mmap) across workers
-- [ ] **WORK-03**: Request routing: round-robin or cache-aware (route to worker with best prefix match)
+- [x] **WORK-03**: Request routing: round-robin or cache-aware (route to worker with best prefix match)
 
 ### Configuration
 
@@ -102,34 +102,35 @@
 | QLOAD-03 | Phase 1 | Complete |
 | MLOAD-01 | Phase 1 | Complete |
 | MLOAD-02 | Phase 1 | Complete |
-| MLOAD-03 | Phase 1 | Complete |
+| MLOAD-03 | Phase 5 | Pending |
 | GDEC-01 | Phase 3 | Complete |
 | GDEC-02 | Phase 3 | Complete |
 | GDEC-03 | Phase 3 | Complete |
 | GDEC-04 | Phase 3 | Complete |
-| KERN-01 | Phase 2 | Pending |
-| KERN-02 | Phase 2 | Pending |
-| MOPT-01 | Phase 2 | Pending |
-| MOPT-02 | Phase 2 | Pending |
-| MOPT-03 | Phase 2 | Pending |
-| TOKN-01 | Phase 2 | Pending |
-| TOKN-02 | Phase 2 | Pending |
-| WORK-01 | Phase 4 | Pending |
-| WORK-02 | Phase 4 | Pending |
-| WORK-03 | Phase 4 | Pending |
-| CONF-01 | Phase 4 | Pending |
-| CONF-02 | Phase 4 | Pending |
+| KERN-01 | Phase 2 | Complete |
+| KERN-02 | Phase 2 | Complete |
+| MOPT-01 | Phase 2 | Complete |
+| MOPT-02 | Phase 2 | Complete |
+| MOPT-03 | Phase 2 | Complete |
+| TOKN-01 | Phase 2 | Complete |
+| TOKN-02 | Phase 2 | Complete |
+| WORK-01 | Phase 4 | Complete |
+| WORK-02 | Phase 4 | Complete |
+| WORK-03 | Phase 5 | Complete |
+| CONF-01 | Phase 4 | Complete |
+| CONF-02 | Phase 4 | Complete |
 | PCCH-01 | Phase 4 | Complete |
 | PCCH-02 | Phase 4 | Complete |
-| EMBD-01 | Phase 4 | Pending |
-| EMBD-02 | Phase 4 | Pending |
-| EMBD-03 | Phase 4 | Pending |
+| EMBD-01 | Phase 4 | Complete |
+| EMBD-02 | Phase 6 | Pending |
+| EMBD-03 | Phase 4 | Complete |
 
 **Coverage:**
 - v1 requirements: 27 total
 - Mapped to phases: 27
-- Unmapped: 0
+- Complete: 24
+- Pending (gap closure): 3 (MLOAD-03, WORK-03, EMBD-02)
 
 ---
 *Requirements defined: 2026-03-12*
-*Last updated: 2026-03-12 — all 27 requirements mapped to phases*
+*Last updated: 2026-04-04 — gap closure phases 5-6 added for 3 remaining requirements*

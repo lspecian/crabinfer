@@ -124,7 +124,7 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `ensure_model_cached` calls `verify_sha256` on every downloaded safetensors file — a corrupted file is rejected with a clear error
   2. `WorkerPool::submit()` uses `block_hashes()` to route requests to the worker with the best prefix match when cache-aware routing is enabled
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 
 Plans:
 - [ ] 05-01-PLAN.md — Wire verify_sha256 into ensure_model_cached with LFS SHA-256 from HF API
@@ -152,5 +152,5 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
 | 2. Performance Optimization | 4/4 | Complete | 2026-04-04 |
 | 3. Guided Decoding | 5/5 | Complete | 2026-04-04 |
 | 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
-| 5. Wiring Fixes | 0/2 | Planned | - |
+| 5. Wiring Fixes | 1/2 | In Progress|  |
 | 6. Embedding Model Loader | 0/0 | Planned | - |
