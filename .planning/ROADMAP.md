@@ -46,19 +46,21 @@ Plans:
 **Plans:** 3/3 plans complete
 
 Plans:
-- [ ] 01.1-00-PLAN.md — Wave 0: failing test stubs for CUDA kernel and graph capture requirements (Nyquist compliance)
-- [ ] 01.1-01-PLAN.md — Candle fork kernel patches: I32/I16 fill, cast, unary, binary CUDA kernels + Rust dispatch
-- [ ] 01.1-02-PLAN.md — CUDA graph config, partial capture, and engine loop CPU-workaround elimination
+- [x] 01.1-00-PLAN.md — Wave 0: failing test stubs for CUDA kernel and graph capture requirements (Nyquist compliance)
+- [x] 01.1-01-PLAN.md — Candle fork kernel patches: I32/I16 fill, cast, unary, binary CUDA kernels + Rust dispatch
+- [x] 01.1-02-PLAN.md — CUDA graph config, partial capture, and engine loop CPU-workaround elimination
 
 ### Phase 01.2: BF16/FP16 Serving Support (INSERTED)
 
-**Goal:** Add automatic dtype downcasting so FP32 safetensors models can be served in BF16/FP16, halving VRAM usage (40GB → 20GB for Qwen3-8B) and improving throughput via reduced memory bandwidth and H100 FP16 tensor cores.
-**Requirements**: TBD
+**Goal:** Add automatic dtype downcasting so FP32 safetensors models can be served in BF16/FP16, halving VRAM usage (40GB -> 20GB for Qwen3-8B) and improving throughput via reduced memory bandwidth and H100 FP16 tensor cores.
+**Requirements**: DTYPE-01, DTYPE-02, DTYPE-03, DTYPE-04, DTYPE-05, DTYPE-06
 **Depends on:** Phase 1
-**Plans:** 0 plans
+**Plans:** 3 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 01.2 to break down)
+- [ ] 01.2-00-PLAN.md — Wave 0: failing test stubs for all 6 DTYPE behaviors (Nyquist compliance)
+- [ ] 01.2-01-PLAN.md — ServingDType enum, GPU auto-detection, --dtype CLI flag, config pipeline, KV cache coupling
+- [ ] 01.2-02-PLAN.md — Dtype-parameterized weight loader, mixed precision norm/embed preservation, VRAM estimation
 
 ### Phase 2: Performance Optimization
 **Goal**: The inference hot path runs with zero per-request GPU allocations, fused LayerNorm+linear, and parallel tokenization — maximizing tokens-per-second on RTX 3060
@@ -117,8 +119,8 @@ Phases execute in numeric order: 1 → 1.1 → 1.2 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Model Loading and Quantization | 3/4 | In Progress |  |
-| 1.1 CUDA Graph Capture + Candle Patches | 0/3 | Planned | - |
-| 1.2 BF16/FP16 Serving Support | 0/? | Not Planned | - |
+| 1.1 CUDA Graph Capture + Candle Patches | 3/3 | Done (needs H100 validation) | 2026-04-02 |
+| 1.2 BF16/FP16 Serving Support | 0/3 | Planned | - |
 | 2. Performance Optimization | 0/4 | Planned | - |
 | 3. Guided Decoding | 0/3 | Planned | - |
 | 4. Production Infrastructure | 0/4 | Planned | - |
