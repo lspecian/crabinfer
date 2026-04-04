@@ -15,7 +15,7 @@
 
 - [x] **MLOAD-01**: `--model` flag accepts HuggingFace repo ID (e.g., `meta-llama/Llama-3.1-8B-Instruct`)
 - [x] **MLOAD-02**: Auto-download from HuggingFace Hub with local caching (~/.cache/crabinfer/)
-- [ ] **MLOAD-03**: Resume interrupted downloads, verify file integrity (SHA256)
+- [x] **MLOAD-03**: Resume interrupted downloads, verify file integrity (SHA256)
 
 ### Guided Decoding
 
@@ -102,7 +102,7 @@
 | QLOAD-03 | Phase 1 | Complete |
 | MLOAD-01 | Phase 1 | Complete |
 | MLOAD-02 | Phase 1 | Complete |
-| MLOAD-03 | Phase 5 | Pending |
+| MLOAD-03 | Phase 5 | Complete |
 | GDEC-01 | Phase 3 | Complete |
 | GDEC-02 | Phase 3 | Complete |
 | GDEC-03 | Phase 3 | Complete |
