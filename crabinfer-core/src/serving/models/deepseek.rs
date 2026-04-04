@@ -24,7 +24,7 @@ use candle_nn::Module;
 use super::attention::{precompute_rope, PagedAttentionLayer};
 use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
 use crate::serving::quantization::{MaybeQuantizedLinear, QuantizationMethod};
-use crate::serving::safetensors_loader::{load_linear, load_tensor};
+use crate::serving::safetensors_loader::{load_linear, load_tensor, load_tensor_fp32};
 
 // ─── DeepSeek config ─────────────────────────────────────────────────────
 
@@ -470,6 +470,7 @@ impl SafetensorsDeepSeekModel {
         weights: &HashMap<String, Tensor>,
         device: &Device,
         quantization: QuantizationMethod,
+        serving_dtype: candle_core::DType,
     ) -> Result<Self> {
         let num_heads = ds_config.num_attention_heads;
         let num_kv_heads = ds_config.num_kv_heads();
@@ -498,19 +499,19 @@ impl SafetensorsDeepSeekModel {
             max_seq_len,
         };
 
-        // Load embeddings
-        let embed_table = load_tensor(weights, "model.embed_tokens.weight", device)?;
+        // Load embeddings (always FP32 — norm/embed preservation per DTYPE-04)
+        let embed_table = load_tensor_fp32(weights, "model.embed_tokens.weight", device)?;
 
-        // Load output projection
+        // Load output projection (lm_head stays FP32)
         let lm_head = if weights.contains_key("lm_head.weight") {
-            load_linear(weights, "lm_head.weight", device, QuantizationMethod::None)?
+            load_linear(weights, "lm_head.weight", device, QuantizationMethod::None, candle_core::DType::F32)?
         } else {
             let qmm = candle_core::quantized::QMatMul::Tensor(embed_table.clone());
             MaybeQuantizedLinear::from_qmatmul(qmm, QuantizationMethod::None, device)?
         };
 
-        // Final norm
-        let norm_weight = load_tensor(weights, "model.norm.weight", device)?;
+        // Final norm (always FP32)
+        let norm_weight = load_tensor_fp32(weights, "model.norm.weight", device)?;
         let norm = RmsNorm {
             weight: norm_weight,
             eps: rms_norm_eps as f32,
@@ -524,7 +525,8 @@ impl SafetensorsDeepSeekModel {
         for i in 0..ds_config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
-            let attn_norm_weight = load_tensor(
+            // Norm weights always FP32 (DTYPE-04)
+            let attn_norm_weight = load_tensor_fp32(
                 weights,
                 &format!("{prefix}.input_layernorm.weight"),
                 device,
@@ -544,8 +546,10 @@ impl SafetensorsDeepSeekModel {
                     &format!("{prefix}.self_attn.q_a_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
-                let q_a_norm_w = load_tensor(
+                // q_a_layernorm is a norm weight — always FP32
+                let q_a_norm_w = load_tensor_fp32(
                     weights,
                     &format!("{prefix}.self_attn.q_a_layernorm.weight"),
                     device,
@@ -559,6 +563,7 @@ impl SafetensorsDeepSeekModel {
                     &format!("{prefix}.self_attn.q_b_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 (Some(q_a), Some(q_a_norm), q_b)
             } else {
@@ -568,6 +573,7 @@ impl SafetensorsDeepSeekModel {
                     &format!("{prefix}.self_attn.q_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 (None, None, q_proj)
             };
@@ -580,9 +586,10 @@ impl SafetensorsDeepSeekModel {
             } else {
                 format!("{prefix}.self_attn.kv_a_proj.weight")
             };
-            let kv_a_proj = load_linear(weights, &kv_a_proj_name, device, quantization)?;
+            let kv_a_proj = load_linear(weights, &kv_a_proj_name, device, quantization, serving_dtype)?;
 
-            let kv_a_norm_w = load_tensor(
+            // kv_a_layernorm is a norm weight — always FP32
+            let kv_a_norm_w = load_tensor_fp32(
                 weights,
                 &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
                 device,
@@ -597,6 +604,7 @@ impl SafetensorsDeepSeekModel {
                 &format!("{prefix}.self_attn.kv_b_proj.weight"),
                 device,
                 quantization,
+                serving_dtype,
             )?;
 
             let attn_output = load_linear(
@@ -604,9 +612,11 @@ impl SafetensorsDeepSeekModel {
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 device,
                 quantization,
+                serving_dtype,
             )?;
 
-            let ffn_norm_weight = load_tensor(
+            // FFN norm — always FP32
+            let ffn_norm_weight = load_tensor_fp32(
                 weights,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 device,
@@ -622,12 +632,13 @@ impl SafetensorsDeepSeekModel {
                 let n_shared = ds_config.n_shared_experts.unwrap_or(0);
                 let num_experts_per_tok = ds_config.num_experts_per_tok.unwrap_or(2);
 
-                // Gate
+                // Gate (small routing projection — always dense, cast to serving_dtype)
                 let gate = load_linear(
                     weights,
                     &format!("{prefix}.mlp.gate.weight"),
                     device,
-                    QuantizationMethod::None, // gate is small, always dense
+                    QuantizationMethod::None,
+                    serving_dtype,
                 )?;
 
                 // Routed experts
@@ -639,18 +650,21 @@ impl SafetensorsDeepSeekModel {
                         &format!("{ep}.gate_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     let expert_down = load_linear(
                         weights,
                         &format!("{ep}.down_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     let expert_up = load_linear(
                         weights,
                         &format!("{ep}.up_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     experts.push(SwiGluMlp::new(expert_gate, expert_down, expert_up));
                 }
@@ -658,24 +672,26 @@ impl SafetensorsDeepSeekModel {
                 // Shared expert
                 let shared_expert = if n_shared > 0 {
                     let sp = format!("{prefix}.mlp.shared_experts");
-                    // Shared experts may be a single fused expert or multiple
                     let shared_gate = load_linear(
                         weights,
                         &format!("{sp}.gate_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     let shared_down = load_linear(
                         weights,
                         &format!("{sp}.down_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     let shared_up = load_linear(
                         weights,
                         &format!("{sp}.up_proj.weight"),
                         device,
                         quantization,
+                        serving_dtype,
                     )?;
                     Some(SwiGluMlp::new(shared_gate, shared_down, shared_up))
                 } else {
@@ -695,18 +711,21 @@ impl SafetensorsDeepSeekModel {
                     &format!("{prefix}.mlp.gate_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 let down = load_linear(
                     weights,
                     &format!("{prefix}.mlp.down_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 let up = load_linear(
                     weights,
                     &format!("{prefix}.mlp.up_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 DeepSeekMlp::Dense(SwiGluMlp::new(gate, down, up))
             };

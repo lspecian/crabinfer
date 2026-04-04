@@ -21,7 +21,7 @@ use candle_nn::Module;
 use super::attention::{precompute_rope, PagedAttentionLayer};
 use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
 use crate::serving::quantization::{MaybeQuantizedLinear, QuantizationMethod};
-use crate::serving::safetensors_loader::{load_linear, load_tensor};
+use crate::serving::safetensors_loader::{load_linear, load_tensor, load_tensor_fp32};
 
 // ─── Phi-3 config ─────────────────────────────────────────────────────────
 
@@ -186,6 +186,7 @@ impl SafetensorsPhi3Model {
         weights: &HashMap<String, Tensor>,
         device: &Device,
         quantization: QuantizationMethod,
+        serving_dtype: candle_core::DType,
     ) -> Result<Self> {
         let num_heads = phi3_config.num_attention_heads;
         let num_kv_heads = phi3_config.num_kv_heads();
@@ -210,19 +211,19 @@ impl SafetensorsPhi3Model {
             max_seq_len,
         };
 
-        // Load embeddings
-        let embed_table = load_tensor(weights, "model.embed_tokens.weight", device)?;
+        // Load embeddings (always FP32 — norm/embed preservation per DTYPE-04)
+        let embed_table = load_tensor_fp32(weights, "model.embed_tokens.weight", device)?;
 
-        // Load output projection (may be tied to embeddings)
+        // Load output projection (lm_head stays FP32)
         let lm_head = if weights.contains_key("lm_head.weight") {
-            load_linear(weights, "lm_head.weight", device, QuantizationMethod::None)?
+            load_linear(weights, "lm_head.weight", device, QuantizationMethod::None, candle_core::DType::F32)?
         } else {
             let qmm = candle_core::quantized::QMatMul::Tensor(embed_table.clone());
             MaybeQuantizedLinear::from_qmatmul(qmm, QuantizationMethod::None, device)?
         };
 
-        // Final norm
-        let norm_weight = load_tensor(weights, "model.norm.weight", device)?;
+        // Final norm (always FP32)
+        let norm_weight = load_tensor_fp32(weights, "model.norm.weight", device)?;
         let norm = RmsNorm {
             weight: norm_weight,
             eps: rms_norm_eps as f32,
@@ -236,7 +237,8 @@ impl SafetensorsPhi3Model {
         for i in 0..phi3_config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
 
-            let attn_norm_weight = load_tensor(
+            // Norm weights always FP32 (DTYPE-04)
+            let attn_norm_weight = load_tensor_fp32(
                 weights,
                 &format!("{prefix}.input_layernorm.weight"),
                 device,
@@ -256,6 +258,7 @@ impl SafetensorsPhi3Model {
                     &format!("{prefix}.self_attn.qkv_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?
             } else {
                 // Separate Q/K/V -- build a fused weight by concatenating.
@@ -264,16 +267,19 @@ impl SafetensorsPhi3Model {
                     weights,
                     &format!("{prefix}.self_attn.q_proj.weight"),
                     device,
+                    serving_dtype,
                 )?;
                 let k_w = load_tensor(
                     weights,
                     &format!("{prefix}.self_attn.k_proj.weight"),
                     device,
+                    serving_dtype,
                 )?;
                 let v_w = load_tensor(
                     weights,
                     &format!("{prefix}.self_attn.v_proj.weight"),
                     device,
+                    serving_dtype,
                 )?;
                 let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?;
                 let qmm = candle_core::quantized::QMatMul::Tensor(qkv_w);
@@ -285,11 +291,12 @@ impl SafetensorsPhi3Model {
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 device,
                 quantization,
+                serving_dtype,
             )?;
 
-            // Optional QK normalization
+            // Optional QK normalization (always FP32)
             let q_norm = if phi3_config.qk_layernorm {
-                let w = load_tensor(
+                let w = load_tensor_fp32(
                     weights,
                     &format!("{prefix}.self_attn.q_layernorm.weight"),
                     device,
@@ -303,7 +310,7 @@ impl SafetensorsPhi3Model {
                 None
             };
             let k_norm = if phi3_config.qk_layernorm {
-                let w = load_tensor(
+                let w = load_tensor_fp32(
                     weights,
                     &format!("{prefix}.self_attn.k_layernorm.weight"),
                     device,
@@ -317,7 +324,8 @@ impl SafetensorsPhi3Model {
                 None
             };
 
-            let ffn_norm_weight = load_tensor(
+            // FFN norm — always FP32
+            let ffn_norm_weight = load_tensor_fp32(
                 weights,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 device,
@@ -329,11 +337,12 @@ impl SafetensorsPhi3Model {
 
             // MLP: Phi-3 may use fused gate_up_proj or separate gate/up projections
             let mlp = if weights.contains_key(&format!("{prefix}.mlp.gate_up_proj.weight")) {
-                // Fused gate_up: split the weight in half
+                // Fused gate_up: split the weight in half (cast to serving_dtype)
                 let gate_up_w = load_tensor(
                     weights,
                     &format!("{prefix}.mlp.gate_up_proj.weight"),
                     device,
+                    serving_dtype,
                 )?;
                 let gate_up_size = gate_up_w.dims()[0];
                 let half = gate_up_size / 2;
@@ -354,6 +363,7 @@ impl SafetensorsPhi3Model {
                     &format!("{prefix}.mlp.down_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 SwiGluMlp::new(gate, down, up)
             } else {
@@ -363,18 +373,21 @@ impl SafetensorsPhi3Model {
                     &format!("{prefix}.mlp.gate_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 let down = load_linear(
                     weights,
                     &format!("{prefix}.mlp.down_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 let up = load_linear(
                     weights,
                     &format!("{prefix}.mlp.up_proj.weight"),
                     device,
                     quantization,
+                    serving_dtype,
                 )?;
                 SwiGluMlp::new(gate, down, up)
             };
