@@ -18,6 +18,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 2: Performance Optimization** - Fused LayerNorm+linear kernel, memory pool, and fast tokenization
 - [ ] **Phase 3: Guided Decoding** - Token-level constrained generation via JSON Schema and regex DFA
 - [ ] **Phase 4: Production Infrastructure** - Multi-worker serving, TOML config, prefix cache salting, and embeddings endpoint
+- [ ] **Phase 5: Wiring Fixes** - SHA-256 verification in download path + cache-aware worker routing
+- [ ] **Phase 6: Embedding Model Loader** - BERT/encoder model support for dedicated embedding models
 
 ## Phase Details
 
@@ -114,16 +116,41 @@ Plans:
 - [ ] 04-03-PLAN.md — OpenAI-compatible /v1/embeddings endpoint with batch support
 - [ ] 04-04-PLAN.md — Multi-worker serving with shared weights and round-robin routing
 
+### Phase 5: Wiring Fixes (SHA-256 + Cache-Aware Routing)
+**Goal**: Close integration gaps: wire verify_sha256 into the serving download path (MLOAD-03) and consume block_hashes in WorkerPool routing (WORK-03)
+**Depends on**: Phase 1, Phase 4
+**Requirements**: MLOAD-03, WORK-03
+**Gap Closure**: Closes gaps from v1.0 milestone audit
+**Success Criteria** (what must be TRUE):
+  1. `ensure_model_cached` calls `verify_sha256` on every downloaded safetensors file — a corrupted file is rejected with a clear error
+  2. `WorkerPool::submit()` uses `block_hashes()` to route requests to the worker with the best prefix match when cache-aware routing is enabled
+**Plans:** 2 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Wire verify_sha256 into ensure_model_cached with LFS SHA-256 from HF API
+- [ ] 05-02-PLAN.md — Cache-aware routing policy for WorkerPool using block_hashes()
+
+### Phase 6: Embedding Model Loader
+**Goal**: Support loading dedicated embedding models (nomic-embed, gte-small) so POST /v1/embeddings returns real encoder-quality vectors
+**Depends on**: Phase 4
+**Requirements**: EMBD-02
+**Gap Closure**: Closes gaps from v1.0 milestone audit
+**Success Criteria** (what must be TRUE):
+  1. `crabinfer serve --model nomic-ai/nomic-embed-text-v1.5` downloads and loads the model without errors
+  2. `POST /v1/embeddings` with that model returns semantically meaningful 768-dim vectors (cosine similarity between related texts > 0.5)
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 1.1 → 1.2 → 2 → 3 → 4
+Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Model Loading and Quantization | 3/4 | In Progress |  |
-| 1.1 CUDA Graph Capture + Candle Patches | 3/3 | Done (needs H100 validation) | 2026-04-02 |
-| 1.2 BF16/FP16 Serving Support | 0/4 | In Progress | - |
-| 2. Performance Optimization | 0/4 | Planned | - |
-| 3. Guided Decoding | 3/5 | In Progress | - |
-| 4. Production Infrastructure | 0/4 | Planned | - |
+| 1. Model Loading and Quantization | 4/4 | Complete | 2026-03-13 |
+| 1.1 CUDA Graph Capture + Candle Patches | 3/3 | Complete (needs H100 validation) | 2026-04-02 |
+| 1.2 BF16/FP16 Serving Support | 4/4 | Complete | 2026-04-04 |
+| 2. Performance Optimization | 4/4 | Complete | 2026-04-04 |
+| 3. Guided Decoding | 5/5 | Complete | 2026-04-04 |
+| 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
+| 5. Wiring Fixes | 0/2 | Planned | - |
+| 6. Embedding Model Loader | 0/0 | Planned | - |
