@@ -156,6 +156,171 @@ impl std::str::FromStr for KVCacheDType {
     }
 }
 
+// ─── Serving dtype ───────────────────────────────────────────────────────
+
+/// Data type for model weight computation during serving.
+///
+/// Controls whether the serving engine runs model weights in BF16, F16, or F32.
+/// `Auto` selects the best dtype for the detected hardware:
+/// - CUDA sm_80+ (Ampere, Hopper): BF16
+/// - CUDA sm_70+ (Volta, Turing): F16
+/// - CPU / Metal / older CUDA: F32
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingDType {
+    /// Automatically select the best dtype for the device.
+    Auto,
+    /// 32-bit float — compatible with all devices but 2x memory vs F16/BF16.
+    F32,
+    /// 16-bit float — 2x memory savings, supported on Volta+ GPUs.
+    F16,
+    /// Brain float 16 — 2x memory savings with better dynamic range than F16.
+    /// Requires Ampere (sm_80+) or newer GPUs on CUDA. Supported on CPU.
+    BF16,
+}
+
+impl Default for ServingDType {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for ServingDType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::F32 => write!(f, "f32"),
+            Self::F16 => write!(f, "f16"),
+            Self::BF16 => write!(f, "bf16"),
+        }
+    }
+}
+
+impl std::str::FromStr for ServingDType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" | "" => Ok(Self::Auto),
+            "f32" | "fp32" | "float32" => Ok(Self::F32),
+            "f16" | "fp16" | "half" => Ok(Self::F16),
+            "bf16" | "bfloat16" => Ok(Self::BF16),
+            other => Err(format!(
+                "unknown serving dtype: {other} (valid: auto, f32, f16, bf16)"
+            )),
+        }
+    }
+}
+
+/// Detect the best dtype for the given device based on hardware capabilities.
+///
+/// For CUDA devices, queries the compute capability:
+/// - sm_80+ (Ampere, Hopper): BF16 (better dynamic range, native support)
+/// - sm_70+ (Volta, Turing): F16
+/// - older: F32
+///
+/// For CPU/Metal: always returns F32.
+#[cfg(feature = "cuda")]
+fn detect_best_dtype(device: &Device) -> DType {
+    use candle_core::backend::BackendDevice;
+
+    if let Device::Cuda(cuda_dev) = device {
+        match cuda_dev.compute_capability() {
+            Ok((major, _minor)) => {
+                if major >= 8 {
+                    DType::BF16
+                } else if major >= 7 {
+                    DType::F16
+                } else {
+                    DType::F32
+                }
+            }
+            Err(_) => DType::F32,
+        }
+    } else {
+        DType::F32
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn detect_best_dtype(_device: &Device) -> DType {
+    DType::F32
+}
+
+/// Resolve a [`ServingDType`] to a concrete [`DType`] for the given device.
+///
+/// - `Auto`: calls [`detect_best_dtype`] and logs the rationale.
+/// - `BF16` on CUDA: validates that the device has Ampere (sm_80+) compute capability.
+///   Returns an error with a helpful suggestion if not.
+/// - `BF16` on non-CUDA: allowed (candle CPU supports BF16).
+/// - `F16`/`F32`: always honoured without hardware checks.
+pub fn resolve_serving_dtype(dtype: ServingDType, device: &Device) -> Result<DType> {
+    let resolved = match dtype {
+        ServingDType::Auto => {
+            let best = detect_best_dtype(device);
+            let rationale = match best {
+                DType::BF16 => "CUDA sm_80+ detected — using BF16 (Ampere+ native)",
+                DType::F16 => "CUDA sm_70+ detected — using F16",
+                _ => "CPU/Metal or old CUDA — using F32",
+            };
+            tracing::info!("Auto-selecting serving dtype: {:?} ({})", best, rationale);
+            best
+        }
+        ServingDType::BF16 => {
+            #[cfg(feature = "cuda")]
+            {
+                use candle_core::backend::BackendDevice;
+                if let Device::Cuda(cuda_dev) = device {
+                    match cuda_dev.compute_capability() {
+                        Ok((major, minor)) => {
+                            if major < 8 {
+                                let sm = major * 10 + minor;
+                                return Err(candle_core::Error::Msg(format!(
+                                    "BF16 requires Ampere (sm_80+) GPU, detected sm_{sm}. \
+                                     Use --dtype f16 or --dtype auto instead."
+                                )));
+                            }
+                        }
+                        Err(_) => {
+                            return Err(candle_core::Error::Msg(
+                                "BF16 selected but could not query CUDA compute capability. \
+                                 Use --dtype f16 or --dtype auto instead."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            DType::BF16
+        }
+        ServingDType::F16 => DType::F16,
+        ServingDType::F32 => DType::F32,
+    };
+
+    tracing::info!("Serving dtype: {:?}", resolved);
+    Ok(resolved)
+}
+
+/// Returns `true` for weight tensor names that must remain in full precision (F32)
+/// even when the model is loaded in a reduced precision dtype.
+///
+/// These are typically:
+/// - Embedding tables (`embed_tokens.weight`, `embed.weight`)
+/// - Layer normalisation weights (any `*_norm.weight`, `.ln_1.weight`, etc.)
+/// - The final model norm (`model.norm.weight`)
+///
+/// Projection weights (`q_proj`, `k_proj`, `gate_proj`, etc.) return `false`
+/// and will be cast to the serving dtype.
+pub fn is_fp32_weight(name: &str) -> bool {
+    name.ends_with("embed_tokens.weight")
+        || name.ends_with("embed.weight")
+        || name == "model.norm.weight"
+        || name.ends_with(".input_layernorm.weight")
+        || name.ends_with(".post_attention_layernorm.weight")
+        || name.ends_with("_norm.weight")
+        || name.ends_with(".ln_1.weight")
+        || name.ends_with(".ln_2.weight")
+}
+
 // ─── INT8 quantized linear layer ─────────────────────────────────────────
 
 /// A linear layer with INT8 weight-only quantization.
@@ -1592,65 +1757,97 @@ mod tests {
 
 #[cfg(test)]
 mod serving_dtype_tests {
-    // Tests for ServingDType, is_fp32_weight, and resolve_serving_dtype.
-    // These stubs are Wave 0 (Nyquist compliance) — they compile and panic
-    // with "not yet implemented" until Plan 01 replaces todo!() with real assertions.
+    use super::*;
+    use candle_core::Device;
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_serving_dtype_fromstr() {
-        // DTYPE-02: Parse "auto" -> Auto, "bf16" -> BF16, "f16" -> F16, "f32" -> F32, "invalid" -> Err
-        todo!("not yet implemented")
+        // Valid parses
+        assert_eq!("auto".parse::<ServingDType>().unwrap(), ServingDType::Auto);
+        assert_eq!("".parse::<ServingDType>().unwrap(), ServingDType::Auto);
+        assert_eq!("bf16".parse::<ServingDType>().unwrap(), ServingDType::BF16);
+        assert_eq!("bfloat16".parse::<ServingDType>().unwrap(), ServingDType::BF16);
+        assert_eq!("f16".parse::<ServingDType>().unwrap(), ServingDType::F16);
+        assert_eq!("fp16".parse::<ServingDType>().unwrap(), ServingDType::F16);
+        assert_eq!("half".parse::<ServingDType>().unwrap(), ServingDType::F16);
+        assert_eq!("f32".parse::<ServingDType>().unwrap(), ServingDType::F32);
+        assert_eq!("fp32".parse::<ServingDType>().unwrap(), ServingDType::F32);
+        assert_eq!("float32".parse::<ServingDType>().unwrap(), ServingDType::F32);
+        // Case-insensitive
+        assert_eq!("BF16".parse::<ServingDType>().unwrap(), ServingDType::BF16);
+        assert_eq!("AUTO".parse::<ServingDType>().unwrap(), ServingDType::Auto);
+        // Invalid
+        assert!("invalid".parse::<ServingDType>().is_err());
+        assert!("int8".parse::<ServingDType>().is_err());
+        assert!("fp8".parse::<ServingDType>().is_err());
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_serving_dtype_display() {
-        // DTYPE-02: Display output for each variant:
-        //   Auto -> "auto", BF16 -> "bf16", F16 -> "f16", F32 -> "f32"
-        todo!("not yet implemented")
+        assert_eq!(ServingDType::Auto.to_string(), "auto");
+        assert_eq!(ServingDType::F32.to_string(), "f32");
+        assert_eq!(ServingDType::F16.to_string(), "f16");
+        assert_eq!(ServingDType::BF16.to_string(), "bf16");
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_serving_dtype_default() {
-        // DTYPE-02: ServingDType::default() == ServingDType::Auto
-        todo!("not yet implemented")
+        assert_eq!(ServingDType::default(), ServingDType::Auto);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_is_fp32_weight_embed_tokens() {
-        // DTYPE-04: is_fp32_weight("model.embed_tokens.weight") == true
-        todo!("not yet implemented")
+        assert!(is_fp32_weight("model.embed_tokens.weight"));
+        assert!(is_fp32_weight("model.embed.weight"));
+        // Negative: lm_head is a projection, not an embedding
+        assert!(!is_fp32_weight("lm_head.weight"));
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_is_fp32_weight_rms_norm() {
-        // DTYPE-04: is_fp32_weight("model.layers.0.input_layernorm.weight") == true
-        //           is_fp32_weight("model.norm.weight") == true
-        todo!("not yet implemented")
+        assert!(is_fp32_weight("model.norm.weight"));
+        assert!(is_fp32_weight("model.layers.0.input_layernorm.weight"));
+        assert!(is_fp32_weight("model.layers.0.post_attention_layernorm.weight"));
+        assert!(is_fp32_weight("model.layers.0.self_attn.q_norm.weight"));
+        assert!(is_fp32_weight("model.layers.0.self_attn.k_norm.weight"));
+        assert!(is_fp32_weight("model.layers.31.input_layernorm.weight"));
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_is_fp32_weight_linear_proj() {
-        // DTYPE-04: is_fp32_weight("model.layers.0.self_attn.q_proj.weight") == false  (negative case)
-        todo!("not yet implemented")
+        assert!(!is_fp32_weight("model.layers.0.self_attn.q_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.self_attn.k_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.self_attn.v_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.self_attn.o_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.mlp.gate_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.mlp.up_proj.weight"));
+        assert!(!is_fp32_weight("model.layers.0.mlp.down_proj.weight"));
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_resolve_serving_dtype_auto_cpu() {
-        // DTYPE-01: resolve_serving_dtype(ServingDType::Auto, &Device::Cpu) == ServingDType::F32
-        todo!("not yet implemented")
+        // On CPU, Auto should resolve to F32
+        let result = resolve_serving_dtype(ServingDType::Auto, &Device::Cpu).unwrap();
+        assert_eq!(result, candle_core::DType::F32);
     }
 
     #[test]
-    #[should_panic(expected = "not yet implemented")]
     fn test_resolve_serving_dtype_explicit_f16() {
-        // DTYPE-01: resolve_serving_dtype(ServingDType::F16, &Device::Cpu) == ServingDType::F16
-        todo!("not yet implemented")
+        // Explicit F16 should always be honoured regardless of device
+        let result = resolve_serving_dtype(ServingDType::F16, &Device::Cpu).unwrap();
+        assert_eq!(result, candle_core::DType::F16);
+    }
+
+    #[test]
+    fn test_resolve_serving_dtype_explicit_bf16_cpu() {
+        // BF16 on CPU should be allowed (candle supports CPU BF16)
+        let result = resolve_serving_dtype(ServingDType::BF16, &Device::Cpu).unwrap();
+        assert_eq!(result, candle_core::DType::BF16);
+    }
+
+    #[test]
+    fn test_resolve_serving_dtype_explicit_f32() {
+        let result = resolve_serving_dtype(ServingDType::F32, &Device::Cpu).unwrap();
+        assert_eq!(result, candle_core::DType::F32);
     }
 }
