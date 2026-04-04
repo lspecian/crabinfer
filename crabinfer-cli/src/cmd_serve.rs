@@ -63,6 +63,7 @@ pub fn run(
         disable_prefix_cache: if disable_prefix_cache { Some(true) } else { None },
         quantization: quantization.map(|s| s.to_string()),
         kv_cache_dtype: kv_cache_dtype.map(|s| s.to_string()),
+        dtype: None,
         max_model_len,
         chat_template,
         swap_space,
