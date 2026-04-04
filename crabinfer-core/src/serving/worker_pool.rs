@@ -125,6 +125,27 @@ impl WorkerPool {
         self.workers[0].embed(texts)
     }
 
+    /// Validate a guided decoding constraint without submitting a full request.
+    ///
+    /// Builds a temporary vocabulary and index to check whether the constraint
+    /// compiles successfully. Returns `Ok(())` if valid, or an error message
+    /// from outlines-core if not.
+    ///
+    /// This is used by the `/v1/guided/completions` handler to return HTTP 400
+    /// before submitting to the engine when `strict_constraints` is `true`.
+    pub fn validate_constraint(
+        &self,
+        constraint: &super::guided::GuidedConstraint,
+    ) -> Result<(), String> {
+        let vocab = super::guided::build_vocabulary(
+            self.workers[0].tokenizer(),
+            self.workers[0].eos_token_id(),
+        )?;
+        let cache = super::guided::IndexCache::new_default(vocab);
+        super::guided::create_guided_state(constraint, &cache)?;
+        Ok(())
+    }
+
     /// Signal all workers to shut down gracefully.
     pub fn shutdown(&self) {
         for w in &self.workers {

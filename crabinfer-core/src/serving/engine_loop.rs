@@ -437,7 +437,7 @@ impl EngineHandle {
         let index_cache = match guided::build_vocabulary(&tokenizer, eos_token_id) {
             Ok(vocab) => {
                 tracing::info!("Guided decoding vocabulary built ({} tokens)", vocab.len());
-                Some(IndexCache::new(vocab))
+                Some(IndexCache::new_default(vocab))
             }
             Err(e) => {
                 tracing::warn!("Guided decoding unavailable: vocabulary build failed: {e}");

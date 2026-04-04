@@ -3,9 +3,11 @@
 //! Uses outlines-core to convert JSON Schema -> regex -> DFA, then masks logits
 //! so only schema-valid continuations are sampled.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use outlines_core::index::Index;
 use outlines_core::primitives::StateId;
 use outlines_core::vocabulary::Vocabulary;
@@ -67,31 +69,93 @@ impl GuidedState {
     }
 }
 
+/// Snapshot of cache statistics (non-atomic, for point-in-time reads).
+#[derive(Debug, Clone, Copy)]
+pub struct CacheStatsSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub size: usize,
+}
+
+/// Atomic counters for cache statistics.
+struct CacheStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl CacheStats {
+    fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Default maximum number of index entries in the cache.
+pub const DEFAULT_MAX_ENTRIES: usize = 256;
+
 /// Cache of compiled Index objects keyed by regex pattern.
 /// Avoids recompiling the same regex/schema for repeated requests.
+/// Uses LRU eviction to bound memory usage.
 pub struct IndexCache {
-    cache: Mutex<HashMap<String, Arc<Index>>>,
+    cache: Mutex<LruCache<String, Arc<Index>>>,
     vocabulary: Arc<Vocabulary>,
+    stats: CacheStats,
+    max_entries: usize,
 }
 
 impl IndexCache {
-    /// Create a new cache with the given vocabulary.
-    pub fn new(vocabulary: Vocabulary) -> Self {
+    /// Create a new cache with the given vocabulary and maximum entry count.
+    pub fn new(vocabulary: Vocabulary, max_entries: usize) -> Self {
+        let cap = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::new(1).unwrap());
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(LruCache::new(cap)),
             vocabulary: Arc::new(vocabulary),
+            stats: CacheStats::new(),
+            max_entries,
         }
+    }
+
+    /// Create a new cache with the default capacity of 256.
+    pub fn new_default(vocabulary: Vocabulary) -> Self {
+        Self::new(vocabulary, DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Returns the configured maximum number of entries.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     /// Get an existing Index for the regex or compile and cache a new one.
     pub fn get_or_create(&self, regex: &str) -> Result<Arc<Index>, outlines_core::Error> {
         let mut cache = self.cache.lock().unwrap();
         if let Some(index) = cache.get(regex) {
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(index));
         }
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
         let index = Arc::new(Index::new(regex, &self.vocabulary)?);
-        cache.insert(regex.to_string(), Arc::clone(&index));
+        // If the cache is at capacity, LruCache::put will evict the LRU entry
+        if cache.len() == cache.cap().get() {
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        cache.put(regex.to_string(), Arc::clone(&index));
         Ok(index)
+    }
+
+    /// Returns a snapshot of the current cache statistics.
+    pub fn stats(&self) -> CacheStatsSnapshot {
+        let size = self.cache.lock().unwrap().len();
+        CacheStatsSnapshot {
+            hits: self.stats.hits.load(Ordering::Relaxed),
+            misses: self.stats.misses.load(Ordering::Relaxed),
+            evictions: self.stats.evictions.load(Ordering::Relaxed),
+            size,
+        }
     }
 }
 
@@ -218,7 +282,7 @@ mod tests {
         // Index masks tokens so only schema-valid continuations are allowed.
         let eos_id = 999;
         let vocab = build_test_vocabulary(eos_id);
-        let cache = IndexCache::new(vocab);
+        let cache = IndexCache::new_default(vocab);
 
         let schema: serde_json::Value = serde_json::from_str(
             r#"{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}"#,
@@ -241,7 +305,7 @@ mod tests {
         // state advances correctly per token, allowed_tokens is correct.
         let eos_id = 999;
         let vocab = build_test_vocabulary(eos_id);
-        let cache = IndexCache::new(vocab);
+        let cache = IndexCache::new_default(vocab);
 
         let constraint = GuidedConstraint::Regex("[0-9]+".to_string());
         let mut state =
@@ -345,13 +409,68 @@ mod tests {
     fn test_index_cache_deduplication() {
         let eos_id = 999;
         let vocab = build_test_vocabulary(eos_id);
-        let cache = IndexCache::new(vocab);
+        let cache = IndexCache::new_default(vocab);
 
         let idx1 = cache.get_or_create("[0-9]+").expect("First create");
         let idx2 = cache.get_or_create("[0-9]+").expect("Second create (cached)");
 
         // Both should be the same Arc (pointer equality)
         assert!(Arc::ptr_eq(&idx1, &idx2), "Cache should return same Arc");
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        // GDEC-04: LRU eviction — insert max_entries+1 patterns, oldest entry is evicted
+        let eos_id = 999;
+        let vocab = build_test_vocabulary(eos_id);
+        // Cache with capacity of 2
+        let cache = IndexCache::new(vocab, 2);
+
+        // Insert pattern A
+        let _idx_a1 = cache.get_or_create("[0-9]+").expect("insert A");
+        // Insert pattern B (most recently used is now B, oldest is A)
+        let _idx_b = cache.get_or_create("[a-z]+").expect("insert B");
+        // Insert pattern C — should evict A (the oldest)
+        let _idx_c = cache.get_or_create("[a-c]+").expect("insert C");
+
+        let stats = cache.stats();
+        // We had 3 misses (each pattern was new), 0 hits, 1 eviction
+        assert_eq!(stats.misses, 3, "Expected 3 misses");
+        assert_eq!(stats.hits, 0, "Expected 0 hits");
+        assert_eq!(stats.evictions, 1, "Expected 1 eviction when capacity exceeded");
+        assert_eq!(stats.size, 2, "Cache size should be 2 (max capacity)");
+    }
+
+    #[test]
+    fn test_cache_stats_tracking() {
+        // GDEC-04: CacheStats tracks hits, misses, and evictions correctly
+        let eos_id = 999;
+        let vocab = build_test_vocabulary(eos_id);
+        let cache = IndexCache::new(vocab, 256);
+
+        // First call — miss
+        let _idx1 = cache.get_or_create("[0-9]+").expect("first");
+        // Second call same pattern — hit
+        let _idx2 = cache.get_or_create("[0-9]+").expect("second (hit)");
+        // Different pattern — miss
+        let _idx3 = cache.get_or_create("[a-z]+").expect("third");
+        // Repeat — hit
+        let _idx4 = cache.get_or_create("[a-z]+").expect("fourth (hit)");
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 2, "Expected 2 hits");
+        assert_eq!(stats.misses, 2, "Expected 2 misses");
+        assert_eq!(stats.evictions, 0, "Expected 0 evictions (capacity not exceeded)");
+        assert_eq!(stats.size, 2, "Expected 2 entries in cache");
+    }
+
+    #[test]
+    fn test_default_max_entries() {
+        // GDEC-04: Default max_entries is 256
+        let eos_id = 999;
+        let vocab = build_test_vocabulary(eos_id);
+        let cache = IndexCache::new_default(vocab);
+        assert_eq!(cache.max_entries(), 256, "Default max_entries should be 256");
     }
 
     #[test]
