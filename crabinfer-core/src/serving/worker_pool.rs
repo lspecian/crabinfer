@@ -118,6 +118,24 @@ impl WorkerPool {
         self.workers.iter().map(|w| w.num_waiting()).sum()
     }
 
+    /// Aggregated guided decoding cache statistics across all workers.
+    ///
+    /// Hits, misses, and evictions are summed across workers; size is summed.
+    pub fn guided_cache_stats(&self) -> super::guided::CacheStatsSnapshot {
+        let mut hits = 0u64;
+        let mut misses = 0u64;
+        let mut evictions = 0u64;
+        let mut size = 0usize;
+        for w in &self.workers {
+            let s = w.guided_cache_stats();
+            hits += s.hits;
+            misses += s.misses;
+            evictions += s.evictions;
+            size += s.size;
+        }
+        super::guided::CacheStatsSnapshot { hits, misses, evictions, size }
+    }
+
     /// Compute embeddings for the given texts.
     ///
     /// Delegates to the first worker (all workers share the same model/tokenizer).

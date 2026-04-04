@@ -664,7 +664,7 @@ async fn serving_chat_completions_stream(
 }
 
 /// Map FinishReason to OpenAI finish_reason string.
-fn finish_reason_to_openai(reason: crabinfer_core::serving::sequence::FinishReason) -> &'static str {
+pub fn finish_reason_to_openai(reason: crabinfer_core::serving::sequence::FinishReason) -> &'static str {
     use crabinfer_core::serving::sequence::FinishReason;
     match reason {
         FinishReason::EndOfSequence => "stop",

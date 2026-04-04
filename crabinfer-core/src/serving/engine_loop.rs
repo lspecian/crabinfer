@@ -201,6 +201,14 @@ pub struct EngineHandle {
     /// Cloned from the model before it is moved into the engine thread.
     /// Shape: `[vocab_size, hidden_size]`. `None` if the model does not expose one.
     embed_table: Option<Tensor>,
+    /// Guided decoding index cache hits (updated by engine loop).
+    guided_cache_hits: Arc<std::sync::atomic::AtomicU64>,
+    /// Guided decoding index cache misses (updated by engine loop).
+    guided_cache_misses: Arc<std::sync::atomic::AtomicU64>,
+    /// Guided decoding index cache evictions (updated by engine loop).
+    guided_cache_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// Current guided decoding index cache size (updated by engine loop).
+    guided_cache_size: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for EngineHandle {
@@ -218,6 +226,10 @@ impl Clone for EngineHandle {
             num_waiting: self.num_waiting.clone(),
             block_hash_snapshot: self.block_hash_snapshot.clone(),
             embed_table: self.embed_table.clone(),
+            guided_cache_hits: self.guided_cache_hits.clone(),
+            guided_cache_misses: self.guided_cache_misses.clone(),
+            guided_cache_evictions: self.guided_cache_evictions.clone(),
+            guided_cache_size: self.guided_cache_size.clone(),
         }
     }
 }
@@ -386,6 +398,10 @@ impl EngineHandle {
         let prefix_cache_hit_rate_bps = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let num_waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let block_hash_snapshot: Arc<Mutex<Vec<BlockHash>>> = Arc::new(Mutex::new(Vec::new()));
+        let guided_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guided_cache_misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guided_cache_evictions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guided_cache_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         if speculative.is_some() {
             tracing::info!("Speculative decoding enabled");
@@ -466,6 +482,10 @@ impl EngineHandle {
             guided_states: HashMap::new(),
             index_cache,
             block_hash_snapshot: block_hash_snapshot.clone(),
+            guided_cache_hits: guided_cache_hits.clone(),
+            guided_cache_misses: guided_cache_misses.clone(),
+            guided_cache_evictions: guided_cache_evictions.clone(),
+            guided_cache_size: guided_cache_size.clone(),
         };
 
         std::thread::Builder::new()
@@ -488,6 +508,10 @@ impl EngineHandle {
             num_waiting,
             block_hash_snapshot,
             embed_table,
+            guided_cache_hits,
+            guided_cache_misses,
+            guided_cache_evictions,
+            guided_cache_size,
         })
     }
 
@@ -590,6 +614,16 @@ impl EngineHandle {
     /// Number of sequences waiting in the scheduler queue.
     pub fn num_waiting(&self) -> usize {
         self.num_waiting.load(Ordering::Relaxed)
+    }
+
+    /// Guided decoding index cache statistics snapshot.
+    pub fn guided_cache_stats(&self) -> guided::CacheStatsSnapshot {
+        guided::CacheStatsSnapshot {
+            hits: self.guided_cache_hits.load(Ordering::Relaxed),
+            misses: self.guided_cache_misses.load(Ordering::Relaxed),
+            evictions: self.guided_cache_evictions.load(Ordering::Relaxed),
+            size: self.guided_cache_size.load(Ordering::Relaxed) as usize,
+        }
     }
 
     /// Return a snapshot of the active block content hashes.
@@ -825,6 +859,11 @@ struct ServingEngineInner {
     index_cache: Option<IndexCache>,
     /// Shared snapshot of active block hashes (read by EngineHandle.block_hashes()).
     block_hash_snapshot: Arc<Mutex<Vec<BlockHash>>>,
+    /// Shared guided cache metric counters (read by EngineHandle.guided_cache_stats()).
+    guided_cache_hits: Arc<std::sync::atomic::AtomicU64>,
+    guided_cache_misses: Arc<std::sync::atomic::AtomicU64>,
+    guided_cache_evictions: Arc<std::sync::atomic::AtomicU64>,
+    guided_cache_size: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ServingEngineInner {
@@ -979,6 +1018,12 @@ impl ServingEngineInner {
                         );
                     }
                 }
+                // Update shared guided cache metrics after each access
+                let snap = cache.stats();
+                self.guided_cache_hits.store(snap.hits, Ordering::Relaxed);
+                self.guided_cache_misses.store(snap.misses, Ordering::Relaxed);
+                self.guided_cache_evictions.store(snap.evictions, Ordering::Relaxed);
+                self.guided_cache_size.store(snap.size as u64, Ordering::Relaxed);
             } else {
                 tracing::warn!(
                     "Sequence {seq_id}: guided constraint requested but vocabulary unavailable"
