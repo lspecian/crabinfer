@@ -24,6 +24,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // OpenAI-compatible
         .route("/v1/models", get(openai::list_models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/completions", post(openai::completions))
         // Guided decoding
         .route("/v1/guided/completions", post(guided::guided_completions))
         .route("/v1/embeddings", post(embeddings::create_embeddings))

@@ -665,6 +665,127 @@ async fn serving_chat_completions_stream(
     Ok(Sse::new(ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()))
 }
 
+/// POST /v1/completions
+///
+/// OpenAI legacy text completion endpoint. Accepts a bare prompt string and
+/// returns a single completion. Requires the serving engine (--serving) — without
+/// it, returns HTTP 503. Streaming is not supported in v1; if `stream: true` is
+/// passed, the request is processed non-streaming (we ignore the flag).
+///
+/// TODO: `prompt` as a JSON array (batch completion) is not supported in v1.
+pub async fn completions(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    use crabinfer_core::serving::sequence::SamplingParams;
+
+    state.metrics.inc_request();
+
+    let engine = state.serving_engine.as_ref().ok_or_else(|| {
+        state.metrics.inc_error();
+        state.metrics.dec_running();
+        ServerError::service_unavailable("Serving engine required for /v1/completions (start server with --serving)")
+    })?;
+
+    if req.prompt.is_empty() {
+        state.metrics.dec_running();
+        return Err(ServerError::bad_request("prompt must not be empty"));
+    }
+
+    let prompt_tokens = engine.encode(&req.prompt).map_err(|e| {
+        state.metrics.inc_error();
+        state.metrics.dec_running();
+        ServerError::internal(format!("tokenization failed: {e}"))
+    })?;
+    let prompt_token_count = prompt_tokens.len() as u32;
+
+    let max_tokens = (req.max_tokens.unwrap_or(16) as usize).min(MAX_TOKENS_CAP);
+    let temperature = req.temperature.unwrap_or(1.0);
+    let top_p = req.top_p.unwrap_or(1.0);
+
+    // Optional LoRA adapter parsed from model field (matches chat path)
+    let (_base_model, lora_adapter) = crabinfer_core::serving::lora::parse_model_adapter(&req.model);
+    let lora_adapter = lora_adapter.map(|s| s.to_string());
+
+    let params = SamplingParams {
+        temperature,
+        top_p,
+        max_tokens,
+        lora_adapter,
+        cache_salt: req.cache_salt.clone(),
+        ..SamplingParams::default()
+    };
+
+    let request_start = Instant::now();
+
+    let mut rx = engine.submit(prompt_tokens, params).map_err(|e| {
+        use crabinfer_core::serving::engine_loop::EngineError;
+        state.metrics.inc_error();
+        state.metrics.dec_running();
+        match e {
+            EngineError::Overloaded => ServerError::too_many_requests("server is overloaded, try again later"),
+            _ => ServerError::internal(format!("engine error: {e}")),
+        }
+    })?;
+
+    // Collect generated tokens with timeout (mirrors chat path, simpler — no logprobs/tools)
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let mut finish_reason_str = "stop".to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    let mut ttft_recorded = false;
+
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(tok)) => {
+                if !ttft_recorded {
+                    state.metrics.ttft.observe(request_start.elapsed().as_secs_f64());
+                    ttft_recorded = true;
+                }
+                generated_ids.push(tok.token_id);
+                if let Some(reason) = tok.finish_reason {
+                    finish_reason_str = finish_reason_to_openai(reason).to_string();
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                finish_reason_str = "length".to_string();
+                break;
+            }
+        }
+    }
+
+    let completion_text = engine.decode(&generated_ids).unwrap_or_default();
+    let completion_tokens = generated_ids.len() as u32;
+
+    state.metrics.inc_success();
+    state.metrics.dec_running();
+    state.metrics.add_tokens(prompt_token_count as u64, completion_tokens as u64);
+    state.metrics.request_latency.observe(request_start.elapsed().as_secs_f64());
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let response = CompletionResponse {
+        id: format!("cmpl-{}", now),
+        object: "text_completion".to_string(),
+        created: now,
+        model: state.model_id.clone(),
+        choices: vec![CompletionChoice {
+            text: completion_text,
+            index: 0,
+            finish_reason: finish_reason_str,
+            logprobs: None,
+        }],
+        usage: Usage {
+            prompt_tokens: prompt_token_count,
+            completion_tokens,
+            total_tokens: prompt_token_count + completion_tokens,
+        },
+    };
+
+    Ok(Json(response).into_response())
+}
+
 /// Map FinishReason to OpenAI finish_reason string.
 pub fn finish_reason_to_openai(reason: crabinfer_core::serving::sequence::FinishReason) -> &'static str {
     use crabinfer_core::serving::sequence::FinishReason;

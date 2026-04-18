@@ -125,6 +125,7 @@ pub async fn run_server(mut config: ServerConfig) -> Result<(), Box<dyn std::err
     tracing::info!("  GET  http://{}/ready", addr);
     tracing::info!("  GET  http://{}/v1/models", addr);
     tracing::info!("  POST http://{}/v1/chat/completions", addr);
+    tracing::info!("  POST http://{}/v1/completions", addr);
     tracing::info!("  POST http://{}/v1/messages", addr);
     tracing::info!("  GET  http://{}/metrics", addr);
 
