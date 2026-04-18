@@ -20,6 +20,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 4: Production Infrastructure** - Multi-worker serving, TOML config, prefix cache salting, and embeddings endpoint
 - [ ] **Phase 5: Wiring Fixes** - SHA-256 verification in download path + cache-aware worker routing
 - [x] **Phase 6: Embedding Model Loader** - BERT/encoder model support for dedicated embedding models (completed 2026-04-04)
+- [ ] **Phase 7: Server Wiring Last-Mile** - Wire CacheAware routing, cache_salt, batch tokenization, and /v1/completions through to API surface (gap closure)
+- [ ] **Phase 8: Fused Kernel Coverage** - Wire fused LayerNorm+linear into DeepSeek/Mistral/Phi3 final layers (gap closure)
 
 ## Phase Details
 
@@ -144,10 +146,39 @@ Plans:
 - [ ] 06-01-PLAN.md — BERT/NomicBert embedding model runners with architecture detection and safetensors dispatch
 - [ ] 06-02-PLAN.md — Engine wiring: bypass PagedAttention for encoder-only models, wire embed() through real encoder
 
+### Phase 7: Server Wiring Last-Mile
+**Goal**: Make the existing infrastructure for cache-aware routing, cache salting, batch tokenization, and bare text completions reachable from the user-facing API. All four features have working core implementations but lack the final server-side wiring.
+**Depends on**: Phase 5, Phase 6
+**Requirements**: WORK-03, PCCH-01, TOKN-01
+**Gap Closure**: Closes 4 gaps from v1.0 milestone audit (WORK-03 partial, PCCH-01 partial, TOKN-01 partial, missing /v1/completions route)
+**Success Criteria** (what must be TRUE):
+  1. `crabinfer serve --routing-policy cache-aware --workers 4` activates `WorkerPool::new_with_policy(CacheAware)` and routes requests by KV-cache prefix match
+  2. A request body containing `"cache_salt": "tenant-foo"` results in a `BlockHash` namespaced to that tenant — different salts cannot share cache blocks via the API
+  3. `POST /v1/embeddings` with a multi-input request (`"input": ["a", "b", "c"]`) calls `WorkerPool::encode_batch()` once instead of three serial `encode()` calls
+  4. `POST /v1/completions` accepts `{"model": "...", "prompt": "..."}` (OpenAI legacy format) and returns a completion — handler exists and route is registered
+
+**Plans:** 4 plans
+
+Plans:
+- [ ] 07-01-PLAN.md — Wire routing_policy field + WorkerPool::new_with_policy (WORK-03)
+- [ ] 07-02-PLAN.md — Propagate cache_salt from ChatCompletionRequest/MessagesRequest to SamplingParams (PCCH-01)
+- [ ] 07-03-PLAN.md — Add /v1/completions handler, types, and route registration (missing flow + PCCH-01)
+- [ ] 07-04-PLAN.md — TOKN-01 call-chain verification tests (audit was stale; test + document existing wiring)
+
+### Phase 8: Fused Kernel Coverage
+**Goal**: Make the fused LayerNorm+linear CUDA kernel benefit DeepSeek, Mistral, and Phi3 models by wiring `forward_linear_fused()` into their final output paths (currently only Llama uses it).
+**Depends on**: Phase 2
+**Requirements**: KERN-01
+**Gap Closure**: Closes KERN-01 partial gap from v1.0 milestone audit
+**Success Criteria** (what must be TRUE):
+  1. DeepSeek, Mistral, and Phi3 model `forward()` methods call `RmsNorm::forward_linear_fused()` for their final norm+lm_head step (matching Llama's pattern at `llama.rs:364`)
+  2. CUDA backend uses the fused kernel for these models; CPU/Metal backends fall back to the unfused path via the existing default `KernelBackend` implementation
+  3. Output token IDs match the unfused path within numerical tolerance (no quality regression)
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
+Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -157,5 +188,7 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6
 | 2. Performance Optimization | 4/4 | Complete | 2026-04-04 |
 | 3. Guided Decoding | 5/5 | Complete | 2026-04-04 |
 | 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
-| 5. Wiring Fixes | 1/2 | In Progress|  |
-| 6. Embedding Model Loader | 2/2 | Complete   | 2026-04-04 |
+| 5. Wiring Fixes | 2/2 | Complete | 2026-04-04 |
+| 6. Embedding Model Loader | 2/2 | Complete | 2026-04-04 |
+| 7. Server Wiring Last-Mile | 0/4 | Planned | - |
+| 8. Fused Kernel Coverage | 0/0 | Planned | - |
