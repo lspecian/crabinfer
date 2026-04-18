@@ -72,6 +72,7 @@ pub fn run(
         max_loras,
         lora_modules,
         block_size,
+        routing_policy: None,
         tensor_parallel_size,
         pipeline_parallel_stages,
     };
