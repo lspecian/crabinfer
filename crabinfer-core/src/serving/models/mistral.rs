@@ -319,8 +319,8 @@ impl ModelRunner for SafetensorsMistralModel {
             hidden_states = layer.forward(&hidden_states, ctx, layer_idx)?;
         }
 
-        let hidden_states = self.norm.forward_fused(&hidden_states, ctx.backend)?;
-        self.lm_head.forward(&hidden_states)
+        // Final norm + output projection: fused on CUDA, sequential on CPU/Metal.
+        self.norm.forward_linear_fused(&hidden_states, &self.lm_head, ctx.backend)
     }
 
     fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
