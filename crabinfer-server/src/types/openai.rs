@@ -29,6 +29,11 @@ pub struct ChatCompletionRequest {
     /// Request priority (lower = higher priority, default 0). CrabInfer extension.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Per-request cache salt for tenant isolation. CrabInfer extension.
+    /// When set, prefix cache block hashes are namespaced to this salt,
+    /// preventing KV cache sharing across tenants even for identical prompts.
+    #[serde(default)]
+    pub cache_salt: Option<String>,
     /// Tool definitions available for the model to call.
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
@@ -174,6 +179,25 @@ pub struct ImageUrl {
 
 fn default_detail() -> String {
     "auto".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_salt_deserialization() {
+        let json = r#"{"model":"gpt-4","messages":[],"cache_salt":"tenant-foo"}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_salt.as_deref(), Some("tenant-foo"));
+    }
+
+    #[test]
+    fn test_cache_salt_default_none() {
+        let json = r#"{"model":"gpt-4","messages":[]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.cache_salt.is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------

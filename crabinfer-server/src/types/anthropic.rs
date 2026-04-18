@@ -21,6 +21,28 @@ pub struct MessagesRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub system: Option<String>,
+    /// Per-request cache salt for tenant isolation. CrabInfer extension.
+    #[serde(default)]
+    pub cache_salt: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_anthropic_cache_salt_deserialization() {
+        let json = r#"{"model":"claude","messages":[],"max_tokens":100,"cache_salt":"tenant-bar"}"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_salt.as_deref(), Some("tenant-bar"));
+    }
+
+    #[test]
+    fn test_anthropic_cache_salt_default_none() {
+        let json = r#"{"model":"claude","messages":[],"max_tokens":100}"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.cache_salt.is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
