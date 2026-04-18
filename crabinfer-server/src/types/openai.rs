@@ -198,6 +198,71 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(req.cache_salt.is_none());
     }
+
+    #[test]
+    fn test_completion_request_deser() {
+        let json = r#"{"model":"m","prompt":"hello"}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "m");
+        assert_eq!(req.prompt, "hello");
+        assert!(req.max_tokens.is_none());
+        assert!(req.temperature.is_none());
+        assert!(req.top_p.is_none());
+        assert!(req.stream.is_none());
+        assert!(req.cache_salt.is_none());
+    }
+
+    #[test]
+    fn test_completion_request_with_optionals() {
+        let json = r#"{"model":"m","prompt":"hi","max_tokens":64,"temperature":0.7,"top_p":0.9,"stream":true,"cache_salt":"x"}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, Some(64));
+        assert!((req.temperature.unwrap() - 0.7).abs() < 1e-5);
+        assert!((req.top_p.unwrap() - 0.9).abs() < 1e-5);
+        assert_eq!(req.stream, Some(true));
+        assert_eq!(req.cache_salt.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn test_completion_response_ser() {
+        let resp = CompletionResponse {
+            id: "cmpl-test".to_string(),
+            object: "text_completion".to_string(),
+            created: 1234567890,
+            model: "m".to_string(),
+            choices: vec![CompletionChoice {
+                text: "hello world".to_string(),
+                index: 0,
+                finish_reason: "stop".to_string(),
+                logprobs: None,
+            }],
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 3,
+                total_tokens: 8,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["object"], "text_completion");
+        assert_eq!(json["choices"][0]["text"], "hello world");
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn test_completion_choice_logprobs_serializes_as_null() {
+        let choice = CompletionChoice {
+            text: "hi".to_string(),
+            index: 0,
+            finish_reason: "stop".to_string(),
+            logprobs: None,
+        };
+        let json = serde_json::to_value(&choice).unwrap();
+        // The key MUST be present even when None; check it's null, not absent
+        assert!(json.get("logprobs").is_some(), "logprobs key must be present");
+        assert!(json["logprobs"].is_null(), "logprobs must serialize as JSON null");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +336,7 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -332,6 +397,52 @@ pub struct DeltaFunctionCall {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Legacy /v1/completions (OpenAI text completion endpoint)
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /v1/completions (OpenAI legacy completions API).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    /// Per-request cache salt for tenant isolation. CrabInfer extension.
+    /// See PCCH-01 wiring in 07-02 for the equivalent ChatCompletionRequest field.
+    #[serde(default)]
+    pub cache_salt: Option<String>,
+}
+
+/// Response body for POST /v1/completions.
+#[derive(Debug, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: String,   // always "text_completion"
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,     // reuse existing Usage struct
+}
+
+/// One choice in a completion response.
+#[derive(Debug, Serialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: u32,
+    pub finish_reason: String,
+    /// OpenAI clients expect `logprobs` as a null field, not an absent field.
+    /// We do NOT use `skip_serializing_if` here — the key must be emitted.
+    pub logprobs: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
