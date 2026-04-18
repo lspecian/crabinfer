@@ -1021,4 +1021,50 @@ mod tests {
         assert_eq!(config.head_size(), 128); // 96 + 32
         assert_eq!(config.rope_dim(), 32);
     }
+
+    #[test]
+    fn test_deepseek_fused_linear_matches_unfused() {
+        // Verify that forward_linear_fused produces the same output as
+        // separate rmsnorm + linear.forward within tolerance.
+        let dev = &candle_core::Device::Cpu;
+        let hidden_size = 64;
+        let out_features = 32;
+
+        let weight = candle_core::Tensor::randn(0f32, 1.0, hidden_size, dev).unwrap();
+        let norm = RmsNorm {
+            weight,
+            eps: 1e-5,
+        };
+
+        let x = candle_core::Tensor::randn(0f32, 1.0, (4, hidden_size), dev).unwrap();
+
+        // Create a dense MaybeQuantizedLinear
+        let linear_weight =
+            candle_core::Tensor::randn(0f32, 1.0, (out_features, hidden_size), dev).unwrap();
+        let qmm = candle_core::quantized::QMatMul::Tensor(linear_weight);
+        let linear = MaybeQuantizedLinear::QMatMul(qmm);
+
+        let backend = crate::serving::kernels::cpu_backend::CpuBackend::new();
+
+        // Fused path
+        let fused = norm.forward_linear_fused(&x, &linear, &backend).unwrap();
+
+        // Unfused reference
+        let normed = norm.forward(&x).unwrap();
+        let unfused = linear.forward(&normed).unwrap();
+
+        let diff = (&fused - &unfused).unwrap().abs().unwrap();
+        let max_diff: f32 = diff
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max_diff < 1e-3,
+            "fused vs unfused max_diff={max_diff}"
+        );
+        assert_eq!(fused.dims(), &[4, out_features]);
+    }
 }
