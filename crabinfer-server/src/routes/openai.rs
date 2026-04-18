@@ -158,6 +158,7 @@ async fn serving_chat_completions(
         priority,
         guided_constraint,
         lora_adapter,
+        cache_salt: req.cache_salt.clone(),
         ..SamplingParams::default()
     };
 
@@ -477,6 +478,7 @@ async fn serving_chat_completions_stream(
         priority,
         guided_constraint,
         lora_adapter,
+        cache_salt: req.cache_salt.clone(),
         ..SamplingParams::default()
     };
 
@@ -1411,5 +1413,18 @@ mod tests {
             extract_guided_constraint(&fmt).is_none(),
             "json_schema without schema value should not produce a constraint"
         );
+    }
+
+    #[test]
+    fn test_cache_salt_field_exists_on_sampling_params() {
+        // Marker test: catches accidental field renames in crabinfer-core.
+        // If this fails to compile, cache_salt was renamed and all four
+        // propagation sites need updating.
+        use crabinfer_core::serving::sequence::SamplingParams;
+        let params = SamplingParams {
+            cache_salt: Some("test-salt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(params.cache_salt.as_deref(), Some("test-salt"));
     }
 }

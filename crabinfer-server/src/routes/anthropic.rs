@@ -130,6 +130,7 @@ async fn serving_messages(
         top_p,
         max_tokens,
         lora_adapter,
+        cache_salt: req.cache_salt.clone(),
         ..SamplingParams::default()
     };
 
@@ -393,6 +394,7 @@ async fn serving_messages_stream(
         top_p,
         max_tokens,
         lora_adapter,
+        cache_salt: req.cache_salt.clone(),
         ..SamplingParams::default()
     };
 
