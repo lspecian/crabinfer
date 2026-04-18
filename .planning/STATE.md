@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 07-04-PLAN.md (TOKN-01 batch embedding call-chain contract tests)
-last_updated: "2026-04-18T05:28:12.578Z"
+stopped_at: Completed 07-02-PLAN.md (cache_salt API wiring, PCCH-01 closure)
+last_updated: "2026-04-18T05:28:53.570Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 10
   completed_phases: 8
   total_plans: 29
-  completed_plans: 30
+  completed_plans: 31
   percent: 25
 ---
 
@@ -66,6 +66,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 06-embedding-model-loader P02 | 8 | 1 tasks | 3 files |
 | Phase 07-server-wiring-last-mile P01 | 12 | 2 tasks | 3 files |
 | Phase 07-server-wiring-last-mile P04 | 7 | 1 tasks | 1 files |
+| Phase 07-server-wiring-last-mile P02 | 4min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -110,6 +111,7 @@ Recent decisions affecting current work:
 - [Phase 06-embedding-model-loader]: HfArchitectureProbe and ModelArchitecture made pub (not pub(crate)) so server crate can detect embedding-only architecture without re-reading config.json in a separate function
 - [Phase 07-server-wiring-last-mile]: parse_routing_policy() as private helper near WorkerPool construction site — pure function, easily unit-testable; unknown strings degrade to RoundRobin with warning, never panic
 - [Phase 07-server-wiring-last-mile]: TOKN-01: Source-level contract tests chosen over runtime mocks to pin batch embed call chain — avoids tokenizer trait refactor; std::fs::read_to_string + CARGO_MANIFEST_DIR pattern established
+- [Phase 07-server-wiring-last-mile]: cache_salt placed adjacent to priority in ChatCompletionRequest for consistent CrabInfer extension grouping; serde(default) preserves backward compatibility
 
 ### Pending Todos
 
@@ -129,6 +131,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-18T05:28:12.576Z
-Stopped at: Completed 07-04-PLAN.md (TOKN-01 batch embedding call-chain contract tests)
+Last session: 2026-04-18T05:28:53.568Z
+Stopped at: Completed 07-02-PLAN.md (cache_salt API wiring, PCCH-01 closure)
 Resume file: None
