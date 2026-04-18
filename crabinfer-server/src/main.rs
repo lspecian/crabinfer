@@ -109,6 +109,10 @@ struct Cli {
     #[arg(long)]
     block_size: Option<usize>,
 
+    /// Request routing policy: round-robin (default) or cache-aware (route by KV-cache prefix match)
+    #[arg(long)]
+    routing_policy: Option<String>,
+
     /// Number of GPUs for tensor parallelism (default: 1 = no TP)
     #[arg(long)]
     tensor_parallel_size: Option<usize>,
@@ -168,6 +172,7 @@ async fn main() {
         max_loras: cli.max_loras,
         lora_modules: cli.lora_modules,
         block_size: cli.block_size,
+        routing_policy: cli.routing_policy,
         tensor_parallel_size: cli.tensor_parallel_size,
         pipeline_parallel_stages: cli.pipeline_parallel_stages,
     };

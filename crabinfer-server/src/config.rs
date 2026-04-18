@@ -46,6 +46,7 @@ pub struct CrabInferConfig {
     pub max_loras: Option<usize>,
     pub lora_modules: Option<String>,
     pub block_size: Option<usize>,
+    pub routing_policy: Option<String>,
     pub tensor_parallel_size: Option<usize>,
     pub pipeline_parallel_stages: Option<usize>,
 }
@@ -79,6 +80,7 @@ pub struct CliOverrides {
     pub max_loras: Option<usize>,
     pub lora_modules: Option<String>,
     pub block_size: Option<usize>,
+    pub routing_policy: Option<String>,
     pub tensor_parallel_size: Option<usize>,
     pub pipeline_parallel_stages: Option<usize>,
 }
@@ -119,6 +121,7 @@ impl CrabInferConfig {
         merge!(max_loras);
         merge!(lora_modules);
         merge!(block_size);
+        merge!(routing_policy);
         merge!(tensor_parallel_size);
         merge!(pipeline_parallel_stages);
     }
@@ -152,6 +155,7 @@ impl CrabInferConfig {
             max_loras: self.max_loras.unwrap_or(4),
             lora_modules: self.lora_modules.clone(),
             block_size: self.block_size.unwrap_or(16),
+            routing_policy: self.routing_policy.clone(),
             tensor_parallel_size: self.tensor_parallel_size.unwrap_or(1),
             pipeline_parallel_stages: self.pipeline_parallel_stages.unwrap_or(1),
         }
@@ -202,6 +206,7 @@ pub fn load_config(path: Option<&Path>) -> Result<CrabInferConfig, Box<dyn std::
 /// - `CRABINFER_CHAT_TEMPLATE` -- chat template override
 /// - `CRABINFER_ENFORCE_EAGER` -- set to "1" or "true" to disable CUDA graphs
 /// - `CRABINFER_SWAP_SPACE` -- CPU swap space for KV cache in GiB (0 = disabled)
+/// - `CRABINFER_ROUTING_POLICY` -- request routing policy: round-robin or cache-aware
 pub fn apply_env_overrides(config: &mut ServerConfig) {
     use std::env;
 
@@ -272,6 +277,9 @@ pub fn apply_env_overrides(config: &mut ServerConfig) {
         if let Ok(n) = v.parse() {
             config.pipeline_parallel_stages = n;
         }
+    }
+    if let Ok(v) = env::var("CRABINFER_ROUTING_POLICY") {
+        config.routing_policy = Some(v);
     }
 }
 
@@ -354,6 +362,9 @@ pub fn apply_cli_overrides(config: &mut ServerConfig, overrides: &CliOverrides) 
     }
     if let Some(v) = overrides.block_size {
         config.block_size = v;
+    }
+    if overrides.routing_policy.is_some() {
+        config.routing_policy = overrides.routing_policy.clone();
     }
     if let Some(v) = overrides.tensor_parallel_size {
         config.tensor_parallel_size = v;
@@ -538,6 +549,55 @@ block_size = 32
         assert!(!is_valid_block_size(12));  // not power of 2
         assert!(!is_valid_block_size(0));   // zero
         assert!(!is_valid_block_size(3));   // not power of 2
+    }
+
+    #[test]
+    fn test_routing_policy_toml() {
+        let toml_str = r#"
+model = "/models/test.gguf"
+routing_policy = "cache-aware"
+"#;
+        let cfg: CrabInferConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.routing_policy.as_deref(), Some("cache-aware"));
+        let sc = cfg.to_server_config();
+        assert_eq!(sc.routing_policy.as_deref(), Some("cache-aware"));
+    }
+
+    #[test]
+    fn test_routing_policy_cli_override() {
+        let cfg = CrabInferConfig::default();
+        let mut sc = cfg.to_server_config();
+        assert!(sc.routing_policy.is_none());
+
+        let overrides = CliOverrides {
+            routing_policy: Some("cache-aware".to_string()),
+            ..Default::default()
+        };
+        apply_cli_overrides(&mut sc, &overrides);
+        assert_eq!(sc.routing_policy.as_deref(), Some("cache-aware"));
+    }
+
+    #[test]
+    fn test_routing_policy_default_none() {
+        let cfg = CrabInferConfig::default();
+        let sc = cfg.to_server_config();
+        assert!(sc.routing_policy.is_none());
+    }
+
+    #[test]
+    fn test_routing_policy_env_override() {
+        let env_var = "CRABINFER_ROUTING_POLICY";
+        // Use a unique marker value to avoid collision with other parallel tests
+        let marker = "cache-aware-env-test-marker-07-01";
+        std::env::set_var(env_var, marker);
+
+        let cfg = CrabInferConfig::default();
+        let mut sc = cfg.to_server_config();
+        apply_env_overrides(&mut sc);
+
+        assert_eq!(sc.routing_policy.as_deref(), Some(marker));
+
+        std::env::remove_var(env_var);
     }
 
     #[test]

@@ -64,6 +64,11 @@ pub struct ServerConfig {
     /// Tokens per KV cache block. Must be a power of 2 between 8 and 64.
     /// Default: 16.
     pub block_size: usize,
+    /// Request routing policy when multi-worker is enabled.
+    /// `None` or `"round-robin"` → `RoutingPolicy::RoundRobin` (default, backward compatible).
+    /// `"cache-aware"` → `RoutingPolicy::CacheAware` (route by KV-cache prefix match).
+    /// Unknown strings fall back to `RoundRobin` with a warning log.
+    pub routing_policy: Option<String>,
     /// Number of GPUs for tensor parallelism (default: 1 = no TP).
     /// Model weights are sharded across GPUs using NCCL for communication.
     pub tensor_parallel_size: usize,
@@ -127,6 +132,10 @@ pub async fn run_server(mut config: ServerConfig) -> Result<(), Box<dyn std::err
         tracing::info!("  Mode: PagedAttention serving engine (continuous batching)");
     } else {
         tracing::info!("  Mode: Legacy single-request engine");
+    }
+
+    if let Some(ref policy) = config.routing_policy {
+        tracing::info!("  Routing policy: {}", policy);
     }
 
     // Bonjour/mDNS advertisement (macOS only)
@@ -634,7 +643,8 @@ fn load_serving_engine(
         }
     }
 
-    let pool = WorkerPool::new(handles);
+    let policy = parse_routing_policy(config.routing_policy.as_deref());
+    let pool = WorkerPool::new_with_policy(handles, policy, config.block_size);
 
     tracing::info!(
         "PagedAttention serving engine started ({} worker{})",
@@ -643,6 +653,31 @@ fn load_serving_engine(
     );
 
     Ok((None, Some(pool), model_info, model_id))
+}
+
+/// Parse a routing policy string into a [`crabinfer_core::serving::worker_pool::RoutingPolicy`].
+///
+/// - `"cache-aware"` → `RoutingPolicy::CacheAware`
+/// - `"round-robin"` or `None` → `RoutingPolicy::RoundRobin` (default)
+/// - Any other string → `RoutingPolicy::RoundRobin` with a warning log
+fn parse_routing_policy(
+    opt: Option<&str>,
+) -> crabinfer_core::serving::worker_pool::RoutingPolicy {
+    use crabinfer_core::serving::worker_pool::RoutingPolicy;
+    match opt {
+        Some("cache-aware") => {
+            tracing::info!("Using cache-aware routing policy");
+            RoutingPolicy::CacheAware
+        }
+        Some("round-robin") | None => RoutingPolicy::RoundRobin,
+        Some(other) => {
+            tracing::warn!(
+                "Unknown routing-policy '{}', falling back to round-robin",
+                other,
+            );
+            RoutingPolicy::RoundRobin
+        }
+    }
 }
 
 /// Extract ModelInfo from GGUF metadata.
@@ -940,6 +975,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use crabinfer_core::serving::hub_download::is_hf_repo_id;
+    use crabinfer_core::serving::worker_pool::RoutingPolicy;
 
     /// Verify is_hf_repo_id returns true for HF repo IDs, triggering the download branch.
     #[test]
@@ -951,5 +987,25 @@ mod tests {
         assert!(!is_hf_repo_id("/models/llama"));
         assert!(!is_hf_repo_id("./models/llama"));
         assert!(!is_hf_repo_id("model.gguf"));
+    }
+
+    #[test]
+    fn test_parse_routing_policy_string() {
+        assert_eq!(
+            super::parse_routing_policy(Some("cache-aware")),
+            RoutingPolicy::CacheAware
+        );
+        assert_eq!(
+            super::parse_routing_policy(Some("round-robin")),
+            RoutingPolicy::RoundRobin
+        );
+        assert_eq!(
+            super::parse_routing_policy(None),
+            RoutingPolicy::RoundRobin
+        );
+        assert_eq!(
+            super::parse_routing_policy(Some("garbage")),
+            RoutingPolicy::RoundRobin
+        );
     }
 }
