@@ -174,6 +174,10 @@ Plans:
   1. DeepSeek, Mistral, and Phi3 model `forward()` methods call `RmsNorm::forward_linear_fused()` for their final norm+lm_head step (matching Llama's pattern at `llama.rs:364`)
   2. CUDA backend uses the fused kernel for these models; CPU/Metal backends fall back to the unfused path via the existing default `KernelBackend` implementation
   3. Output token IDs match the unfused path within numerical tolerance (no quality regression)
+**Plans:** 1 plan
+
+Plans:
+- [ ] 08-01-PLAN.md — Port forward_linear_fused into DeepSeek/Mistral/Phi3 final norm+lm_head step with per-model parity tests
 
 ## Progress
 
@@ -191,4 +195,4 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -
 | 5. Wiring Fixes | 2/2 | Complete | 2026-04-04 |
 | 6. Embedding Model Loader | 2/2 | Complete | 2026-04-04 |
 | 7. Server Wiring Last-Mile | 0/4 | Planned | - |
-| 8. Fused Kernel Coverage | 0/0 | Planned | - |
+| 8. Fused Kernel Coverage | 0/1 | Planned | - |

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 07-03-PLAN.md (POST /v1/completions handler, missing-flow closure)
-last_updated: "2026-04-18T05:33:51.895Z"
+stopped_at: Completed 08-01-PLAN.md (fused kernel coverage — DeepSeek/Mistral/Phi3 forward_linear_fused)
+last_updated: "2026-04-18T08:16:46.467Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 10
-  completed_phases: 9
-  total_plans: 29
-  completed_plans: 32
+  completed_phases: 10
+  total_plans: 30
+  completed_plans: 33
   percent: 25
 ---
 
@@ -68,6 +68,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 07-server-wiring-last-mile P04 | 7 | 1 tasks | 1 files |
 | Phase 07-server-wiring-last-mile P02 | 4min | 2 tasks | 4 files |
 | Phase 07-server-wiring-last-mile P03 | 3min | 2 tasks | 4 files |
+| Phase 08-fused-kernel-coverage P01 | 9min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -114,6 +115,8 @@ Recent decisions affecting current work:
 - [Phase 07-server-wiring-last-mile]: TOKN-01: Source-level contract tests chosen over runtime mocks to pin batch embed call chain — avoids tokenizer trait refactor; std::fs::read_to_string + CARGO_MANIFEST_DIR pattern established
 - [Phase 07-server-wiring-last-mile]: cache_salt placed adjacent to priority in ChatCompletionRequest for consistent CrabInfer extension grouping; serde(default) preserves backward compatibility
 - [Phase 07-server-wiring-last-mile]: 503 returned for /v1/completions when serving engine missing — no legacy fallback; logprobs serializes as null (not omitted) per OpenAI client expectations
+- [Phase 08-fused-kernel-coverage]: No per-model #[cfg(feature = 'cuda')] guards — KernelBackend trait handles dispatch internally
+- [Phase 08-fused-kernel-coverage]: Quantized lm_head handled automatically by forward_linear_fused None-branch (no caller changes)
 
 ### Pending Todos
 
@@ -133,6 +136,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-18T05:33:51.893Z
-Stopped at: Completed 07-03-PLAN.md (POST /v1/completions handler, missing-flow closure)
+Last session: 2026-04-18T08:16:46.465Z
+Stopped at: Completed 08-01-PLAN.md (fused kernel coverage — DeepSeek/Mistral/Phi3 forward_linear_fused)
 Resume file: None

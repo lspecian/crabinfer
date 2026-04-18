@@ -26,7 +26,7 @@
 
 ### CUDA Kernel Fusion
 
-- [ ] **KERN-01**: Fused LayerNorm+linear CUDA kernel (combined norm + matmul in single kernel pass)
+- [x] **KERN-01**: Fused LayerNorm+linear CUDA kernel (combined norm + matmul in single kernel pass)
 - [ ] **KERN-02**: Kernel wired into model forward via `KernelBackend` trait with unfused default fallback
 
 ### Memory Optimization
@@ -37,7 +37,7 @@
 
 ### Tokenization
 
-- [ ] **TOKN-01**: Parallel tokenization across requests using Rust async (no GIL bottleneck)
+- [x] **TOKN-01**: Parallel tokenization across requests using Rust async (no GIL bottleneck)
 - [ ] **TOKN-02**: Tokenizer compilation/caching — compile tokenizer once at startup, reuse across requests
 
 ### Multi-Worker
