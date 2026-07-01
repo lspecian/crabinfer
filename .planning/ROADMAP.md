@@ -23,7 +23,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 7: Server Wiring Last-Mile** - Wire CacheAware routing, cache_salt, batch tokenization, and /v1/completions through to API surface (gap closure)
 - [ ] **Phase 8: Fused Kernel Coverage** - Wire fused LayerNorm+linear into DeepSeek/Mistral/Phi3 final layers (gap closure)
 - [ ] **Phase 9: Cache Salt Engine Bridge** - Wire SamplingParams.cache_salt into BlockHash computation so tenant isolation actually works (gap closure)
-- [ ] **Phase 10: Multi-Architecture Marlin Activation** - Call activate_marlin in Phi3/Mistral/DeepSeek loader branches (gap closure)
+- [x] **Phase 10: Multi-Architecture Marlin Activation** - Call activate_marlin in Phi3/Mistral/DeepSeek loader branches (gap closure) (completed 2026-07-01)
 
 ## Phase Details
 
@@ -207,7 +207,7 @@ Plans:
   2. Same behavior for Mistral and DeepSeekV2 architectures
   3. CPU/Metal devices skip activation (existing `if device.is_cuda()` guard)
   4. Llama and Qwen paths remain unchanged
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [ ] 10-01-PLAN.md — Add activate_marlin methods (+ tests) to Phi3/Mistral/DeepSeek model files (QLOAD-03)
@@ -231,4 +231,4 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -
 | 7. Server Wiring Last-Mile | 4/4 | Complete | 2026-04-18 |
 | 8. Fused Kernel Coverage | 1/1 | Complete | 2026-06-20 |
 | 9. Cache Salt Engine Bridge | 1/2 | In Progress|  |
-| 10. Multi-Architecture Marlin Activation | 1/2 | In Progress|  |
+| 10. Multi-Architecture Marlin Activation | 2/2 | Complete   | 2026-07-01 |

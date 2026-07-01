@@ -99,7 +99,7 @@
 |-------------|-------|--------|
 | QLOAD-01 | Phase 1 | Complete |
 | QLOAD-02 | Phase 1 | Complete |
-| QLOAD-03 | Phase 1 + Phase 10 | Pending (multi-arch Marlin) |
+| QLOAD-03 | Phase 1 + Phase 10 | Complete |
 | MLOAD-01 | Phase 1 | Complete |
 | MLOAD-02 | Phase 1 | Complete |
 | MLOAD-03 | Phase 5 | Complete |
