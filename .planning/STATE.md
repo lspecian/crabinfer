@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 09-01-PLAN.md (cache-salt engine bridge — register_completed_blocks + engine_loop wiring)
-last_updated: "2026-07-01T21:15:58.903Z"
+stopped_at: Completed 09-02-PLAN.md (cache-salt WorkerPool routing — thread cache_salt through compute_prompt_hashes/best_prefix_worker/submit)
+last_updated: "2026-07-01T21:24:50.320Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 12
-  completed_phases: 10
+  completed_phases: 11
   total_plans: 32
-  completed_plans: 34
+  completed_plans: 35
   percent: 25
 ---
 
@@ -70,6 +70,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 07-server-wiring-last-mile P03 | 3min | 2 tasks | 4 files |
 | Phase 08-fused-kernel-coverage P01 | 9min | 3 tasks | 4 files |
 | Phase 09-cache-salt-engine-bridge P01 | 20min | 3 tasks | 2 files |
+| Phase 09-cache-salt-engine-bridge P02 | 5min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -121,6 +122,9 @@ Recent decisions affecting current work:
 - [Phase 09-cache-salt-engine-bridge]: Task 3 gating approach (b): internal decode-phase early return inside register_completed_blocks keeps engine_loop call unconditional and minimal
 - [Phase 09-cache-salt-engine-bridge]: seq.block_hashes (Sequence field) is the target for PCCH-01, not seq.blocks.block_hashes (SequenceBlocks) — dual-field trap avoided
 - [Phase 09-cache-salt-engine-bridge]: BlockHash::from_tokens_salted is the only hashing call in register_completed_blocks; None salt preserves backward compat via block.rs:55
+- [Phase 09-cache-salt-engine-bridge]: compute_prompt_hashes and best_prefix_worker accept Option<&str> salt; None preserves pre-PCCH-02 behavior
+- [Phase 09-cache-salt-engine-bridge]: submit() extracts sampling_params.cache_salt.as_deref() at CacheAware branch only; RoundRobin path unchanged
+- [Phase 09-cache-salt-engine-bridge]: PCCH-01 (storage) and PCCH-02 (routing) use same from_tokens_salted with same cache_salt — both hash domains align
 
 ### Pending Todos
 
@@ -140,6 +144,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-01T21:15:58.899Z
-Stopped at: Completed 09-01-PLAN.md (cache-salt engine bridge — register_completed_blocks + engine_loop wiring)
+Last session: 2026-07-01T21:24:50.318Z
+Stopped at: Completed 09-02-PLAN.md (cache-salt WorkerPool routing — thread cache_salt through compute_prompt_hashes/best_prefix_worker/submit)
 Resume file: None
