@@ -9,7 +9,7 @@
 
 - [x] **QLOAD-01**: Server loads GPTQ models from HuggingFace format (reads `quantize_config.json`, loads packed INT4 qweight/qzeros/scales from safetensors)
 - [x] **QLOAD-02**: Server loads AWQ models from AutoAWQ HuggingFace format (reads `quantize_config.json`, reuses GPTQ INT4 infrastructure)
-- [x] **QLOAD-03**: Marlin-style fused dequant+GEMM CUDA kernel for GPTQ/AWQ (target 1.5-2x speedup over naive dequant→matmul)
+- [ ] **QLOAD-03**: Marlin-style fused dequant+GEMM CUDA kernel for GPTQ/AWQ (target 1.5-2x speedup over naive dequant→matmul)
 
 ### Model Loading
 
@@ -99,7 +99,7 @@
 |-------------|-------|--------|
 | QLOAD-01 | Phase 1 | Complete |
 | QLOAD-02 | Phase 1 | Complete |
-| QLOAD-03 | Phase 1 | Complete |
+| QLOAD-03 | Phase 1 + Phase 10 | Pending (multi-arch Marlin) |
 | MLOAD-01 | Phase 1 | Complete |
 | MLOAD-02 | Phase 1 | Complete |
 | MLOAD-03 | Phase 5 | Complete |
@@ -119,8 +119,8 @@
 | WORK-03 | Phase 5 | Complete |
 | CONF-01 | Phase 4 | Complete |
 | CONF-02 | Phase 4 | Complete |
-| PCCH-01 | Phase 4 | Complete |
-| PCCH-02 | Phase 4 | Complete |
+| PCCH-01 | Phase 4 + Phase 7 + Phase 9 | Pending (engine bridge) |
+| PCCH-02 | Phase 4 + Phase 9 | Pending (consequence of PCCH-01) |
 | EMBD-01 | Phase 4 | Complete |
 | EMBD-02 | Phase 6 | Complete |
 | EMBD-03 | Phase 4 | Complete |
@@ -129,8 +129,8 @@
 - v1 requirements: 27 total
 - Mapped to phases: 27
 - Complete: 24
-- Pending (gap closure): 3 (MLOAD-03, WORK-03, EMBD-02)
+- Pending (gap closure): 3 (QLOAD-03 partial, PCCH-01 unsatisfied, PCCH-02 partial — addressed by Phases 9-10)
 
 ---
 *Requirements defined: 2026-03-12*
-*Last updated: 2026-04-04 — gap closure phases 5-6 added for 3 remaining requirements*
+*Last updated: 2026-06-20 — gap closure phases 9-10 added after third milestone audit surfaced PCCH-01 engine-bridge gap and QLOAD-03 multi-architecture Marlin gap*

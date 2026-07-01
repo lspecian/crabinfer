@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 08-01-PLAN.md (fused kernel coverage — DeepSeek/Mistral/Phi3 forward_linear_fused)
-last_updated: "2026-04-18T08:16:46.467Z"
+stopped_at: Completed 09-01-PLAN.md (cache-salt engine bridge — register_completed_blocks + engine_loop wiring)
+last_updated: "2026-07-01T21:15:58.903Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
-  total_phases: 10
+  total_phases: 12
   completed_phases: 10
-  total_plans: 30
-  completed_plans: 33
+  total_plans: 32
+  completed_plans: 34
   percent: 25
 ---
 
@@ -69,6 +69,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 07-server-wiring-last-mile P02 | 4min | 2 tasks | 4 files |
 | Phase 07-server-wiring-last-mile P03 | 3min | 2 tasks | 4 files |
 | Phase 08-fused-kernel-coverage P01 | 9min | 3 tasks | 4 files |
+| Phase 09-cache-salt-engine-bridge P01 | 20min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -117,6 +118,9 @@ Recent decisions affecting current work:
 - [Phase 07-server-wiring-last-mile]: 503 returned for /v1/completions when serving engine missing — no legacy fallback; logprobs serializes as null (not omitted) per OpenAI client expectations
 - [Phase 08-fused-kernel-coverage]: No per-model #[cfg(feature = 'cuda')] guards — KernelBackend trait handles dispatch internally
 - [Phase 08-fused-kernel-coverage]: Quantized lm_head handled automatically by forward_linear_fused None-branch (no caller changes)
+- [Phase 09-cache-salt-engine-bridge]: Task 3 gating approach (b): internal decode-phase early return inside register_completed_blocks keeps engine_loop call unconditional and minimal
+- [Phase 09-cache-salt-engine-bridge]: seq.block_hashes (Sequence field) is the target for PCCH-01, not seq.blocks.block_hashes (SequenceBlocks) — dual-field trap avoided
+- [Phase 09-cache-salt-engine-bridge]: BlockHash::from_tokens_salted is the only hashing call in register_completed_blocks; None salt preserves backward compat via block.rs:55
 
 ### Pending Todos
 
@@ -136,6 +140,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-18T08:16:46.465Z
-Stopped at: Completed 08-01-PLAN.md (fused kernel coverage — DeepSeek/Mistral/Phi3 forward_linear_fused)
+Last session: 2026-07-01T21:15:58.899Z
+Stopped at: Completed 09-01-PLAN.md (cache-salt engine bridge — register_completed_blocks + engine_loop wiring)
 Resume file: None

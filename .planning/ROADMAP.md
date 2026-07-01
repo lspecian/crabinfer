@@ -22,6 +22,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 6: Embedding Model Loader** - BERT/encoder model support for dedicated embedding models (completed 2026-04-04)
 - [ ] **Phase 7: Server Wiring Last-Mile** - Wire CacheAware routing, cache_salt, batch tokenization, and /v1/completions through to API surface (gap closure)
 - [ ] **Phase 8: Fused Kernel Coverage** - Wire fused LayerNorm+linear into DeepSeek/Mistral/Phi3 final layers (gap closure)
+- [ ] **Phase 9: Cache Salt Engine Bridge** - Wire SamplingParams.cache_salt into BlockHash computation so tenant isolation actually works (gap closure)
+- [ ] **Phase 10: Multi-Architecture Marlin Activation** - Call activate_marlin in Phi3/Mistral/DeepSeek loader branches (gap closure)
 
 ## Phase Details
 
@@ -179,6 +181,34 @@ Plans:
 Plans:
 - [ ] 08-01-PLAN.md — Port forward_linear_fused into DeepSeek/Mistral/Phi3 final norm+lm_head step with per-model parity tests
 
+### Phase 9: Cache Salt Engine Bridge
+**Goal**: Wire `SamplingParams.cache_salt` into the engine's post-prefill block-hash computation so that submitting `"cache_salt": "tenant-foo"` actually isolates KV cache blocks at the storage layer (not just at the API surface). Phase 7 propagated the field to `SamplingParams`; Phase 9 makes it have an effect.
+**Depends on**: Phase 4, Phase 7
+**Requirements**: PCCH-01, PCCH-02
+**Gap Closure**: Closes PCCH-01 (unsatisfied) and PCCH-02 (partial) gaps from 2026-06-20 milestone audit
+**Success Criteria** (what must be TRUE):
+  1. After a sequence completes its prefill, `seq.block_hashes` is populated with `BlockHash` values computed via `BlockHash::from_tokens_salted(tokens, prev_hash, sampling_params.cache_salt.as_deref())`
+  2. Two requests with the same prompt but different `cache_salt` values do NOT share KV cache blocks — `kv_cache::lookup_blocks` returns disjoint block IDs
+  3. Two requests with the same prompt and the same `cache_salt` DO share KV cache blocks — prefix cache hit rate matches the unsalted baseline
+  4. `WorkerPool::CacheAware` routing now operates on salted hashes — different-salt requests route independently of prefix overlap
+**Plans:** 1/2 plans executed
+
+Plans:
+- [ ] 09-01-PLAN.md — Add Scheduler::register_completed_blocks (salted) and wire into engine_loop post-step (PCCH-01)
+- [ ] 09-02-PLAN.md — Thread cache_salt through WorkerPool::compute_prompt_hashes / best_prefix_worker / submit (PCCH-02)
+
+### Phase 10: Multi-Architecture Marlin Activation
+**Goal**: Call `activate_marlin` for GPTQ/AWQ models loaded as Phi3, Mistral, or DeepSeekV2 architectures on CUDA, so all four supported quantized architectures benefit from the Marlin tiled kernel — not just Llama and Qwen.
+**Depends on**: Phase 1
+**Requirements**: QLOAD-03
+**Gap Closure**: Closes QLOAD-03 partial gap from 2026-06-20 milestone audit
+**Success Criteria** (what must be TRUE):
+  1. Loading a GPTQ or AWQ Phi3 model on CUDA triggers `Phi3Model::activate_marlin(backend)` and the model's linear layers report Marlin-tiled weights
+  2. Same behavior for Mistral and DeepSeekV2 architectures
+  3. CPU/Metal devices skip activation (existing `if device.is_cuda()` guard)
+  4. Llama and Qwen paths remain unchanged
+**Plans:** 0 plans
+
 ## Progress
 
 **Execution Order:**
@@ -194,5 +224,7 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -
 | 4. Production Infrastructure | 4/4 | Complete | 2026-04-04 |
 | 5. Wiring Fixes | 2/2 | Complete | 2026-04-04 |
 | 6. Embedding Model Loader | 2/2 | Complete | 2026-04-04 |
-| 7. Server Wiring Last-Mile | 0/4 | Planned | - |
-| 8. Fused Kernel Coverage | 0/1 | Planned | - |
+| 7. Server Wiring Last-Mile | 4/4 | Complete | 2026-04-18 |
+| 8. Fused Kernel Coverage | 1/1 | Complete | 2026-06-20 |
+| 9. Cache Salt Engine Bridge | 1/2 | In Progress|  |
+| 10. Multi-Architecture Marlin Activation | 0/0 | Planned | - |
