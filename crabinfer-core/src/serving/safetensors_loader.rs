@@ -1025,13 +1025,26 @@ pub fn load_model_from_safetensors_with_backend(
                 serde_json::from_str(&config_text).map_err(|e| {
                     candle_core::Error::Msg(format!("Failed to parse Phi-3 config: {e}"))
                 })?;
-            let model = super::models::phi3::SafetensorsPhi3Model::from_safetensors(
+            let mut model = super::models::phi3::SafetensorsPhi3Model::from_safetensors(
                 &phi3_config,
                 &weights,
                 device,
                 effective_quantization,
                 weight_dtype,
             )?;
+
+            // Activate Marlin fused kernels for GPTQ/AWQ layers on CUDA
+            if device.is_cuda() {
+                if let Some(ref backend) = kernel_backend {
+                    let marlin_count = model.activate_marlin(backend)?;
+                    if marlin_count > 0 {
+                        tracing::info!(
+                            "Activated Marlin fused kernel for {marlin_count} quantized layers"
+                        );
+                    }
+                }
+            }
+
             return Ok(Box::new(model));
         }
         ModelArchitecture::Mistral => {
@@ -1039,13 +1052,26 @@ pub fn load_model_from_safetensors_with_backend(
                 serde_json::from_str(&config_text).map_err(|e| {
                     candle_core::Error::Msg(format!("Failed to parse Mistral config: {e}"))
                 })?;
-            let model = super::models::mistral::SafetensorsMistralModel::from_safetensors(
+            let mut model = super::models::mistral::SafetensorsMistralModel::from_safetensors(
                 &mistral_config,
                 &weights,
                 device,
                 effective_quantization,
                 weight_dtype,
             )?;
+
+            // Activate Marlin fused kernels for GPTQ/AWQ layers on CUDA
+            if device.is_cuda() {
+                if let Some(ref backend) = kernel_backend {
+                    let marlin_count = model.activate_marlin(backend)?;
+                    if marlin_count > 0 {
+                        tracing::info!(
+                            "Activated Marlin fused kernel for {marlin_count} quantized layers"
+                        );
+                    }
+                }
+            }
+
             return Ok(Box::new(model));
         }
         ModelArchitecture::DeepSeekV2 => {
@@ -1053,13 +1079,26 @@ pub fn load_model_from_safetensors_with_backend(
                 serde_json::from_str(&config_text).map_err(|e| {
                     candle_core::Error::Msg(format!("Failed to parse DeepSeek config: {e}"))
                 })?;
-            let model = super::models::deepseek::SafetensorsDeepSeekModel::from_safetensors(
+            let mut model = super::models::deepseek::SafetensorsDeepSeekModel::from_safetensors(
                 &ds_config,
                 &weights,
                 device,
                 effective_quantization,
                 weight_dtype,
             )?;
+
+            // Activate Marlin fused kernels for GPTQ/AWQ layers on CUDA
+            if device.is_cuda() {
+                if let Some(ref backend) = kernel_backend {
+                    let marlin_count = model.activate_marlin(backend)?;
+                    if marlin_count > 0 {
+                        tracing::info!(
+                            "Activated Marlin fused kernel for {marlin_count} quantized layers"
+                        );
+                    }
+                }
+            }
+
             return Ok(Box::new(model));
         }
         ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 => {
