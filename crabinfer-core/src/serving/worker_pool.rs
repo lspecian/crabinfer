@@ -445,4 +445,47 @@ mod tests {
     fn test_empty_worker_pool_panics() {
         let _pool: WorkerPool = WorkerPool::new(vec![]);
     }
+
+    // --- Tests for salt-aware compute_prompt_hashes (PCCH-02) ---
+
+    #[test]
+    fn test_cache_aware_routing_with_salt() {
+        let pool = WorkerPool {
+            workers: vec![],
+            next_worker: AtomicUsize::new(0),
+            routing_policy: RoutingPolicy::RoundRobin,
+            block_size: 16,
+        };
+        let tokens: Vec<u32> = (0..32).collect();
+
+        // Scenario A — same tokens, different salt produces different hashes
+        let hashes_a = pool.compute_prompt_hashes(&tokens, Some("tenant-a"));
+        let hashes_b = pool.compute_prompt_hashes(&tokens, Some("tenant-b"));
+        let hashes_unsalted = pool.compute_prompt_hashes(&tokens, None);
+
+        assert_eq!(hashes_a.len(), 2);
+        assert_eq!(hashes_b.len(), 2);
+        // Block 0 differs because salt is mixed into block 0's initial state.
+        assert_ne!(hashes_a[0], hashes_b[0]);
+        assert_ne!(hashes_a[0], hashes_unsalted[0]);
+        // Block 1 also differs because the chain propagates the salted block 0 hash forward.
+        assert_ne!(hashes_a[1], hashes_b[1]);
+
+        // Scenario B — same tokens, same salt produces identical hashes (deterministic)
+        let hashes_a1 = pool.compute_prompt_hashes(&tokens, Some("tenant-a"));
+        let hashes_a2 = pool.compute_prompt_hashes(&tokens, Some("tenant-a"));
+        assert_eq!(hashes_a1, hashes_a2);
+
+        // Scenario C — backward compat: None salt matches the pre-PCCH-02 unsalted hashes
+        let unsalted_via_new = pool.compute_prompt_hashes(&tokens, None);
+        // Reproduce what the old unsalted impl did, inline:
+        let mut expected = Vec::new();
+        let mut prev: Option<BlockHash> = None;
+        for chunk in tokens.chunks(16) {
+            let h = BlockHash::from_tokens(chunk, prev);
+            expected.push(h);
+            prev = Some(h);
+        }
+        assert_eq!(unsalted_via_new, expected);
+    }
 }
