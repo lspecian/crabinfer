@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 09-02-PLAN.md (cache-salt WorkerPool routing — thread cache_salt through compute_prompt_hashes/best_prefix_worker/submit)
-last_updated: "2026-07-01T21:24:50.320Z"
+stopped_at: Completed 10-01-PLAN.md (multi-arch Marlin activation — SafetensorsPhi3Model, SafetensorsMistralModel, SafetensorsDeepSeekModel activate_marlin methods)
+last_updated: "2026-07-01T21:40:01.481Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 12
   completed_phases: 11
-  total_plans: 32
-  completed_plans: 35
+  total_plans: 34
+  completed_plans: 36
   percent: 25
 ---
 
@@ -71,6 +71,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 08-fused-kernel-coverage P01 | 9min | 3 tasks | 4 files |
 | Phase 09-cache-salt-engine-bridge P01 | 20min | 3 tasks | 2 files |
 | Phase 09-cache-salt-engine-bridge P02 | 5min | 2 tasks | 1 files |
+| Phase 10-multi-arch-marlin-activation P01 | 8min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -125,6 +126,7 @@ Recent decisions affecting current work:
 - [Phase 09-cache-salt-engine-bridge]: compute_prompt_hashes and best_prefix_worker accept Option<&str> salt; None preserves pre-PCCH-02 behavior
 - [Phase 09-cache-salt-engine-bridge]: submit() extracts sampling_params.cache_salt.as_deref() at CacheAware branch only; RoundRobin path unchanged
 - [Phase 09-cache-salt-engine-bridge]: PCCH-01 (storage) and PCCH-02 (routing) use same from_tokens_salted with same cache_salt — both hash domains align
+- [Phase 10-multi-arch-marlin-activation]: activate_marlin placed in per-model files (not safetensors_loader.rs) because DeepSeek MoeLayer fields and Phi3 qkv_proj are private to their modules
 
 ### Pending Todos
 
@@ -144,6 +146,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-01T21:24:50.318Z
-Stopped at: Completed 09-02-PLAN.md (cache-salt WorkerPool routing — thread cache_salt through compute_prompt_hashes/best_prefix_worker/submit)
+Last session: 2026-07-01T21:40:01.477Z
+Stopped at: Completed 10-01-PLAN.md (multi-arch Marlin activation — SafetensorsPhi3Model, SafetensorsMistralModel, SafetensorsDeepSeekModel activate_marlin methods)
 Resume file: None

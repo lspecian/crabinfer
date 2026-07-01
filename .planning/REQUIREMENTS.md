@@ -9,7 +9,7 @@
 
 - [x] **QLOAD-01**: Server loads GPTQ models from HuggingFace format (reads `quantize_config.json`, loads packed INT4 qweight/qzeros/scales from safetensors)
 - [x] **QLOAD-02**: Server loads AWQ models from AutoAWQ HuggingFace format (reads `quantize_config.json`, reuses GPTQ INT4 infrastructure)
-- [ ] **QLOAD-03**: Marlin-style fused dequant+GEMM CUDA kernel for GPTQ/AWQ (target 1.5-2x speedup over naive dequant→matmul)
+- [x] **QLOAD-03**: Marlin-style fused dequant+GEMM CUDA kernel for GPTQ/AWQ (target 1.5-2x speedup over naive dequant→matmul)
 
 ### Model Loading
 

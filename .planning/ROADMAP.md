@@ -207,7 +207,11 @@ Plans:
   2. Same behavior for Mistral and DeepSeekV2 architectures
   3. CPU/Metal devices skip activation (existing `if device.is_cuda()` guard)
   4. Llama and Qwen paths remain unchanged
-**Plans:** 0 plans
+**Plans:** 1/2 plans executed
+
+Plans:
+- [ ] 10-01-PLAN.md — Add activate_marlin methods (+ tests) to Phi3/Mistral/DeepSeek model files (QLOAD-03)
+- [ ] 10-02-PLAN.md — Wire activate_marlin calls into safetensors_loader.rs Phi3/Mistral/DeepSeekV2 branches (QLOAD-03)
 
 ## Progress
 
@@ -227,4 +231,4 @@ Phases execute in numeric order: 1 -> 1.1 -> 1.2 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -
 | 7. Server Wiring Last-Mile | 4/4 | Complete | 2026-04-18 |
 | 8. Fused Kernel Coverage | 1/1 | Complete | 2026-06-20 |
 | 9. Cache Salt Engine Bridge | 1/2 | In Progress|  |
-| 10. Multi-Architecture Marlin Activation | 0/0 | Planned | - |
+| 10. Multi-Architecture Marlin Activation | 1/2 | In Progress|  |
