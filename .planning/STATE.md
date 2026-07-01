@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: planning
 stopped_at: Completed 10-02-PLAN.md (multi-arch Marlin activation — loader wiring for Phi3/Mistral/DeepSeekV2)
-last_updated: "2026-07-01T21:43:29.330Z"
+last_updated: "2026-07-01T21:50:42.098Z"
 last_activity: 2026-03-12 — Roadmap created, phases derived from 27 v1 requirements
 progress:
   total_phases: 12
