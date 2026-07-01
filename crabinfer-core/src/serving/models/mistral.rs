@@ -13,9 +13,11 @@
 //! - Codestral
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 use candle_nn::Module;
+use crate::serving::kernels::KernelBackend;
 
 use super::attention::{precompute_rope, PagedAttentionLayer};
 use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
@@ -360,6 +362,67 @@ impl ModelRunner for SafetensorsMistralModel {
     }
 }
 
+// ─── activate_marlin ─────────────────────────────────────────────────────
+
+impl SafetensorsMistralModel {
+    /// Activate Marlin fused kernel for all GPTQ/AWQ layers.
+    /// Structurally identical to SafetensorsLlamaModel::activate_marlin
+    /// since MistralLayer has the same fields (attn_q/k/v/output + SwiGluMlp).
+    /// Returns the number of layers whose qweight_marlin was populated.
+    pub(crate) fn activate_marlin(&mut self, backend: &Arc<dyn KernelBackend>) -> Result<usize> {
+        let mut marlin_count = 0;
+
+        let mut process_linear = |linear: &mut MaybeQuantizedLinear| -> Result<()> {
+            match linear {
+                MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                    gptq.backend = Some(Arc::clone(backend));
+                    if gptq.reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                MaybeQuantizedLinear::Awq(ref mut awq) => {
+                    awq.inner_mut().backend = Some(Arc::clone(backend));
+                    if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+
+        for layer in &mut self.layers {
+            process_linear(&mut layer.attn_q)?;
+            process_linear(&mut layer.attn_k)?;
+            process_linear(&mut layer.attn_v)?;
+            process_linear(&mut layer.attn_output)?;
+            process_linear(&mut layer.mlp.gate)?;
+            process_linear(&mut layer.mlp.down)?;
+            process_linear(&mut layer.mlp.up)?;
+        }
+
+        // lm_head (same pattern as Llama)
+        let lm = &mut self.lm_head;
+        match lm {
+            MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                gptq.backend = Some(Arc::clone(backend));
+                if gptq.reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            MaybeQuantizedLinear::Awq(ref mut awq) => {
+                awq.inner_mut().backend = Some(Arc::clone(backend));
+                if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(marlin_count)
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -519,5 +582,219 @@ mod tests {
             "fused vs unfused max_diff={max_diff}"
         );
         assert_eq!(fused.dims(), &[4, out_features]);
+    }
+
+    // ─── activate_marlin tests ────────────────────────────────────────────
+
+    /// Minimal mock backend that reports name() == "cuda" so reformat_for_marlin
+    /// gets past its name check.
+    struct MockCudaBackend;
+
+    impl crate::serving::kernels::backend::KernelBackend for MockCudaBackend {
+        fn name(&self) -> &'static str {
+            "cuda"
+        }
+
+        fn paged_attention(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &crate::serving::kernels::backend::PagedAttentionConfig,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn reshape_and_cache(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn copy_blocks(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: usize,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn allocate_kv_caches(
+            &self, _: usize, _: usize, _: usize, _: usize,
+            _: candle_core::DType, _: &candle_core::Device,
+        ) -> candle_core::Result<(Vec<candle_core::Tensor>, Vec<candle_core::Tensor>)> {
+            Ok((vec![], vec![]))
+        }
+    }
+
+    /// Build an aligned GPTQ MaybeQuantizedLinear (dims must be multiples of N=64, K=128 for Marlin).
+    fn make_gptq(out: usize, in_: usize) -> MaybeQuantizedLinear {
+        let w = candle_core::Tensor::randn(0f32, 0.1, (out, in_), &candle_core::Device::Cpu).unwrap();
+        MaybeQuantizedLinear::Gptq(
+            crate::serving::quantization::GptqLinear::from_float(&w, None, 128).unwrap()
+        )
+    }
+
+    /// Build a dense (non-quantized) MaybeQuantizedLinear.
+    fn make_dense(out: usize, in_: usize) -> MaybeQuantizedLinear {
+        let w = candle_core::Tensor::randn(0f32, 0.1, (out, in_), &candle_core::Device::Cpu).unwrap();
+        let qmm = candle_core::quantized::QMatMul::Tensor(w);
+        MaybeQuantizedLinear::QMatMul(qmm)
+    }
+
+    /// Build a minimal single-layer SafetensorsMistralModel for testing with GPTQ layers.
+    fn make_test_mistral_model_gptq() -> SafetensorsMistralModel {
+        let dev = &candle_core::Device::Cpu;
+        let norm_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+        let norm = RmsNorm { weight: norm_w, eps: 1e-5 };
+
+        let rope_cos = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        let rope_sin = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        let attention = PagedAttentionLayer::with_rope(4, 4, 64, rope_cos, rope_sin);
+
+        let ffn_norm_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+        let ffn_norm = RmsNorm { weight: ffn_norm_w, eps: 1e-5 };
+
+        let layer = MistralLayer {
+            attn_norm: norm.clone(),
+            attn_q: make_gptq(128, 256),
+            attn_k: make_gptq(128, 256),
+            attn_v: make_gptq(128, 256),
+            attn_output: make_gptq(128, 256),
+            ffn_norm,
+            mlp: SwiGluMlp::new(make_gptq(128, 256), make_gptq(256, 128), make_gptq(128, 256)),
+            attention,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        let norm_final_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+
+        SafetensorsMistralModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: RmsNorm { weight: norm_final_w, eps: 1e-5 },
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 64,
+                max_seq_len: 64,
+            },
+            sliding_window: None,
+        }
+    }
+
+    /// Build a minimal single-layer SafetensorsMistralModel with all-Dense layers.
+    fn make_test_mistral_model_dense() -> SafetensorsMistralModel {
+        let dev = &candle_core::Device::Cpu;
+        let norm_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+        let norm = RmsNorm { weight: norm_w, eps: 1e-5 };
+
+        let rope_cos = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        let rope_sin = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        let attention = PagedAttentionLayer::with_rope(4, 4, 64, rope_cos, rope_sin);
+
+        let ffn_norm_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+        let ffn_norm = RmsNorm { weight: ffn_norm_w, eps: 1e-5 };
+
+        let layer = MistralLayer {
+            attn_norm: norm.clone(),
+            attn_q: make_dense(128, 256),
+            attn_k: make_dense(128, 256),
+            attn_v: make_dense(128, 256),
+            attn_output: make_dense(128, 256),
+            ffn_norm,
+            mlp: SwiGluMlp::new(make_dense(128, 256), make_dense(256, 128), make_dense(128, 256)),
+            attention,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        let norm_final_w = candle_core::Tensor::ones(256usize, candle_core::DType::F32, dev).unwrap();
+
+        SafetensorsMistralModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: RmsNorm { weight: norm_final_w, eps: 1e-5 },
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 64,
+                max_seq_len: 64,
+            },
+            sliding_window: None,
+        }
+    }
+
+    #[test]
+    fn test_mistral_activate_marlin_cpu_skips() {
+        let mut model = make_test_mistral_model_gptq();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(crate::serving::kernels::cpu_backend::CpuBackend::new());
+        let count = model.activate_marlin(&backend).unwrap();
+        // CPU backend skips reformat_for_marlin, so count == 0
+        assert_eq!(count, 0, "CPU backend should skip Marlin reformatting");
+        // But backend field IS set on GPTQ layers
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_q {
+            assert!(gptq.backend.is_some(), "backend should be set even when reformat skips");
+            assert!(gptq.qweight_marlin.is_none(), "qweight_marlin should remain None on CPU");
+        } else {
+            panic!("expected Gptq variant for attn_q");
+        }
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_k {
+            assert!(gptq.qweight_marlin.is_none(), "qweight_marlin should remain None for attn_k on CPU");
+        }
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_v {
+            assert!(gptq.qweight_marlin.is_none(), "qweight_marlin should remain None for attn_v on CPU");
+        }
+    }
+
+    #[test]
+    fn test_mistral_activate_marlin_cuda_populates() {
+        let mut model = make_test_mistral_model_gptq();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        // 1 layer × 7 GPTQ linears (attn_q/k/v/output + gate/down/up) = 7 layers reformatted
+        assert!(count > 0, "CUDA backend should reformat aligned GPTQ layers, got count={count}");
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_q {
+            assert!(gptq.backend.is_some(), "backend should be set");
+            assert!(gptq.qweight_marlin.is_some(), "qweight_marlin should be populated for attn_q on CUDA");
+        } else {
+            panic!("expected Gptq variant for attn_q");
+        }
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_k {
+            assert!(gptq.qweight_marlin.is_some(), "qweight_marlin should be populated for attn_k on CUDA");
+        }
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].attn_v {
+            assert!(gptq.qweight_marlin.is_some(), "qweight_marlin should be populated for attn_v on CUDA");
+        }
+    }
+
+    #[test]
+    fn test_mistral_activate_marlin_dense_noop() {
+        let mut model = make_test_mistral_model_dense();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        assert_eq!(count, 0, "Dense (non-GPTQ) layers should not be counted");
     }
 }
