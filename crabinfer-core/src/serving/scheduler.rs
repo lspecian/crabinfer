@@ -1403,4 +1403,195 @@ mod tests {
         // 1 block used out of 4
         assert!((sched.kv_cache_usage_ratio() - 0.25).abs() < 0.01);
     }
+
+    // PCCH-01: Cache-salt block hash registration tests
+
+    #[test]
+    fn test_cache_salt_isolation() {
+        // PCCH-01: Two sequences with identical prompts but different salts must
+        // produce disjoint block_hashes — no KV sharing across tenants.
+        use std::collections::HashSet;
+
+        let mut sched_a = test_scheduler(32);
+        let mut sched_b = test_scheduler(32);
+
+        // 32 tokens = 2 full blocks at block_size 16
+        let prompt: Vec<u32> = (0u32..32).collect();
+
+        let mut params_a = SamplingParams::default();
+        params_a.cache_salt = Some("tenant-a".into());
+
+        let mut params_b = SamplingParams::default();
+        params_b.cache_salt = Some("tenant-b".into());
+
+        let id_a = sched_a.add_request(prompt.clone(), params_a);
+        let id_b = sched_b.add_request(prompt.clone(), params_b);
+
+        // Prefill both sequences
+        sched_a.schedule();
+        sched_b.schedule();
+        sched_a.update_after_step(id_a, 32);
+        sched_b.update_after_step(id_b, 32);
+
+        // Register completed blocks for each
+        sched_a.register_completed_blocks(id_a);
+        sched_b.register_completed_blocks(id_b);
+
+        let hashes_a: Vec<_> = sched_a.get_sequence(id_a).unwrap().block_hashes.clone();
+        let hashes_b: Vec<_> = sched_b.get_sequence(id_b).unwrap().block_hashes.clone();
+
+        // Both should have 2 blocks registered
+        assert_eq!(hashes_a.len(), 2, "seq_a should have 2 block hashes");
+        assert_eq!(hashes_b.len(), 2, "seq_b should have 2 block hashes");
+
+        // No overlap between salted hash chains
+        let set_a: HashSet<_> = hashes_a.iter().copied().collect();
+        let set_b: HashSet<_> = hashes_b.iter().copied().collect();
+        assert!(
+            set_a.is_disjoint(&set_b),
+            "tenant-a and tenant-b hashes must not overlap: a={:?} b={:?}",
+            hashes_a,
+            hashes_b
+        );
+    }
+
+    #[test]
+    fn test_cache_salt_shared_hit() {
+        // PCCH-01: Same prompt + same salt → identical hashes → prefix cache hit.
+        let mut sched = test_scheduler(64);
+
+        let prompt: Vec<u32> = (0u32..32).collect();
+
+        let mut params_x = SamplingParams::default();
+        params_x.cache_salt = Some("tenant-x".into());
+
+        let id_a = sched.add_request(prompt.clone(), params_x.clone());
+        let id_b = sched.add_request(prompt.clone(), params_x);
+
+        // Schedule and complete prefill for seq A
+        sched.schedule();
+        sched.update_after_step(id_a, 32);
+        sched.register_completed_blocks(id_a);
+
+        // Schedule and complete prefill for seq B
+        sched.update_after_step(id_b, 0); // already scheduled in first call
+        sched.register_completed_blocks(id_b);
+
+        let hashes_a = sched.get_sequence(id_a).unwrap().block_hashes.clone();
+        let hashes_b = sched.get_sequence(id_b).unwrap().block_hashes.clone();
+
+        // Same prompt + same salt → identical hash chains
+        assert_eq!(
+            hashes_a, hashes_b,
+            "same salt + same prompt must produce identical block hashes"
+        );
+
+        // The KV cache should return a prefix hit for seq B's hashes
+        let (cached_blocks, _) = sched.kv_cache().get_computed_blocks(&hashes_b);
+        assert!(
+            !cached_blocks.is_empty(),
+            "get_computed_blocks should return a non-empty prefix for matching hashes"
+        );
+        assert_eq!(
+            cached_blocks.len(),
+            hashes_b.len(),
+            "all blocks should be cached (full prefix hit)"
+        );
+    }
+
+    #[test]
+    fn test_cache_no_salt_backward_compat() {
+        // PCCH-01: cache_salt = None → same hashes as the unsalted BlockHash::from_tokens helper.
+        use super::super::block::BlockHash;
+
+        let mut sched = test_scheduler(32);
+
+        // 32 tokens = 2 full blocks at block_size 16
+        let prompt: Vec<u32> = (100u32..132).collect();
+
+        let id = sched.add_request(prompt.clone(), SamplingParams::default()); // cache_salt = None
+
+        sched.schedule();
+        sched.update_after_step(id, 32);
+        sched.register_completed_blocks(id);
+
+        // Compute expected hashes inline using the unsalted helper
+        let block_size = 16;
+        let hash0 = BlockHash::from_tokens(&prompt[..block_size], None);
+        let hash1 = BlockHash::from_tokens(&prompt[block_size..2 * block_size], Some(hash0));
+        let expected = vec![hash0, hash1];
+
+        let actual = sched.get_sequence(id).unwrap().block_hashes.clone();
+        assert_eq!(
+            actual, expected,
+            "no-salt register_completed_blocks must match BlockHash::from_tokens chain"
+        );
+    }
+
+    #[test]
+    fn test_register_completed_blocks_chunked() {
+        // PCCH-01: Chunked prefill across 3 calls → 3 distinct blocks, no duplicates,
+        // and the hash chain is correct.
+        use super::super::block::BlockHash;
+        use std::collections::HashSet;
+
+        let mut sched = test_scheduler(32);
+
+        // 48 tokens = 3 full blocks at block_size 16
+        let prompt: Vec<u32> = (0u32..48).collect();
+
+        let id = sched.add_request(prompt.clone(), SamplingParams::default());
+
+        // Schedule initial batch
+        sched.schedule();
+
+        // Chunk 1: 16 tokens computed
+        sched.update_after_step(id, 16);
+        sched.register_completed_blocks(id);
+        assert_eq!(
+            sched.get_sequence(id).unwrap().block_hashes.len(),
+            1,
+            "after 16 tokens, exactly 1 block should be registered"
+        );
+
+        // Chunk 2: 16 more tokens computed (total 32)
+        sched.update_after_step(id, 16);
+        sched.register_completed_blocks(id);
+        assert_eq!(
+            sched.get_sequence(id).unwrap().block_hashes.len(),
+            2,
+            "after 32 tokens, exactly 2 blocks should be registered"
+        );
+
+        // Chunk 3: final 16 tokens computed (total 48)
+        sched.update_after_step(id, 16);
+        sched.register_completed_blocks(id);
+        assert_eq!(
+            sched.get_sequence(id).unwrap().block_hashes.len(),
+            3,
+            "after 48 tokens, exactly 3 blocks should be registered"
+        );
+
+        let hashes = sched.get_sequence(id).unwrap().block_hashes.clone();
+
+        // No duplicates
+        let unique: HashSet<_> = hashes.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "all 3 block hashes must be distinct (no duplicates)"
+        );
+
+        // Verify chain: hash[1] must depend on hash[0] via from_tokens_salted
+        let block_size = 16;
+        let expected_hash1 = BlockHash::from_tokens_salted(
+            &prompt[block_size..2 * block_size],
+            Some(hashes[0]),
+            None, // cache_salt = None
+        );
+        assert_eq!(
+            hashes[1], expected_hash1,
+            "hash[1] must be computed from tokens[16..32] chained on hash[0]"
+        );
+    }
 }
