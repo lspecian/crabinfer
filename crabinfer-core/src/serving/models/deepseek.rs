@@ -17,9 +17,11 @@
 //! - DeepSeek-V3, DeepSeek-R1
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 use candle_nn::Module;
+use crate::serving::kernels::KernelBackend;
 
 use super::attention::{precompute_rope, PagedAttentionLayer};
 use super::{ForwardContext, ModelConfig, ModelRunner, RmsNorm, SwiGluMlp};
@@ -824,6 +826,92 @@ impl ModelRunner for SafetensorsDeepSeekModel {
     }
 }
 
+// ─── activate_marlin ─────────────────────────────────────────────────────
+
+impl SafetensorsDeepSeekModel {
+    /// Activate Marlin fused kernel for all GPTQ/AWQ layers.
+    /// DeepSeek has MLA attention (optional q_a_proj, q_b_proj, kv_a_proj, kv_b_proj)
+    /// and either Dense or MoE MLP. MoE has a router gate + Vec<SwiGluMlp> experts
+    /// + optional shared_expert.
+    /// Returns the number of layers whose qweight_marlin was populated.
+    pub(crate) fn activate_marlin(&mut self, backend: &Arc<dyn KernelBackend>) -> Result<usize> {
+        let mut marlin_count = 0;
+
+        let mut process_linear = |linear: &mut MaybeQuantizedLinear| -> Result<()> {
+            match linear {
+                MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                    gptq.backend = Some(Arc::clone(backend));
+                    if gptq.reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                MaybeQuantizedLinear::Awq(ref mut awq) => {
+                    awq.inner_mut().backend = Some(Arc::clone(backend));
+                    if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                        marlin_count += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+
+        for layer in &mut self.layers {
+            // MLA Q path — q_a_proj is Option<MaybeQuantizedLinear>
+            if let Some(ref mut q_a) = layer.q_a_proj {
+                process_linear(q_a)?;
+            }
+            process_linear(&mut layer.q_b_proj)?;
+            // MLA KV path
+            process_linear(&mut layer.kv_a_proj)?;
+            process_linear(&mut layer.kv_b_proj)?;
+            // Output projection
+            process_linear(&mut layer.attn_output)?;
+            // MLP: Dense or MoE
+            match &mut layer.mlp {
+                DeepSeekMlp::Dense(mlp) => {
+                    process_linear(&mut mlp.gate)?;
+                    process_linear(&mut mlp.down)?;
+                    process_linear(&mut mlp.up)?;
+                }
+                DeepSeekMlp::Moe(moe) => {
+                    process_linear(&mut moe.gate)?;
+                    for expert in &mut moe.experts {
+                        process_linear(&mut expert.gate)?;
+                        process_linear(&mut expert.down)?;
+                        process_linear(&mut expert.up)?;
+                    }
+                    if let Some(ref mut shared) = moe.shared_expert {
+                        process_linear(&mut shared.gate)?;
+                        process_linear(&mut shared.down)?;
+                        process_linear(&mut shared.up)?;
+                    }
+                }
+            }
+        }
+
+        // lm_head (same pattern as Llama)
+        let lm = &mut self.lm_head;
+        match lm {
+            MaybeQuantizedLinear::Gptq(ref mut gptq) => {
+                gptq.backend = Some(Arc::clone(backend));
+                if gptq.reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            MaybeQuantizedLinear::Awq(ref mut awq) => {
+                awq.inner_mut().backend = Some(Arc::clone(backend));
+                if awq.inner_mut().reformat_for_marlin(backend.as_ref())? {
+                    marlin_count += 1;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(marlin_count)
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1066,5 +1154,363 @@ mod tests {
             "fused vs unfused max_diff={max_diff}"
         );
         assert_eq!(fused.dims(), &[4, out_features]);
+    }
+
+    // ─── activate_marlin tests ────────────────────────────────────────────
+
+    /// Minimal mock backend that reports name() == "cuda" so reformat_for_marlin
+    /// gets past its name check.
+    struct MockCudaBackend;
+
+    impl crate::serving::kernels::backend::KernelBackend for MockCudaBackend {
+        fn name(&self) -> &'static str {
+            "cuda"
+        }
+
+        fn paged_attention(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &crate::serving::kernels::backend::PagedAttentionConfig,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn reshape_and_cache(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: &candle_core::Tensor, _: &candle_core::Tensor,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn copy_blocks(
+            &self, _: &candle_core::Tensor, _: &candle_core::Tensor,
+            _: &candle_core::Tensor, _: usize,
+        ) -> candle_core::Result<()> {
+            Ok(())
+        }
+
+        fn allocate_kv_caches(
+            &self, _: usize, _: usize, _: usize, _: usize,
+            _: candle_core::DType, _: &candle_core::Device,
+        ) -> candle_core::Result<(Vec<candle_core::Tensor>, Vec<candle_core::Tensor>)> {
+            Ok((vec![], vec![]))
+        }
+    }
+
+    /// Build an aligned GPTQ MaybeQuantizedLinear (N=128 multiple of 64, K=256 multiple of 128).
+    fn make_gptq(out: usize, in_: usize) -> MaybeQuantizedLinear {
+        let w = candle_core::Tensor::randn(0f32, 0.1, (out, in_), &candle_core::Device::Cpu).unwrap();
+        MaybeQuantizedLinear::Gptq(
+            crate::serving::quantization::GptqLinear::from_float(&w, None, 128).unwrap()
+        )
+    }
+
+    /// Build a dense (non-quantized) MaybeQuantizedLinear.
+    fn make_dense(out: usize, in_: usize) -> MaybeQuantizedLinear {
+        let w = candle_core::Tensor::randn(0f32, 0.1, (out, in_), &candle_core::Device::Cpu).unwrap();
+        MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(w))
+    }
+
+    fn make_rms_norm(size: usize) -> RmsNorm {
+        let dev = &candle_core::Device::Cpu;
+        let w = candle_core::Tensor::ones(size, candle_core::DType::F32, dev).unwrap();
+        RmsNorm { weight: w, eps: 1e-5 }
+    }
+
+    fn make_attention() -> PagedAttentionLayer {
+        let dev = &candle_core::Device::Cpu;
+        let rope_cos = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        let rope_sin = candle_core::Tensor::zeros((64, 64), candle_core::DType::F32, dev).unwrap();
+        PagedAttentionLayer::with_rope(4, 4, 64, rope_cos, rope_sin)
+    }
+
+    /// Build a minimal SafetensorsDeepSeekModel with Dense MLP and no q_a_proj.
+    fn make_test_deepseek_model_dense_gptq() -> SafetensorsDeepSeekModel {
+        let dev = &candle_core::Device::Cpu;
+
+        let layer = MlaLayer {
+            attn_norm: make_rms_norm(256),
+            q_a_proj: None,
+            q_a_norm: None,
+            q_b_proj: make_gptq(128, 256),
+            kv_a_proj: make_gptq(128, 256),
+            kv_a_norm: make_rms_norm(128),
+            kv_b_proj: make_gptq(128, 256),
+            attn_output: make_gptq(128, 256),
+            ffn_norm: make_rms_norm(256),
+            mlp: DeepSeekMlp::Dense(SwiGluMlp::new(
+                make_gptq(128, 256),
+                make_gptq(256, 128),
+                make_gptq(128, 256),
+            )),
+            attention: make_attention(),
+            num_heads: 4,
+            qk_nope_head_dim: 32,
+            qk_rope_head_dim: 32,
+            kv_lora_rank: 64,
+            v_head_dim: 64,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        SafetensorsDeepSeekModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: make_rms_norm(256),
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 32,
+                max_seq_len: 64,
+            },
+        }
+    }
+
+    /// Build a model with q_a_proj present.
+    fn make_test_deepseek_model_with_q_a() -> SafetensorsDeepSeekModel {
+        let dev = &candle_core::Device::Cpu;
+
+        let layer = MlaLayer {
+            attn_norm: make_rms_norm(256),
+            q_a_proj: Some(make_gptq(128, 256)),
+            q_a_norm: Some(make_rms_norm(128)),
+            q_b_proj: make_gptq(128, 256),
+            kv_a_proj: make_gptq(128, 256),
+            kv_a_norm: make_rms_norm(128),
+            kv_b_proj: make_gptq(128, 256),
+            attn_output: make_gptq(128, 256),
+            ffn_norm: make_rms_norm(256),
+            mlp: DeepSeekMlp::Dense(SwiGluMlp::new(
+                make_gptq(128, 256),
+                make_gptq(256, 128),
+                make_gptq(128, 256),
+            )),
+            attention: make_attention(),
+            num_heads: 4,
+            qk_nope_head_dim: 32,
+            qk_rope_head_dim: 32,
+            kv_lora_rank: 64,
+            v_head_dim: 64,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        SafetensorsDeepSeekModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: make_rms_norm(256),
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 32,
+                max_seq_len: 64,
+            },
+        }
+    }
+
+    /// Build a model with MoE MLP (4 routed experts + 1 shared).
+    fn make_test_deepseek_model_moe() -> SafetensorsDeepSeekModel {
+        let dev = &candle_core::Device::Cpu;
+        let n_experts = 4;
+
+        let experts = (0..n_experts).map(|_| SwiGluMlp::new(
+            make_gptq(128, 256),
+            make_gptq(256, 128),
+            make_gptq(128, 256),
+        )).collect();
+
+        let moe = MoeLayer {
+            gate: make_gptq(64, 256), // router: n_experts=64 would be too big; use smaller for test
+            experts,
+            shared_expert: Some(SwiGluMlp::new(
+                make_gptq(128, 256),
+                make_gptq(256, 128),
+                make_gptq(128, 256),
+            )),
+            num_experts_per_tok: 2,
+        };
+
+        let layer = MlaLayer {
+            attn_norm: make_rms_norm(256),
+            q_a_proj: None,
+            q_a_norm: None,
+            q_b_proj: make_gptq(128, 256),
+            kv_a_proj: make_gptq(128, 256),
+            kv_a_norm: make_rms_norm(128),
+            kv_b_proj: make_gptq(128, 256),
+            attn_output: make_gptq(128, 256),
+            ffn_norm: make_rms_norm(256),
+            mlp: DeepSeekMlp::Moe(moe),
+            attention: make_attention(),
+            num_heads: 4,
+            qk_nope_head_dim: 32,
+            qk_rope_head_dim: 32,
+            kv_lora_rank: 64,
+            v_head_dim: 64,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        SafetensorsDeepSeekModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: make_rms_norm(256),
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 32,
+                max_seq_len: 64,
+            },
+        }
+    }
+
+    /// Build a model with all-Dense (non-quantized) layers.
+    fn make_test_deepseek_model_all_dense() -> SafetensorsDeepSeekModel {
+        let dev = &candle_core::Device::Cpu;
+
+        let layer = MlaLayer {
+            attn_norm: make_rms_norm(256),
+            q_a_proj: None,
+            q_a_norm: None,
+            q_b_proj: make_dense(128, 256),
+            kv_a_proj: make_dense(128, 256),
+            kv_a_norm: make_rms_norm(128),
+            kv_b_proj: make_dense(128, 256),
+            attn_output: make_dense(128, 256),
+            ffn_norm: make_rms_norm(256),
+            mlp: DeepSeekMlp::Dense(SwiGluMlp::new(
+                make_dense(128, 256),
+                make_dense(256, 128),
+                make_dense(128, 256),
+            )),
+            attention: make_attention(),
+            num_heads: 4,
+            qk_nope_head_dim: 32,
+            qk_rope_head_dim: 32,
+            kv_lora_rank: 64,
+            v_head_dim: 64,
+        };
+
+        let embed_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head_w = candle_core::Tensor::zeros((100, 256), candle_core::DType::F32, dev).unwrap();
+        let lm_head = MaybeQuantizedLinear::QMatMul(candle_core::quantized::QMatMul::Tensor(lm_head_w));
+
+        SafetensorsDeepSeekModel {
+            embed_table: embed_w,
+            layers: vec![layer],
+            norm: make_rms_norm(256),
+            lm_head,
+            config: ModelConfig {
+                hidden_size: 256,
+                intermediate_size: 128,
+                num_heads: 4,
+                num_kv_heads: 4,
+                num_layers: 1,
+                head_size: 64,
+                vocab_size: 100,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                rope_dim: 32,
+                max_seq_len: 64,
+            },
+        }
+    }
+
+    #[test]
+    fn test_deepseek_activate_marlin_cuda_dense_mlp() {
+        // q_a_proj=None, Dense MLP, 4 MLA + 3 mlp = 7 GPTQ linears
+        let mut model = make_test_deepseek_model_dense_gptq();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        // q_b_proj + kv_a_proj + kv_b_proj + attn_output + gate + down + up = 7
+        assert_eq!(count, 7, "expected 7 GPTQ layers reformatted (dense MLP, no q_a_proj), got {count}");
+        // Verify q_b_proj is reformatted
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].q_b_proj {
+            assert!(gptq.qweight_marlin.is_some(), "q_b_proj should be reformatted");
+        }
+    }
+
+    #[test]
+    fn test_deepseek_activate_marlin_cuda_dense_with_q_a() {
+        // q_a_proj=Some, Dense MLP, 5 MLA + 3 mlp = 8 GPTQ linears
+        let mut model = make_test_deepseek_model_with_q_a();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        // q_a_proj + q_b_proj + kv_a_proj + kv_b_proj + attn_output + gate + down + up = 8
+        assert_eq!(count, 8, "expected 8 GPTQ layers reformatted (dense MLP + q_a_proj), got {count}");
+        if let Some(MaybeQuantizedLinear::Gptq(ref gptq)) = model.layers[0].q_a_proj {
+            assert!(gptq.qweight_marlin.is_some(), "q_a_proj should be reformatted");
+        } else {
+            panic!("q_a_proj should be Some(Gptq)");
+        }
+    }
+
+    #[test]
+    fn test_deepseek_activate_marlin_cuda_moe() {
+        // No q_a_proj, MoE MLP: 4 attn + 1 moe.gate + 4*3 experts + 3 shared = 20 GPTQ linears
+        let mut model = make_test_deepseek_model_moe();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        // q_b_proj(1) + kv_a_proj(1) + kv_b_proj(1) + attn_output(1) = 4 attn
+        // moe.gate(1) + 4 experts * 3 = 12 + shared 3 = 16 mlp
+        // total = 20
+        // Note: moe.gate has out=64, K=256 — 64 is a multiple of 64, 256 multiple of 128, so it reformats
+        assert_eq!(count, 20, "expected 20 GPTQ layers reformatted (MoE with 4 experts + shared), got {count}");
+    }
+
+    #[test]
+    fn test_deepseek_activate_marlin_cpu_skips() {
+        let mut model = make_test_deepseek_model_dense_gptq();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(crate::serving::kernels::cpu_backend::CpuBackend::new());
+        let count = model.activate_marlin(&backend).unwrap();
+        assert_eq!(count, 0, "CPU backend should skip Marlin reformatting");
+        // Backend field IS set on GPTQ layers even when reformat skips
+        if let MaybeQuantizedLinear::Gptq(ref gptq) = model.layers[0].q_b_proj {
+            assert!(gptq.backend.is_some(), "backend should be set even when reformat skips");
+            assert!(gptq.qweight_marlin.is_none(), "qweight_marlin should remain None on CPU");
+        }
+    }
+
+    #[test]
+    fn test_deepseek_activate_marlin_dense_noop() {
+        let mut model = make_test_deepseek_model_all_dense();
+        let backend: std::sync::Arc<dyn crate::serving::kernels::backend::KernelBackend> =
+            std::sync::Arc::new(MockCudaBackend);
+        let count = model.activate_marlin(&backend).unwrap();
+        assert_eq!(count, 0, "Dense (non-GPTQ) layers should not be counted");
     }
 }
