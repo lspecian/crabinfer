@@ -662,6 +662,14 @@ impl Scheduler {
             };
             let num_computed = seq.blocks.num_computed_tokens;
             let already_registered = seq.block_hashes.len();
+            // During pure decode steps, all full prompt blocks are already registered.
+            // Skip cheaply to avoid per-token hashmap scans. A block is complete when
+            // block_end <= num_computed, so "all registerable blocks done" means
+            // already_registered >= floor(min(num_computed, prompt_len) / block_size).
+            let max_registerable = seq.prompt_tokens.len().min(num_computed) / block_size;
+            if already_registered >= max_registerable {
+                return;
+            }
             let prev_hash = seq.block_hashes.last().copied();
             (
                 seq.prompt_tokens.clone(),

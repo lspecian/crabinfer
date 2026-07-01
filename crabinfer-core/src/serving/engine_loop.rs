@@ -1625,6 +1625,11 @@ impl ServingEngineInner {
             self.scheduler
                 .update_after_step(sched.seq_id, sched.num_tokens);
 
+            // PCCH-01: register newly-completed prefill blocks so cache_salt isolation takes effect.
+            // Safe to call on every step — the method's internal `block_end > num_computed` guard
+            // skips partial blocks, and the decode-phase early return prevents per-token scans.
+            self.scheduler.register_completed_blocks(sched.seq_id);
+
             // Advance guided state after sampling and check for forced completion
             let guided_complete = if let Some(guided) = self.guided_states.get_mut(&sched.seq_id) {
                 guided.advance(token_id);
