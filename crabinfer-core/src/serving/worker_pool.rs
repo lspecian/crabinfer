@@ -92,11 +92,17 @@ impl WorkerPool {
     ///
     /// Tokens are chunked into `block_size`-token blocks and hashed with FNV-1a
     /// chaining so that each block's hash encodes the entire prefix up to that block.
-    fn compute_prompt_hashes(&self, prompt_tokens: &[u32]) -> Vec<BlockHash> {
+    ///
+    /// When `salt` is `Some`, the salt is mixed into the first block's hash state
+    /// so that requests with different salts (e.g., different tenants) produce
+    /// disjoint hash domains and cannot match each other's cached prefix blocks.
+    /// When `salt` is `None`, behavior is identical to the pre-PCCH-02 unsalted
+    /// implementation for full backward compatibility.
+    fn compute_prompt_hashes(&self, prompt_tokens: &[u32], salt: Option<&str>) -> Vec<BlockHash> {
         let mut hashes = Vec::new();
         let mut prev_hash = None;
         for chunk in prompt_tokens.chunks(self.block_size) {
-            let h = BlockHash::from_tokens(chunk, prev_hash);
+            let h = BlockHash::from_tokens_salted(chunk, prev_hash, salt);
             hashes.push(h);
             prev_hash = Some(h);
         }
@@ -114,8 +120,12 @@ impl WorkerPool {
     ///
     /// Falls back to round-robin when no worker has any matching prefix hashes,
     /// or when the prompt produces no block hashes (empty token list).
-    fn best_prefix_worker(&self, prompt_tokens: &[u32]) -> usize {
-        let prompt_hashes = self.compute_prompt_hashes(prompt_tokens);
+    ///
+    /// `salt` must match the salt used when the engine registered its blocks
+    /// (i.e., the request's `sampling_params.cache_salt`). Passing `None` retains
+    /// the pre-PCCH-02 unsalted routing behavior.
+    fn best_prefix_worker(&self, prompt_tokens: &[u32], salt: Option<&str>) -> usize {
+        let prompt_hashes = self.compute_prompt_hashes(prompt_tokens, salt);
         if prompt_hashes.is_empty() {
             return self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         }
@@ -157,7 +167,10 @@ impl WorkerPool {
                 if self.workers.len() == 1 {
                     0
                 } else {
-                    self.best_prefix_worker(&prompt_tokens)
+                    self.best_prefix_worker(
+                        &prompt_tokens,
+                        sampling_params.cache_salt.as_deref(),
+                    )
                 }
             }
         };
@@ -340,7 +353,7 @@ mod tests {
             routing_policy: RoutingPolicy::RoundRobin,
             block_size: 16,
         };
-        let hashes = pool.compute_prompt_hashes(&[]);
+        let hashes = pool.compute_prompt_hashes(&[], None);
         assert!(hashes.is_empty());
     }
 
@@ -354,7 +367,7 @@ mod tests {
             block_size: 16,
         };
         let tokens: Vec<u32> = (0..8).collect();
-        let hashes = pool.compute_prompt_hashes(&tokens);
+        let hashes = pool.compute_prompt_hashes(&tokens, None);
         assert_eq!(hashes.len(), 1);
         // Verify the hash matches manual computation
         let expected = BlockHash::from_tokens(&tokens, None);
@@ -371,7 +384,7 @@ mod tests {
             block_size: 4,
         };
         let tokens: Vec<u32> = (0..12).collect();
-        let hashes = pool.compute_prompt_hashes(&tokens);
+        let hashes = pool.compute_prompt_hashes(&tokens, None);
         assert_eq!(hashes.len(), 3);
         // Verify chaining: each hash depends on the previous
         let h0 = BlockHash::from_tokens(&tokens[0..4], None);
